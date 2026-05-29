@@ -1,0 +1,9 @@
+-- =============================================================================
+-- 0003_indexes.sql
+-- Intentionally empty.
+--
+-- All indexes from CLAUDE.md section 5 are declared inline in
+-- 0001_initial_schema.sql (right after each table), per the Phase 2 request.
+-- This file is kept as a numbered placeholder so the migration sequence in
+-- CLAUDE.md section 4 stays intact; add future ad-hoc indexes here.
+-- =============================================================================

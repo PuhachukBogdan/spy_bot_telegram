@@ -1,0 +1,1 @@
+﻿"""Pings via critical_alert_recipients. Phase 11."""

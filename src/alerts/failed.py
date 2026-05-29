@@ -1,0 +1,1 @@
+﻿"""failed_alerts table on total failure. Phase 11."""

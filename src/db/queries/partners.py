@@ -1,0 +1,1 @@
+﻿"""partners queries. Phase 2+."""

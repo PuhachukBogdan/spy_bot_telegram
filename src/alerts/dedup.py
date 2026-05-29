@@ -1,0 +1,1 @@
+﻿"""Cooldown (chat x risk_type, 1h). Phase 11."""

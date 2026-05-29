@@ -1,0 +1,1 @@
+﻿"""Whisper worker. Phase 7."""

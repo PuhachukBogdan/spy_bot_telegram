@@ -1,0 +1,307 @@
+"""Pydantic v2 models for all 17 tables. Phase 2.
+
+One model per table in ``supabase/migrations/0001_initial_schema.sql``. These
+are primarily *row* models: build them from an ``asyncpg.Record`` with
+``Model.from_record(record)`` (see ``_ORMModel`` for why a plain
+``model_validate(record)`` does not work on a Record).
+
+Type mapping conventions:
+  - PK / FK / UUID columns  -> ``uuid.UUID``        (see note below)
+  - ``UUID[]``              -> ``list[UUID] | None``
+  - ``TEXT[]``             -> ``list[str] | None``
+  - ``TIMESTAMPTZ``        -> ``datetime``
+  - ``DATE``               -> ``date``
+  - ``NUMERIC``            -> ``Decimal`` (never float, CLAUDE.md section 9)
+  - ``JSONB``              -> ``dict[str, Any]`` / ``list[Any]`` per content
+  - ``BIGINT`` / ``INT``   -> ``int``
+  - ``FLOAT``              -> ``float`` (llm_confidence / llm_multiplier only)
+
+Why ``uuid.UUID`` and not ``pydantic.UUID4``:
+  asyncpg decodes ``UUID`` columns to native ``uuid.UUID`` objects, so this is a
+  zero-conversion match on read. ``UUID4`` additionally asserts version==4;
+  although ``gen_random_uuid()`` does emit v4, that extra check buys nothing on
+  trusted DB-sourced data and would reject any legitimately stored non-v4 id.
+  Plain ``UUID`` still serializes to a string in JSON output.
+
+Columns that are NOT NULL with a server-side DEFAULT are given the same default
+here so a model can be constructed before insert; columns that are NOT NULL with
+no default are required; nullable columns default to ``None``.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any, Self
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class _ORMModel(BaseModel):
+    """Base for every table model.
+
+    Use :meth:`from_record` to build from an ``asyncpg.Record``. A Record is a
+    *mapping*, not an attribute object, so ``model_validate(record)`` with
+    ``from_attributes=True`` fails (Pydantic reads fields via ``getattr``, which
+    a Record does not support for columns). ``from_record`` converts to a plain
+    dict first, which validates by mapping. ``from_attributes`` is kept for any
+    genuine attribute-style source.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> Self:
+        """Validate from an ``asyncpg.Record`` (or any mapping) by dict-coercion."""
+        return cls.model_validate(dict(record))
+
+
+# --- 1. internal_users ------------------------------------------------------
+class InternalUser(_ORMModel):
+    id: UUID
+    full_name: str
+    role: str | None = None
+    telegram_accounts: list[int] = Field(default_factory=list)
+    is_admin: bool = False
+    enabled: bool = True
+    created_at: datetime
+
+
+# --- 2. partners ------------------------------------------------------------
+class Partner(_ORMModel):
+    id: UUID
+    name: str
+    status: str = "active"
+    owner_manager_id: UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+# --- 3. chats ---------------------------------------------------------------
+class Chat(_ORMModel):
+    id: UUID
+    telegram_chat_id: int
+    partner_id: UUID | None = None
+    chat_name: str | None = None
+    status: str = "pending"
+    added_by_user_id: int | None = None
+    authorized_by: UUID | None = None
+    authorized_at: datetime | None = None
+    chat_purpose: str | None = None
+    created_at: datetime
+
+
+# --- 4. messages ------------------------------------------------------------
+class Message(_ORMModel):
+    id: UUID
+    telegram_message_id: int
+    chat_id: UUID
+    sender_id: int | None = None
+    sender_chat_id: int | None = None
+    sender_name: str | None = None
+    sender_role: str
+    message_text: str | None = None
+    message_type: str
+    timestamp: datetime
+    reply_to_message_id: int | None = None
+    forward_from_id: int | None = None
+    forward_from_chat_id: int | None = None
+    message_thread_id: int | None = None
+    links: list[str] | None = None
+    mentions: list[str] | None = None
+    detected_language: str | None = None
+    transcription: str | None = None
+    is_significant: bool = False
+    has_triggers: bool = False
+    triggered_patterns: dict[str, Any] | list[Any] | None = None
+    base_score: int = 0
+    source: str = "live"
+    raw_payload: dict[str, Any] | None = None
+    created_at: datetime
+
+
+# --- 5. message_edits -------------------------------------------------------
+class MessageEdit(_ORMModel):
+    id: UUID
+    message_id: UUID
+    old_text: str | None = None
+    new_text: str | None = None
+    edited_at: datetime
+    created_at: datetime
+
+
+# --- 6. chat_events ---------------------------------------------------------
+class ChatEvent(_ORMModel):
+    id: UUID
+    chat_id: UUID
+    event_type: str
+    actor_user_id: int | None = None
+    target_user_id: int | None = None
+    payload: dict[str, Any] | None = None
+    created_at: datetime
+
+
+# --- 7. risk_events ---------------------------------------------------------
+class RiskEvent(_ORMModel):
+    id: UUID
+    message_id: UUID | None = None
+    partner_id: UUID | None = None
+    chat_id: UUID | None = None
+    sender_id: int | None = None
+    risk_type: str
+    risk_level: str
+    triggered_patterns: dict[str, Any] | list[Any] | None = None
+    context_modifiers: dict[str, Any] | None = None
+    base_score: int
+    llm_confidence: float | None = None
+    llm_multiplier: float | None = None
+    llm_verdict: str | None = None
+    llm_explanation: str | None = None
+    final_score: int
+    disagreement: bool = False
+    detected_phrase: str | None = None
+    context_message_ids: list[UUID] | None = None
+    status: str = "new"
+    reviewed_by: UUID | None = None
+    reviewed_at: datetime | None = None
+    slack_message_ts: str | None = None
+    created_at: datetime
+
+
+# --- 8. red_flag_patterns ---------------------------------------------------
+class RedFlagPattern(_ORMModel):
+    id: UUID
+    pattern: str
+    pattern_type: str = "literal"
+    language: str
+    risk_category: str
+    base_score: int
+    examples: list[str] | None = None
+    enabled: bool = True
+    updated_at: datetime
+
+
+# --- 9. summaries -----------------------------------------------------------
+class Summary(_ORMModel):
+    id: UUID
+    partner_id: UUID | None = None
+    period_type: str
+    period_start: datetime
+    period_end: datetime
+    structured_content: dict[str, Any]
+    rendered_html: str | None = None
+    risk_event_ids: list[UUID] | None = None
+    action_items: dict[str, Any] | list[Any] | None = None
+    delivery_status: str = "pending"
+    delivered_at: datetime | None = None
+    created_at: datetime
+
+
+# --- 10. summaries_skipped --------------------------------------------------
+class SummarySkipped(_ORMModel):
+    id: UUID
+    partner_id: UUID | None = None
+    period_type: str
+    period_start: datetime
+    period_end: datetime
+    reason: str
+    significant_message_count: int | None = None
+    risk_event_count: int | None = None
+    created_at: datetime
+
+
+# --- 11. critical_alert_recipients ------------------------------------------
+class CriticalAlertRecipient(_ORMModel):
+    id: UUID
+    full_name: str
+    slack_user_id: str | None = None
+    email: str | None = None
+    enabled: bool = True
+    added_at: datetime
+
+
+# --- 12. admin_audit_log ----------------------------------------------------
+class AdminAuditLog(_ORMModel):
+    id: UUID
+    actor_user_id: int | None = None
+    actor_internal_id: UUID | None = None
+    action: str
+    target_entity: str | None = None
+    target_id: UUID | None = None
+    payload: dict[str, Any] | None = None
+    ip: str | None = None
+    created_at: datetime
+
+
+# --- 13. llm_calls ----------------------------------------------------------
+class LlmCall(_ORMModel):
+    id: UUID
+    call_type: str
+    model: str
+    chat_id: UUID | None = None
+    message_ids: list[UUID] | None = None
+    prompt_hash: str
+    prompt_storage_path: str | None = None
+    response_summary: str | None = None
+    response_storage_path: str | None = None
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    cost_usd: Decimal | None = None
+    latency_ms: int | None = None
+    disagreement_flag: bool = False
+    error: str | None = None
+    created_at: datetime
+
+
+# --- 14. prompts ------------------------------------------------------------
+class Prompt(_ORMModel):
+    id: UUID
+    name: str
+    version: int
+    template: str
+    json_schema: dict[str, Any] | None = None
+    active: bool = False
+    notes: str | None = None
+    created_by: str | None = None
+    created_at: datetime
+
+
+# --- 15. failed_alerts ------------------------------------------------------
+class FailedAlert(_ORMModel):
+    id: UUID
+    risk_event_id: UUID | None = None
+    channel: str
+    payload: dict[str, Any] | None = None
+    error: str | None = None
+    retry_count: int = 0
+    last_attempt_at: datetime | None = None
+    resolved: bool = False
+    created_at: datetime
+
+
+# --- 16. cost_tracking ------------------------------------------------------
+class CostTracking(_ORMModel):
+    date: date
+    llm_cost_usd: Decimal = Decimal("0")
+    whisper_cost_usd: Decimal = Decimal("0")
+    # GENERATED ALWAYS column: always present on read, never supplied on write.
+    total_cost_usd: Decimal | None = None
+    llm_calls_count: int = 0
+    whisper_calls_count: int = 0
+    circuit_breaker_triggered: bool = False
+
+
+# --- 17. processing_queue ---------------------------------------------------
+class ProcessingQueue(_ORMModel):
+    id: int  # BIGSERIAL
+    task_type: str
+    payload: dict[str, Any]
+    status: str = "pending"
+    attempts: int = 0
+    last_attempt_at: datetime | None = None
+    error: str | None = None
+    scheduled_for: datetime
+    created_at: datetime
+    completed_at: datetime | None = None

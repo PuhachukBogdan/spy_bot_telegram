@@ -1,0 +1,10 @@
+# Replace bot.yourcompany.com with your real domain.
+# Caddy auto-provisions a Let's Encrypt cert for it.
+bot.yourcompany.com {
+    reverse_proxy bot:8080
+
+    log {
+        output stdout
+        format json
+    }
+}
