@@ -136,3 +136,30 @@ async def update_message_text(
         message_id,
         new_text,
     )
+
+
+async def update_message_triggers(
+    conn: asyncpg.Connection,
+    message_id: UUID,
+    *,
+    has_triggers: bool,
+    base_score: int,
+    triggered_patterns: dict[str, Any] | None,
+) -> None:
+    """Write Tier-1 matcher output back onto a message (CLAUDE.md 7.1 step 7).
+
+    ``triggered_patterns`` is passed natively for the pool's jsonb codec.
+    """
+    await conn.execute(
+        """
+        UPDATE messages
+        SET has_triggers = $2,
+            base_score = $3,
+            triggered_patterns = $4
+        WHERE id = $1
+        """,
+        message_id,
+        has_triggers,
+        base_score,
+        triggered_patterns,
+    )

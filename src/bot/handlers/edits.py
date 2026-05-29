@@ -18,13 +18,17 @@ from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.types import Message
 
+from src.config import settings
 from src.db.client import acquire_connection
 from src.db.queries.chats import get_chat_by_telegram_id
 from src.db.queries.messages import (
     get_message,
     insert_message_edit,
     update_message_text,
+    update_message_triggers,
 )
+from src.db.queries.queue import enqueue_task
+from src.pipeline.tier1 import pattern_cache
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -65,5 +69,27 @@ async def on_edited_message(edited: Message) -> None:
         )
         await update_message_text(conn, existing.id, new_text)
 
-    log.info("edit.recorded", chat_id=edited.chat.id, msg_id=edited.message_id)
-    # Phase 6: re-run Tier-1 on the new text; may raise/lower has_triggers.
+        # Re-run Tier-1 on the edited text (CLAUDE.md 7.3): an edit can introduce
+        # or remove triggers. Only enqueue a priority pass if the score newly
+        # crossed the threshold, to avoid re-queueing on every benign edit.
+        result = pattern_cache.match(new_text, existing.sender_role)
+        await update_message_triggers(
+            conn,
+            existing.id,
+            has_triggers=result.has_triggers,
+            base_score=result.base_score,
+            triggered_patterns=result.triggered_patterns,
+        )
+        threshold = settings.PRIORITY_SCORE_THRESHOLD
+        if existing.base_score < threshold <= result.base_score:
+            await enqueue_task(
+                conn, "priority_llm", {"message_id": str(existing.id)}
+            )
+
+    log.info(
+        "edit.recorded",
+        chat_id=edited.chat.id,
+        msg_id=edited.message_id,
+        has_triggers=result.has_triggers,
+        base_score=result.base_score,
+    )

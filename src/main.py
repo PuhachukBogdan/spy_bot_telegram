@@ -24,7 +24,11 @@ setup_logging()
 from src.bot.instance import bot, dp  # noqa: E402  (after setup_logging on purpose)
 from src.config import settings  # noqa: E402
 from src.db.client import acquire_connection, close_pool, get_pool  # noqa: E402
-from src.pipeline.workers import abandoned_chat_cleanup_loop  # noqa: E402
+from src.pipeline.tier1 import pattern_cache  # noqa: E402
+from src.pipeline.workers import (  # noqa: E402
+    abandoned_chat_cleanup_loop,
+    pattern_reload_loop,
+)
 
 log = get_logger(__name__)
 
@@ -41,6 +45,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await get_pool()  # warms the pool and fails fast if the DB is unreachable
     log.info("startup.db.connected")
 
+    # --- Tier-1 dictionary: load before serving so the first message matches ---
+    async with acquire_connection() as conn:
+        await pattern_cache.refresh(conn)
+    log.info("startup.patterns.loaded", count=pattern_cache.size)
+
     # --- Telegram webhook ---
     try:
         await bot.set_webhook(
@@ -56,14 +65,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cleanup_task = asyncio.create_task(
         abandoned_chat_cleanup_loop(bot), name="abandoned_chat_cleanup"
     )
+    pattern_task = asyncio.create_task(
+        pattern_reload_loop(), name="pattern_reload"
+    )
 
     try:
         yield
     finally:
         # --- shutdown ---
-        cleanup_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await cleanup_task
+        for task in (cleanup_task, pattern_task):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
         try:
             await bot.delete_webhook(drop_pending_updates=False)

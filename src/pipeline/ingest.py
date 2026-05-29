@@ -12,6 +12,8 @@ Tier-1 rule matching (CLAUDE.md 7.1 steps 6-9) hooks in here in Phase 6; for now
 
 from __future__ import annotations
 
+from uuid import UUID
+
 import asyncpg
 from aiogram.enums import MessageEntityType
 from aiogram.types import (
@@ -22,10 +24,13 @@ from aiogram.types import (
     MessageOriginUser,
 )
 
+from src.config import settings
 from src.db.client import acquire_connection
 from src.db.models import Chat
 from src.db.queries.etc import find_internal_user_by_telegram_id
-from src.db.queries.messages import insert_message
+from src.db.queries.messages import insert_message, update_message_triggers
+from src.db.queries.queue import enqueue_task
+from src.pipeline.tier1 import MatchResult, pattern_cache
 from src.utils.language import detect_language
 from src.utils.logging import get_logger
 
@@ -73,13 +78,25 @@ async def ingest_message(message: Message, chat: Chat) -> None:
             raw_payload=message.model_dump(mode="json", exclude_none=True),
         )
 
-    if stored is None:
-        log.debug(
-            "ingest.duplicate",
-            chat_id=chat.telegram_chat_id,
-            msg_id=message.message_id,
+        if stored is None:
+            log.debug(
+                "ingest.duplicate",
+                chat_id=chat.telegram_chat_id,
+                msg_id=message.message_id,
+            )
+            return
+
+        # Tier-1 rule matching (CLAUDE.md 7.1 steps 6-9): cheap, in-memory.
+        result = pattern_cache.match(text, sender_role)
+        await update_message_triggers(
+            conn,
+            stored.id,
+            has_triggers=result.has_triggers,
+            base_score=result.base_score,
+            triggered_patterns=result.triggered_patterns,
         )
-        return
+        await _enqueue_followups(conn, stored.id, message_type, result)
+
     log.info(
         "ingest.stored",
         chat_id=chat.telegram_chat_id,
@@ -89,8 +106,27 @@ async def ingest_message(message: Message, chat: Chat) -> None:
         significant=is_significant,
         forwarded=forward_from_id is not None or forward_from_chat_id is not None,
         forward_from_id=forward_from_id,
+        has_triggers=result.has_triggers,
+        base_score=result.base_score,
     )
-    # Phase 6: run Tier-1 matcher here and enqueue priority/whisper work.
+
+
+async def _enqueue_followups(
+    conn: asyncpg.Connection,
+    message_id: UUID,
+    message_type: str,
+    result: MatchResult,
+) -> None:
+    """Queue heavy follow-up work (CLAUDE.md 7.1 steps 8-9).
+
+    Voice / video notes go to the Whisper queue (transcription runs Tier-1 again
+    in Phase 7). Otherwise a base_score at/above the threshold gets a real-time
+    priority LLM pass (Phase 10).
+    """
+    if message_type in ("voice", "video_note"):
+        await enqueue_task(conn, "whisper_transcribe", {"message_id": str(message_id)})
+    elif result.base_score >= settings.PRIORITY_SCORE_THRESHOLD:
+        await enqueue_task(conn, "priority_llm", {"message_id": str(message_id)})
 
 
 def _classify_type(message: Message) -> str:

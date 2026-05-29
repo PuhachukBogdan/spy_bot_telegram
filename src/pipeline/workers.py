@@ -21,12 +21,15 @@ from src.config import settings
 from src.db.client import acquire_connection
 from src.db.queries.audit import insert_audit_log
 from src.db.queries.chats import list_stale_pending_chats, mark_chat_abandoned
+from src.pipeline.tier1 import pattern_cache
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
 
 # How often the abandoned-chat sweep runs (CLAUDE.md: hourly).
 _CLEANUP_INTERVAL_SECONDS = 3600
+# How often the Tier-1 dictionary is hot-reloaded (CLAUDE.md Phase 6: ~5 min).
+_PATTERN_RELOAD_INTERVAL_SECONDS = 300
 
 
 async def run_abandoned_chat_sweep(bot: Bot) -> int:
@@ -94,3 +97,27 @@ async def _leave_chat_quietly(bot: Bot, telegram_chat_id: int) -> None:
         await bot.leave_chat(telegram_chat_id)
     except TelegramAPIError as exc:
         log.warning("worker.leave_failed", chat_id=telegram_chat_id, error=str(exc))
+
+
+async def pattern_reload_loop(
+    interval_seconds: int = _PATTERN_RELOAD_INTERVAL_SECONDS,
+) -> None:
+    """Hot-reload the Tier-1 dictionary on the interval (CLAUDE.md Phase 6).
+
+    The cache only recompiles when its fingerprint changes, so most ticks are a
+    single cheap aggregate query. Errors are logged and swallowed; cancellation
+    propagates.
+    """
+    log.info("worker.pattern_reload.start", interval_s=interval_seconds)
+    while True:
+        try:
+            async with acquire_connection() as conn:
+                reloaded = await pattern_cache.refresh(conn)
+            if reloaded:
+                log.info("worker.pattern_reload.refreshed", count=pattern_cache.size)
+        except asyncio.CancelledError:
+            log.info("worker.pattern_reload.stop")
+            raise
+        except Exception as exc:  # never let one bad reload kill the loop
+            log.error("worker.pattern_reload.error", error=str(exc))
+        await asyncio.sleep(interval_seconds)
