@@ -12,6 +12,8 @@ additionally require the caller to be an enabled internal user.
 
 from __future__ import annotations
 
+from html import escape as html_escape
+
 import asyncpg
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
@@ -94,11 +96,11 @@ async def cmd_whoami(message: Message) -> None:
         )
         return
 
-    role = internal.role or "—"
+    role = html_escape(internal.role) if internal.role else "—"
     admin = "yes" if internal.is_admin else "no"
     await message.answer(
         "You are recognized as an internal user.\n\n"
-        f"<b>Name:</b> {internal.full_name}\n"
+        f"<b>Name:</b> {html_escape(internal.full_name)}\n"
         f"<b>Role:</b> {role}\n"
         f"<b>Admin:</b> {admin}\n"
         f"<b>Telegram id:</b> <code>{user.id}</code>"
@@ -142,7 +144,7 @@ async def cmd_pending(message: Message) -> None:
 
     lines = ["<b>Chats pending authorization</b>\n"]
     for chat in pending:
-        name = chat.chat_name or "(untitled)"
+        name = html_escape(chat.chat_name) if chat.chat_name else "(untitled)"
         lines.append(
             f"• {name}\n"
             f"  id: <code>{chat.telegram_chat_id}</code>"
@@ -226,7 +228,7 @@ async def cmd_authorize(message: Message, command: CommandObject) -> None:
         by=internal.full_name,
     )
     await message.answer(
-        f"✅ Chat activated and bound to partner <b>{partner.name}</b>. "
+        f"✅ Chat activated and bound to partner <b>{html_escape(partner.name)}</b>. "
         "Monitoring has started."
     )
 
