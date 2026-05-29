@@ -87,6 +87,8 @@ async def ingest_message(message: Message, chat: Chat) -> None:
         type=message_type,
         role=sender_role,
         significant=is_significant,
+        forwarded=forward_from_id is not None or forward_from_chat_id is not None,
+        forward_from_id=forward_from_id,
     )
     # Phase 6: run Tier-1 matcher here and enqueue priority/whisper work.
 
