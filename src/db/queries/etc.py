@@ -32,3 +32,21 @@ async def find_internal_user_by_telegram_id(
         [telegram_user_id],  # JSON codec on the pool encodes this to '[<id>]'
     )
     return InternalUser.from_record(row) if row is not None else None
+
+
+async def list_admin_users(conn: asyncpg.Connection) -> list[InternalUser]:
+    """Return all enabled admins (for onboarding DM notifications, CLAUDE.md 7.2).
+
+    A person whose ``telegram_accounts`` is empty still matches, but the bot can
+    only DM accounts that have started it; the caller handles unreachable users.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT *
+        FROM internal_users
+        WHERE is_admin = true
+          AND enabled = true
+        ORDER BY full_name ASC
+        """
+    )
+    return [InternalUser.from_record(row) for row in rows]

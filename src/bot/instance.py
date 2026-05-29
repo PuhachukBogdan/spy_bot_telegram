@@ -14,6 +14,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
+from src.bot.handlers.chat_member import router as onboarding_router
 from src.bot.handlers.dm_commands import router as dm_commands_router
 from src.bot.middleware.audit import AuditMiddleware
 from src.bot.middleware.whitelist import WhitelistMiddleware
@@ -32,4 +33,7 @@ dp = Dispatcher()
 dp.message.outer_middleware(AuditMiddleware())
 dp.message.outer_middleware(WhitelistMiddleware())
 
+# Onboarding (my_chat_member) is not a message, so the message-only middlewares
+# above do not touch it; its router handles bot add/remove events directly.
+dp.include_router(onboarding_router)
 dp.include_router(dm_commands_router)

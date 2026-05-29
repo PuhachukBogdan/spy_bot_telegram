@@ -7,6 +7,8 @@ into the aiogram dispatcher. The Slack-callback handler is a stub until Phase 12
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hmac
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -22,6 +24,7 @@ setup_logging()
 from src.bot.instance import bot, dp  # noqa: E402  (after setup_logging on purpose)
 from src.config import settings  # noqa: E402
 from src.db.client import acquire_connection, close_pool, get_pool  # noqa: E402
+from src.pipeline.workers import abandoned_chat_cleanup_loop  # noqa: E402
 
 log = get_logger(__name__)
 
@@ -49,10 +52,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:  # don't let a transient Telegram error kill the app
         log.error("startup.webhook.failed", error=str(exc))
 
+    # --- background workers ---
+    cleanup_task = asyncio.create_task(
+        abandoned_chat_cleanup_loop(bot), name="abandoned_chat_cleanup"
+    )
+
     try:
         yield
     finally:
         # --- shutdown ---
+        cleanup_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cleanup_task
+
         try:
             await bot.delete_webhook(drop_pending_updates=False)
             log.info("shutdown.webhook.deleted")
