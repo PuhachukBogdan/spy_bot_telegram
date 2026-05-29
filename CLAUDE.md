@@ -1127,14 +1127,30 @@ C:\Dev\claude-obsidian\
 
 ### 16.1 Remotes
 
-Two separate remotes (kept distinct on purpose — no single remote with multiple push URLs yet):
+Two separate remotes (kept distinct on purpose — no single remote with multiple push URLs):
 
-| Remote | Purpose | URL |
-|---|---|---|
-| `origin` | work GitHub | `https://github.com/warden-afk/tg_ai_bot_bow.git` |
-| `personal` | personal GitHub mirror | `https://github.com/PuhachukBogdan/spy_bot_telegram.git` |
+| Remote | Purpose | URL | Auth |
+|---|---|---|---|
+| `origin` | work GitHub | `https://github.com/warden-afk/tg_ai_bot_bow.git` | HTTPS (warden-afk credential in Windows Credential Manager) |
+| `personal` | personal GitHub mirror | `git@github-puhachuk:PuhachukBogdan/spy_bot_telegram.git` | SSH (dedicated key, see below) |
 
 Default branch: `main`.
+
+**Why the two remotes use different auth:** both repos live on `github.com` but belong to different accounts (`warden-afk` vs `PuhachukBogdan`). HTTPS caches one credential per host, so pushing to both over HTTPS made the personal push reuse the work token and 403. The fix is a dedicated SSH identity for `personal` only, via a host **alias** so it doesn't collide with any `github.com` HTTPS credential:
+
+- SSH key: `~/.ssh/id_ed25519_puhachuk` (ed25519, empty passphrase for local dev), public half registered on the `PuhachukBogdan` GitHub account.
+- `~/.ssh/config` block:
+  ```
+  Host github-puhachuk
+      HostName github.com
+      User git
+      IdentityFile ~/.ssh/id_ed25519_puhachuk
+      IdentitiesOnly yes
+  ```
+- The plain `git@github.com:...` URL is NOT enough for multi-account separation (still host `github.com`); the `github-puhachuk` alias is what isolates the identity.
+- Verify with `ssh -T git@github-puhachuk` → must say `Hi PuhachukBogdan!`.
+- `origin` stays HTTPS/work; do not connect the two accounts (no collaborator cross-add).
+- **Never put a token in a remote URL** (it would land in `.git/config` in plaintext).
 
 ### 16.2 Commit + push policy
 
