@@ -158,3 +158,26 @@ async def mark_chat_abandoned(
         telegram_chat_id,
     )
     return Chat.from_record(row) if row is not None else None
+
+
+async def update_chat_telegram_id(
+    conn: asyncpg.Connection, old_telegram_chat_id: int, new_telegram_chat_id: int
+) -> Chat | None:
+    """Repoint a chat to its new id after a group->supergroup migration.
+
+    Telegram assigns a fresh chat id on migration; without this the old row would
+    orphan and the new id would look like an unknown chat (CLAUDE.md 11.6). The
+    UNIQUE constraint on ``telegram_chat_id`` means this is a no-op (``None``)
+    if the new id is already recorded.
+    """
+    row = await conn.fetchrow(
+        """
+        UPDATE chats
+        SET telegram_chat_id = $2
+        WHERE telegram_chat_id = $1
+        RETURNING *
+        """,
+        old_telegram_chat_id,
+        new_telegram_chat_id,
+    )
+    return Chat.from_record(row) if row is not None else None

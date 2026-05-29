@@ -16,6 +16,8 @@ from aiogram.enums import ParseMode
 
 from src.bot.handlers.chat_member import router as onboarding_router
 from src.bot.handlers.dm_commands import router as dm_commands_router
+from src.bot.handlers.edits import router as edits_router
+from src.bot.handlers.messages import router as messages_router
 from src.bot.middleware.audit import AuditMiddleware
 from src.bot.middleware.whitelist import WhitelistMiddleware
 from src.config import settings
@@ -36,4 +38,8 @@ dp.message.outer_middleware(WhitelistMiddleware())
 # Onboarding (my_chat_member) is not a message, so the message-only middlewares
 # above do not touch it; its router handles bot add/remove events directly.
 dp.include_router(onboarding_router)
+# dm_commands is private-only; messages is group-only — disjoint, but dm_commands
+# is included first so a (private) command never reaches the ingestion router.
 dp.include_router(dm_commands_router)
+dp.include_router(messages_router)
+dp.include_router(edits_router)

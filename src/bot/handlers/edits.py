@@ -1,1 +1,69 @@
-﻿"""edited_message. Phase 5."""
+"""edited_message handler. Phase 5.
+
+Telegram delivers edits on a separate update type (``edited_message``), so the
+message-observer whitelist middleware does not gate these. We don't need it to:
+an edit for a chat we never stored (non-active, or pre-activation) simply finds
+no original row and is ignored.
+
+On a real text change we append a ``message_edits`` history row and overwrite the
+current text (CLAUDE.md 7.3). Re-running the Tier-1 matcher on the new text lands
+in Phase 6.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+from aiogram import F, Router
+from aiogram.enums import ChatType
+from aiogram.types import Message
+
+from src.db.client import acquire_connection
+from src.db.queries.chats import get_chat_by_telegram_id
+from src.db.queries.messages import (
+    get_message,
+    insert_message_edit,
+    update_message_text,
+)
+from src.utils.logging import get_logger
+
+log = get_logger(__name__)
+
+router = Router(name="edits")
+router.edited_message.filter(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+
+
+@router.edited_message()
+async def on_edited_message(edited: Message) -> None:
+    """Record an edit to a previously-stored message."""
+    new_text = edited.text if edited.text is not None else edited.caption
+
+    async with acquire_connection() as conn:
+        chat = await get_chat_by_telegram_id(conn, edited.chat.id)
+        if chat is None:
+            return
+        existing = await get_message(conn, chat.id, edited.message_id)
+        if existing is None:
+            # We never stored the original (e.g. it predates activation). Nothing
+            # to diff against; ignore rather than insert a partial row.
+            return
+        if new_text == existing.message_text:
+            return  # non-text edit (media swap, etc.) or no real change
+
+        # aiogram exposes edit_date as a Unix int (only `date` is auto-converted).
+        edited_at = (
+            datetime.fromtimestamp(edited.edit_date, tz=UTC)
+            if edited.edit_date is not None
+            else edited.date
+        )
+        await insert_message_edit(
+            conn,
+            message_id=existing.id,
+            old_text=existing.message_text,
+            new_text=new_text,
+            edited_at=edited_at,
+        )
+        await update_message_text(conn, existing.id, new_text)
+
+    log.info("edit.recorded", chat_id=edited.chat.id, msg_id=edited.message_id)
+    # Phase 6: re-run Tier-1 on the new text; may raise/lower has_triggers.
