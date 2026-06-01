@@ -55,3 +55,10 @@ supabase/.env
 
 # Internal spec docs — kept local for now; may become docs/README later
 *.docx
+
+# Local working files: red-flag dictionary prompt + the GPT output we paste back
+red_flag_dictionary*.txt
+red_flag_dictionary*.json
+# Approved Tier-1 dictionary (leadership-approved data, loaded into the DB; never committed)
+red_flag_patterns_dictionary*.txt
+red_flag_patterns_dictionary*.json
