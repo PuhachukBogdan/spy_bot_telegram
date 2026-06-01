@@ -25,7 +25,8 @@ from src.db.models import InternalUser
 from src.db.queries.audit import insert_audit_log
 from src.db.queries.chats import (
     authorize_chat,
-    get_chat_by_telegram_id,
+    count_live_units,
+    get_chat_unit,
     list_pending_chats,
     reject_chat,
 )
@@ -57,10 +58,11 @@ _HELP_TEXT = (
     "/help — this message\n"
     "/whoami — show whether I recognize you as an internal user\n\n"
     "<b>Internal only — chat onboarding:</b>\n"
-    "/pending — chats awaiting authorization\n"
-    "/authorize &lt;chat_id&gt; &lt;partner name&gt; — start monitoring a chat\n"
-    "/reject &lt;chat_id&gt; — decline a chat and leave it\n\n"
-    "<i>Partner and risk views unlock in later phases.</i>"
+    "/pending — units (chats/topics) awaiting authorization\n"
+    "/authorize &lt;chat_id&gt; &lt;thread_id&gt; &lt;partner name&gt; — start monitoring a unit\n"
+    "/reject &lt;chat_id&gt; &lt;thread_id&gt; — decline a unit\n\n"
+    "<i>Use thread_id <code>0</code> for the whole group / General topic. "
+    "Partner and risk views unlock in later phases.</i>"
 )
 
 
@@ -142,17 +144,22 @@ async def cmd_pending(message: Message) -> None:
         await message.answer("No chats are pending authorization. ✅")
         return
 
-    lines = ["<b>Chats pending authorization</b>\n"]
+    lines = ["<b>Units pending authorization</b>\n"]
     for chat in pending:
         name = html_escape(chat.chat_name) if chat.chat_name else "(untitled)"
+        thread = chat.message_thread_id or 0
+        topic = (
+            html_escape(chat.topic_name)
+            if chat.topic_name
+            else ("General/whole group" if thread == 0 else f"thread {thread}")
+        )
         lines.append(
-            f"• {name}\n"
-            f"  id: <code>{chat.telegram_chat_id}</code>"
+            f"• {name} — {topic}\n"
+            f"  <code>/authorize {chat.telegram_chat_id} {thread} &lt;partner&gt;</code>"
             f" · added by <code>{chat.added_by_user_id or '—'}</code>"
         )
     lines.append(
-        "\nAuthorize with <code>/authorize &lt;chat_id&gt; &lt;partner name&gt;</code> "
-        "or <code>/reject &lt;chat_id&gt;</code>."
+        "\nReject with <code>/reject &lt;chat_id&gt; &lt;thread_id&gt;</code>."
     )
     await message.answer("\n".join(lines))
 
@@ -167,11 +174,13 @@ async def cmd_authorize(message: Message, command: CommandObject) -> None:
     parsed = _parse_authorize_args(command.args)
     if parsed is None:
         await message.answer(
-            "Usage: <code>/authorize &lt;chat_id&gt; &lt;partner name&gt;</code>\n"
-            "Example: <code>/authorize -1001234567890 Acme Corp</code>"
+            "Usage: <code>/authorize &lt;chat_id&gt; &lt;thread_id&gt; "
+            "&lt;partner name&gt;</code>\n"
+            "Example: <code>/authorize -1001234567890 0 Acme Corp</code>\n"
+            "(thread_id <code>0</code> = whole group / General topic)"
         )
         return
-    telegram_chat_id, partner_name = parsed
+    telegram_chat_id, thread_id, partner_name = parsed
 
     async with acquire_connection() as conn:
         internal = await _resolve_internal(message, conn)
@@ -179,17 +188,18 @@ async def cmd_authorize(message: Message, command: CommandObject) -> None:
             return
 
         async with conn.transaction():
-            chat = await get_chat_by_telegram_id(conn, telegram_chat_id)
+            chat = await get_chat_unit(conn, telegram_chat_id, thread_id)
             if chat is None:
                 await message.answer(
-                    f"I don't know chat <code>{telegram_chat_id}</code>. "
-                    "I only track chats I've been added to."
+                    f"I don't know unit <code>{telegram_chat_id}</code> / thread "
+                    f"<code>{thread_id}</code>. I only track units I've seen."
                 )
                 return
             if chat.status != "pending":
                 await message.answer(
-                    f"Chat <code>{telegram_chat_id}</code> is not pending "
-                    f"(current status: <b>{chat.status}</b>). Nothing to do."
+                    f"Unit <code>{telegram_chat_id}</code>/<code>{thread_id}</code> "
+                    f"is not pending (current status: <b>{chat.status}</b>). "
+                    "Nothing to do."
                 )
                 return
 
@@ -197,13 +207,14 @@ async def cmd_authorize(message: Message, command: CommandObject) -> None:
             activated = await authorize_chat(
                 conn,
                 telegram_chat_id=telegram_chat_id,
+                thread_id=thread_id,
                 partner_id=partner.id,
                 authorized_by=internal.id,
             )
-            if activated is None:  # lost a race; chat left pending state
+            if activated is None:  # lost a race; unit left pending state
                 await message.answer(
-                    f"Chat <code>{telegram_chat_id}</code> is no longer pending. "
-                    "Nothing to do."
+                    f"Unit <code>{telegram_chat_id}</code>/<code>{thread_id}</code> "
+                    "is no longer pending. Nothing to do."
                 )
                 return
 
@@ -216,6 +227,7 @@ async def cmd_authorize(message: Message, command: CommandObject) -> None:
                 target_id=activated.id,
                 payload={
                     "telegram_chat_id": telegram_chat_id,
+                    "thread_id": thread_id,
                     "partner_id": str(partner.id),
                     "partner_name": partner.name,
                 },
@@ -224,11 +236,12 @@ async def cmd_authorize(message: Message, command: CommandObject) -> None:
     log.info(
         "onboarding.authorized",
         chat_id=telegram_chat_id,
+        thread_id=thread_id,
         partner=partner.name,
         by=internal.full_name,
     )
     await message.answer(
-        f"✅ Chat activated and bound to partner <b>{html_escape(partner.name)}</b>. "
+        f"✅ Unit activated and bound to partner <b>{html_escape(partner.name)}</b>. "
         "Monitoring has started."
     )
 
@@ -240,13 +253,15 @@ async def cmd_reject(message: Message, command: CommandObject, bot: Bot) -> None
     Usage: ``/reject <chat_id>``. The DB flip + audit commit together; the
     ``bot.leave_chat`` call happens after commit and is best-effort.
     """
-    telegram_chat_id = _parse_chat_id(command.args)
-    if telegram_chat_id is None:
+    parsed = _parse_reject_args(command.args)
+    if parsed is None:
         await message.answer(
-            "Usage: <code>/reject &lt;chat_id&gt;</code>\n"
-            "Example: <code>/reject -1001234567890</code>"
+            "Usage: <code>/reject &lt;chat_id&gt; &lt;thread_id&gt;</code>\n"
+            "Example: <code>/reject -1001234567890 0</code>\n"
+            "(thread_id <code>0</code> = whole group / General topic)"
         )
         return
+    telegram_chat_id, thread_id = parsed
 
     async with acquire_connection() as conn:
         internal = await _resolve_internal(message, conn)
@@ -254,11 +269,11 @@ async def cmd_reject(message: Message, command: CommandObject, bot: Bot) -> None
             return
 
         async with conn.transaction():
-            rejected = await reject_chat(conn, telegram_chat_id)
+            rejected = await reject_chat(conn, telegram_chat_id, thread_id)
             if rejected is None:
                 await message.answer(
-                    f"Chat <code>{telegram_chat_id}</code> is not pending. "
-                    "Nothing to reject."
+                    f"Unit <code>{telegram_chat_id}</code>/<code>{thread_id}</code> "
+                    "is not pending. Nothing to reject."
                 )
                 return
             await insert_audit_log(
@@ -268,14 +283,28 @@ async def cmd_reject(message: Message, command: CommandObject, bot: Bot) -> None
                 actor_internal_id=internal.id,
                 target_entity="chat",
                 target_id=rejected.id,
-                payload={"telegram_chat_id": telegram_chat_id},
+                payload={"telegram_chat_id": telegram_chat_id, "thread_id": thread_id},
             )
+        # Only leave the whole Telegram supergroup when no other monitored unit
+        # of it remains — leaving would kill every topic.
+        remaining = await count_live_units(conn, telegram_chat_id)
 
-    left = await _leave_chat_quietly(bot, telegram_chat_id)
-    log.info("onboarding.rejected", chat_id=telegram_chat_id, left=left, by=internal.full_name)
-    suffix = "" if left else " (I couldn't leave it — already removed?)"
+    if remaining == 0:
+        left = await _leave_chat_quietly(bot, telegram_chat_id)
+        suffix = "" if left else " (I couldn't leave it — already removed?)"
+        body = f"and left the group{suffix}"
+    else:
+        body = f"(staying in the group — {remaining} other unit(s) still monitored)"
+    log.info(
+        "onboarding.rejected",
+        chat_id=telegram_chat_id,
+        thread_id=thread_id,
+        remaining=remaining,
+        by=internal.full_name,
+    )
     await message.answer(
-        f"🚫 Chat <code>{telegram_chat_id}</code> rejected and banned.{suffix}"
+        f"🚫 Unit <code>{telegram_chat_id}</code>/<code>{thread_id}</code> "
+        f"rejected and banned {body}."
     )
 
 
@@ -291,25 +320,40 @@ async def _leave_chat_quietly(bot: Bot, telegram_chat_id: int) -> bool:
         return False
 
 
-def _parse_authorize_args(args: str | None) -> tuple[int, str] | None:
-    """Split ``<chat_id> <partner name>`` into ``(chat_id, name)`` or ``None``."""
+def _parse_authorize_args(args: str | None) -> tuple[int, int, str] | None:
+    """Split ``<chat_id> <thread_id> <partner name>`` or return ``None``."""
     if not args:
         return None
-    parts = args.strip().split(maxsplit=1)
+    parts = args.strip().split(maxsplit=2)
+    if len(parts) != 3:
+        return None
+    chat_id = _parse_int(parts[0])
+    thread_id = _parse_int(parts[1])
+    partner_name = parts[2].strip()
+    if chat_id is None or thread_id is None or not partner_name:
+        return None
+    return chat_id, thread_id, partner_name
+
+
+def _parse_reject_args(args: str | None) -> tuple[int, int] | None:
+    """Split ``<chat_id> <thread_id>`` into ``(chat_id, thread_id)`` or ``None``."""
+    if not args:
+        return None
+    parts = args.strip().split()
     if len(parts) != 2:
         return None
-    chat_id = _parse_chat_id(parts[0])
-    partner_name = parts[1].strip()
-    if chat_id is None or not partner_name:
+    chat_id = _parse_int(parts[0])
+    thread_id = _parse_int(parts[1])
+    if chat_id is None or thread_id is None:
         return None
-    return chat_id, partner_name
+    return chat_id, thread_id
 
 
-def _parse_chat_id(token: str | None) -> int | None:
-    """Parse a Telegram chat id (negative for groups) from a string, or ``None``."""
+def _parse_int(token: str | None) -> int | None:
+    """Parse a single integer token (chat id is negative for groups), or ``None``."""
     if not token:
         return None
     try:
-        return int(token.strip().split(maxsplit=1)[0])
+        return int(token.strip())
     except ValueError:
         return None

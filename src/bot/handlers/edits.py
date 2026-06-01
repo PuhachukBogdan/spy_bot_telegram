@@ -18,9 +18,10 @@ from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.types import Message
 
+from src.bot.topics import effective_topic_id
 from src.config import settings
 from src.db.client import acquire_connection
-from src.db.queries.chats import get_chat_by_telegram_id
+from src.db.queries.chats import get_chat_unit
 from src.db.queries.messages import (
     get_message,
     insert_message_edit,
@@ -43,7 +44,7 @@ async def on_edited_message(edited: Message) -> None:
     new_text = edited.text if edited.text is not None else edited.caption
 
     async with acquire_connection() as conn:
-        chat = await get_chat_by_telegram_id(conn, edited.chat.id)
+        chat = await get_chat_unit(conn, edited.chat.id, effective_topic_id(edited))
         if chat is None:
             return
         existing = await get_message(conn, chat.id, edited.message_id)

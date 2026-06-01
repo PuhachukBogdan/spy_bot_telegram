@@ -229,6 +229,8 @@ CREATE INDEX idx_chats_status ON chats(status);
 CREATE INDEX idx_chats_partner ON chats(partner_id);
 ```
 
+> **Миграция `0005` (topic units):** в `chats` добавлены `message_thread_id BIGINT`, `topic_name TEXT`, `topic_key BIGINT GENERATED ALWAYS AS (COALESCE(message_thread_id,0)) STORED`; `UNIQUE(telegram_chat_id)` заменён на `UNIQUE(telegram_chat_id, topic_key)`. Строка `chats` теперь = одна тема форума (или вся группа при `topic_key=0`). См. §11.7.
+
 ### 5.3 `internal_users`
 ```sql
 CREATE TABLE internal_users (
@@ -1018,8 +1020,17 @@ Privacy mode = OFF включаем у @BotFather командой `/setprivacy 
 ### 11.6 Group → supergroup migration
 Telegram присылает событие с `migrate_to_chat_id`. Без обработки старый chat_id "осиротеет". Обработать → UPDATE telegram_chat_id в chats.
 
-### 11.7 Forum topics
-В супергруппах с topics каждое сообщение имеет `message_thread_id`. Сохраняем поле, но **анализ ведём на уровне chat, не thread** в MVP.
+### 11.7 Forum topics — единица мониторинга = тема (обновлено)
+В форум-супергруппах каждое сообщение в теме имеет `message_thread_id` + `is_topic_message=true`. **Одна строка `chats` = один monitored unit = `(telegram_chat_id, topic)`**, где `topic` — id темы или `NULL`/0 для всей группы / General. Так одна супергруппа может держать много несвязанных партнёров (по теме на партнёра), а весь нижестоящий pipeline разделяется по темам автоматически (всё FK-ится на `chats.id`).
+
+Ключевые правила реализации:
+- Тему различаем только если `chat.is_forum AND message.is_topic_message` (см. `src/bot/topics.py:effective_topic_id`) — иначе reply-треды в обычных группах ложно стали бы отдельными юнитами.
+- Уникальность `chats` — по `(telegram_chat_id, topic_key)`, где `topic_key = COALESCE(message_thread_id, 0)` (миграция `0005`).
+- Telegram НЕ шлёт событие на каждую тему: group-level юнит создаётся в `my_chat_member`, а отдельные темы **обнаруживаются лениво** по первому сообщению (whitelist middleware: создаёт pending-юнит + DM админам один раз, контент до авторизации не сохраняется).
+- DM-команды: `/authorize <chat_id> <thread_id> <partner>`, `/reject <chat_id> <thread_id>` (thread `0` = вся группа).
+- Из супергруппы бот выходит (`leave_chat`) только когда не осталось живых юнитов (`count_live_units == 0`) — иначе остаёмся ради других тем.
+
+См. wiki `proj1-tgbot-topic-separation-plan`.
 
 ### 11.8 Anonymous admins
 Если админ постит "от имени группы" → `from` отсутствует, есть `sender_chat`. Помечаем `sender_role='anonymous_admin'`, в whitelist не ищем.

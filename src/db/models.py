@@ -83,6 +83,13 @@ class Partner(_ORMModel):
 class Chat(_ORMModel):
     id: UUID
     telegram_chat_id: int
+    # A chats row is a monitored *unit* = one forum topic. message_thread_id is
+    # NULL for a whole group / forum General topic / non-forum group; topic_key
+    # is the generated COALESCE(message_thread_id, 0) used for NULL-safe
+    # uniqueness (read-only — never supplied on insert).
+    message_thread_id: int | None = None
+    topic_key: int = 0
+    topic_name: str | None = None
     partner_id: UUID | None = None
     chat_name: str | None = None
     status: str = "pending"

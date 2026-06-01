@@ -100,6 +100,7 @@ async def ingest_message(message: Message, chat: Chat) -> None:
     log.info(
         "ingest.stored",
         chat_id=chat.telegram_chat_id,
+        thread_id=chat.message_thread_id,
         msg_id=message.message_id,
         type=message_type,
         role=sender_role,

@@ -20,7 +20,11 @@ from aiogram.exceptions import TelegramAPIError
 from src.config import settings
 from src.db.client import acquire_connection
 from src.db.queries.audit import insert_audit_log
-from src.db.queries.chats import list_stale_pending_chats, mark_chat_abandoned
+from src.db.queries.chats import (
+    count_live_units,
+    list_stale_pending_chats,
+    mark_chat_abandoned,
+)
 from src.db.queries.queue import claim_tasks
 from src.pipeline.tier1 import pattern_cache
 from src.pipeline.transcription import process_whisper_task
@@ -50,9 +54,10 @@ async def run_abandoned_chat_sweep(bot: Bot) -> int:
 
     swept = 0
     for chat in stale:
-        await _leave_chat_quietly(bot, chat.telegram_chat_id)
         async with acquire_connection() as conn, conn.transaction():
-            marked = await mark_chat_abandoned(conn, chat.telegram_chat_id)
+            marked = await mark_chat_abandoned(
+                conn, chat.telegram_chat_id, chat.message_thread_id
+            )
             if marked is None:
                 continue  # status changed under us; skip
             await insert_audit_log(
@@ -62,11 +67,17 @@ async def run_abandoned_chat_sweep(bot: Bot) -> int:
                 target_id=marked.id,
                 payload={
                     "telegram_chat_id": chat.telegram_chat_id,
+                    "thread_id": chat.message_thread_id,
                     "reason": "pending_timeout",
                     "timeout_hours": settings.ABANDONED_CHAT_TIMEOUT_HOURS,
                 },
             )
-            swept += 1
+            # Leave the whole supergroup only once no monitored unit of it remains
+            # (leaving kills every topic); abandon the unit first, then check.
+            remaining = await count_live_units(conn, chat.telegram_chat_id)
+        if remaining == 0:
+            await _leave_chat_quietly(bot, chat.telegram_chat_id)
+        swept += 1
     return swept
 
 

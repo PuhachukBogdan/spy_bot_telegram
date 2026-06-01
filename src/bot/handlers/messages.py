@@ -19,9 +19,10 @@ from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.types import Message
 
+from src.bot.topics import effective_topic_id
 from src.db.client import acquire_connection
 from src.db.queries.chat_events import insert_chat_event
-from src.db.queries.chats import get_chat_by_telegram_id, update_chat_telegram_id
+from src.db.queries.chats import get_chat_unit, update_chat_telegram_id
 from src.pipeline.ingest import ingest_message
 from src.utils.logging import get_logger
 
@@ -46,17 +47,18 @@ async def on_migration(message: Message) -> None:
         return
     old_id = message.chat.id
     async with acquire_connection() as conn:
-        chat = await get_chat_by_telegram_id(conn, old_id)
-        if chat is None:
-            return
-        await insert_chat_event(
-            conn,
-            chat_id=chat.id,
-            event_type="migration",
-            payload={"old_chat_id": old_id, "new_chat_id": new_id},
-        )
-        await update_chat_telegram_id(conn, old_id, new_id)
-    log.info("chat.migrated", old_chat_id=old_id, new_chat_id=new_id)
+        # Migration is group-level: record against the group-level unit, then
+        # move every topic unit of the supergroup to the new id.
+        chat = await get_chat_unit(conn, old_id, None)
+        if chat is not None:
+            await insert_chat_event(
+                conn,
+                chat_id=chat.id,
+                event_type="migration",
+                payload={"old_chat_id": old_id, "new_chat_id": new_id},
+            )
+        moved = await update_chat_telegram_id(conn, old_id, new_id)
+    log.info("chat.migrated", old_chat_id=old_id, new_chat_id=new_id, units_moved=moved)
 
 
 @router.message(F.new_chat_members)
@@ -67,7 +69,7 @@ async def on_members_joined(message: Message) -> None:
         return
     actor = message.from_user
     async with acquire_connection() as conn:
-        chat = await get_chat_by_telegram_id(conn, message.chat.id)
+        chat = await get_chat_unit(conn, message.chat.id, None)
         if chat is None:
             return
         for member in members:
@@ -90,7 +92,7 @@ async def on_member_left(message: Message) -> None:
         return
     actor = message.from_user
     async with acquire_connection() as conn:
-        chat = await get_chat_by_telegram_id(conn, message.chat.id)
+        chat = await get_chat_unit(conn, message.chat.id, None)
         if chat is None:
             return
         await insert_chat_event(
@@ -112,7 +114,7 @@ async def on_title_change(message: Message) -> None:
         return
     actor = message.from_user
     async with acquire_connection() as conn:
-        chat = await get_chat_by_telegram_id(conn, message.chat.id)
+        chat = await get_chat_unit(conn, message.chat.id, None)
         if chat is None:
             return
         await insert_chat_event(
@@ -131,9 +133,10 @@ async def on_content_message(message: Message) -> None:
 
     Reached only by non-service messages (the service handlers above match first).
     """
+    thread_id = effective_topic_id(message)
     async with acquire_connection() as conn:
-        chat = await get_chat_by_telegram_id(conn, message.chat.id)
+        chat = await get_chat_unit(conn, message.chat.id, thread_id)
     if chat is None:  # whitelist passed but row vanished; nothing to attach to
-        log.warning("ingest.no_chat_row", chat_id=message.chat.id)
+        log.warning("ingest.no_chat_row", chat_id=message.chat.id, thread_id=thread_id)
         return
     await ingest_message(message, chat)
