@@ -48,6 +48,20 @@ class Settings(BaseSettings):
 
     # === Whisper (OpenAI Audio API, separate from OpenRouter) ===
     OPENAI_API_KEY: SecretStr
+    # MVP kill-switch. When false the queue consumer still runs and DRAINS
+    # whisper_transcribe tasks (marks them done) without calling the paid API, so
+    # the queue never backs up. Flip to true once the Whisper budget exists — no
+    # code change needed. Voice notes queued while disabled are not transcribed
+    # retroactively (they keep transcription=NULL).
+    WHISPER_ENABLED: bool = False
+    WHISPER_MODEL: str = "whisper-1"
+    # Queue-consumer cadence (CLAUDE.md 7.5 priority lane uses 5s; Whisper is
+    # slower + paid, so poll a touch less aggressively with a tiny batch).
+    WHISPER_POLL_INTERVAL_SECONDS: int = 10
+    WHISPER_BATCH_SIZE: int = 3
+    WHISPER_MAX_ATTEMPTS: int = 3
+    # OpenAI Audio API hard limit is 25 MB; skip anything larger than the API.
+    WHISPER_MAX_FILE_BYTES: int = 25 * 1024 * 1024
 
     # === Slack ===
     SLACK_BOT_TOKEN: SecretStr

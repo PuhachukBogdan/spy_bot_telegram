@@ -106,6 +106,29 @@ async def get_message(
     return Message.from_record(row) if row is not None else None
 
 
+async def get_message_by_id(
+    conn: asyncpg.Connection, message_id: UUID
+) -> Message | None:
+    """Return a message by its primary-key UUID, or ``None``.
+
+    Used by queue workers (Phase 7+), whose task payloads carry the message's
+    internal id rather than the ``(chat, telegram id)`` pair.
+    """
+    row = await conn.fetchrow("SELECT * FROM messages WHERE id = $1", message_id)
+    return Message.from_record(row) if row is not None else None
+
+
+async def update_message_transcription(
+    conn: asyncpg.Connection, message_id: UUID, transcription: str | None
+) -> None:
+    """Store the Whisper transcript on a voice / video_note message (Phase 7)."""
+    await conn.execute(
+        "UPDATE messages SET transcription = $2 WHERE id = $1",
+        message_id,
+        transcription,
+    )
+
+
 async def insert_message_edit(
     conn: asyncpg.Connection,
     *,

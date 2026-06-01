@@ -28,6 +28,7 @@ from src.pipeline.tier1 import pattern_cache  # noqa: E402
 from src.pipeline.workers import (  # noqa: E402
     abandoned_chat_cleanup_loop,
     pattern_reload_loop,
+    whisper_worker_loop,
 )
 
 log = get_logger(__name__)
@@ -68,12 +69,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     pattern_task = asyncio.create_task(
         pattern_reload_loop(), name="pattern_reload"
     )
+    whisper_task = asyncio.create_task(
+        whisper_worker_loop(bot), name="whisper_worker"
+    )
+    log.info("startup.whisper.worker", enabled=settings.WHISPER_ENABLED)
 
     try:
         yield
     finally:
         # --- shutdown ---
-        for task in (cleanup_task, pattern_task):
+        for task in (cleanup_task, pattern_task, whisper_task):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task

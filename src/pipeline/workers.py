@@ -21,7 +21,9 @@ from src.config import settings
 from src.db.client import acquire_connection
 from src.db.queries.audit import insert_audit_log
 from src.db.queries.chats import list_stale_pending_chats, mark_chat_abandoned
+from src.db.queries.queue import claim_tasks
 from src.pipeline.tier1 import pattern_cache
+from src.pipeline.transcription import process_whisper_task
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -97,6 +99,42 @@ async def _leave_chat_quietly(bot: Bot, telegram_chat_id: int) -> None:
         await bot.leave_chat(telegram_chat_id)
     except TelegramAPIError as exc:
         log.warning("worker.leave_failed", chat_id=telegram_chat_id, error=str(exc))
+
+
+async def whisper_worker_loop(
+    bot: Bot,
+    interval_seconds: int | None = None,
+    batch_size: int | None = None,
+) -> None:
+    """Consume ``whisper_transcribe`` tasks forever (CLAUDE.md Phase 7).
+
+    Each tick claims a small batch with ``FOR UPDATE SKIP LOCKED`` and processes
+    them sequentially; each task self-resolves to done/failed/retry inside
+    ``process_whisper_task``. The claim runs in its own short connection so the
+    slow download + API work never holds a row lock. Always runs (even with
+    ``WHISPER_ENABLED=false``) so the queue drains rather than backs up.
+    Per-iteration errors are logged and swallowed; cancellation propagates.
+    """
+    interval = interval_seconds or settings.WHISPER_POLL_INTERVAL_SECONDS
+    batch = batch_size or settings.WHISPER_BATCH_SIZE
+    log.info(
+        "worker.whisper.start",
+        interval_s=interval,
+        batch=batch,
+        enabled=settings.WHISPER_ENABLED,
+    )
+    while True:
+        try:
+            async with acquire_connection() as conn:
+                tasks = await claim_tasks(conn, "whisper_transcribe", batch)
+            for task in tasks:
+                await process_whisper_task(bot, task)
+        except asyncio.CancelledError:
+            log.info("worker.whisper.stop")
+            raise
+        except Exception as exc:  # never let one bad tick kill the loop
+            log.error("worker.whisper.error", error=str(exc))
+        await asyncio.sleep(interval)
 
 
 async def pattern_reload_loop(
