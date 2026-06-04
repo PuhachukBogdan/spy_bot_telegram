@@ -4,6 +4,18 @@ Phase 3 ships the read-only identity commands: ``/start``, ``/help``, ``/whoami`
 Phase 4 adds the onboarding-control commands; the partner/risk commands land in
 Phase 13.
 
+Access control (migration 0007) is enforced by the decorators in
+``src.bot.middleware.roles``:
+
+  * ``/start``, ``/help``, ``/whoami`` — open to everyone. ``/help`` shows the
+    internal command list to recognized staff and a neutral cover message to
+    outsiders (the full cover layer arrives later); ``/whoami`` reports the
+    caller's role.
+  * Onboarding — ``/pending``, ``/authorize``, ``/reject``, ``/authorize_topic``,
+    ``/reject_topic`` — are ``@require_role('admin')``. A non-internal caller gets
+    a neutral "Command not found."; a known non-admin gets "Insufficient
+    permissions." plus an audit row. The resolved admin is injected as ``actor``.
+
 Onboarding is split by unit type (a ``chats`` row is a monitored *unit* =
 ``(telegram_chat_id, topic)``):
 
@@ -16,34 +28,37 @@ Onboarding is split by unit type (a ``chats`` row is a monitored *unit* =
 
 Every handler here is restricted to **private** chats by a router-level filter,
 which structurally enforces CLAUDE.md's hard rule: the bot never writes in a
-partner group chat, only in DMs with our own staff. Group onboarding requires an
-enabled internal user; topic onboarding additionally requires admin.
+partner group chat, only in DMs with our own staff.
 
-Manual e2e test scenario (forum topics)::
+Manual e2e test scenario (roles + forum topics)::
 
-    1. Create a Telegram supergroup with "Topics" enabled.
-    2. Add the bot -> a pending GROUP unit is created; admins get a DM.
-    3. /authorize <chat_id> "TestPartner"   -> group becomes active.
-    4. Create a topic "Ops" and post a message in it.
-    5. The first message is dropped, a pending TOPIC unit is created, and admins
+    1. In Supabase Studio set your internal_users row to role='admin'.
+    2. /whoami -> shows Role: admin.
+    3. (optional) a second internal_users row with role='manager': /authorize
+       from it must reply "Insufficient permissions." and write an
+       unauthorized_command_attempt audit row.
+    4. Create a Telegram supergroup with "Topics" enabled.
+    5. Add the bot -> a pending GROUP unit is created; admins get a DM.
+    6. /authorize <chat_id> "TestPartner"   -> group becomes active.
+    7. Create a topic "Ops" and post a message in it.
+    8. The first message is dropped, a pending TOPIC unit is created, and admins
        get a "📂 New topic pending" DM (only because the parent group is active).
-    6. /authorize_topic <chat_id> <thread_id> "TestPartner Ops" -> topic active.
-    7. Further messages in "Ops" are ingested under the topic unit's own chats.id
-       (UUID), separate from the group-level unit.
-    8. /reject_topic <chat_id> <other_thread_id> -> that topic is 'rejected' and
+    9. /authorize_topic <chat_id> <thread_id> "TestPartner Ops" -> topic active.
+   10. /reject_topic <chat_id> <other_thread_id> -> that topic is 'rejected' and
        the bot stays in the supergroup for "Ops".
 """
 
 from __future__ import annotations
 
 from html import escape as html_escape
+from typing import Any
 
-import asyncpg
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import Message
 
+from src.bot.middleware.roles import require_role
 from src.db.client import acquire_connection
 from src.db.models import InternalUser
 from src.db.queries.audit import insert_audit_log
@@ -81,28 +96,42 @@ _HELP_TEXT = (
     "<b>Available commands</b>\n\n"
     "/start — intro and what I do\n"
     "/help — this message\n"
-    "/whoami — show whether I recognize you as an internal user\n\n"
-    "<b>Internal only — onboarding:</b>\n"
+    "/whoami — show how I recognize you and your role\n\n"
+    "<b>Admin only — onboarding:</b>\n"
     "/pending — units (groups + topics) awaiting authorization\n"
     "/authorize &lt;chat_id&gt; &lt;partner name&gt; — activate a group\n"
-    "/reject &lt;chat_id&gt; — decline a group (bot leaves it)\n\n"
-    "<b>Admin only — forum topics:</b>\n"
+    "/reject &lt;chat_id&gt; — decline a group (bot leaves it)\n"
     "/authorize_topic &lt;chat_id&gt; &lt;thread_id&gt; &lt;partner name&gt; — activate a topic\n"
     "/reject_topic &lt;chat_id&gt; &lt;thread_id&gt; — decline a topic (bot stays in the chat)\n\n"
     "<i>Partner and risk views unlock in later phases.</i>"
 )
 
+# Shown to non-internal callers instead of the internal command list. Placeholder
+# for the fuller "cover" experience added in a later phase.
+_COVER_HELP_TEXT = (
+    "<b>Partner Chat Risk Monitor</b>\n\n"
+    "This is an internal management assistant. There are no public commands "
+    "here.\n\n"
+    "If you believe you should have access, ask an administrator to register "
+    "your Telegram account."
+)
+
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    """Greet the user and explain the bot's purpose."""
+    """Greet the user and explain the bot's purpose (open to everyone)."""
     await message.answer(_START_TEXT)
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    """List the currently available commands."""
-    await message.answer(_HELP_TEXT)
+    """List commands for internal staff; show a cover message to outsiders."""
+    user = message.from_user
+    internal: InternalUser | None = None
+    if user is not None:
+        async with acquire_connection() as conn:
+            internal = await find_internal_user_by_telegram_id(conn, user.id)
+    await message.answer(_HELP_TEXT if internal is not None else _COVER_HELP_TEXT)
 
 
 @router.message(Command("whoami"))
@@ -125,64 +154,20 @@ async def cmd_whoami(message: Message) -> None:
         )
         return
 
-    role = html_escape(internal.role) if internal.role else "—"
-    admin = "yes" if internal.is_admin else "no"
     await message.answer(
         "You are recognized as an internal user.\n\n"
         f"<b>Name:</b> {html_escape(internal.full_name)}\n"
-        f"<b>Role:</b> {role}\n"
-        f"<b>Admin:</b> {admin}\n"
+        f"<b>Role:</b> {html_escape(internal.role)}\n"
+        f"<b>Admin:</b> {'yes' if internal.is_admin else 'no'}\n"
         f"<b>Telegram id:</b> <code>{user.id}</code>"
     )
 
 
-async def _resolve_internal(
-    message: Message, conn: asyncpg.Connection
-) -> InternalUser | None:
-    """Return the calling internal user, or ``None`` after replying to outsiders.
-
-    Gate for the onboarding-control commands: a Telegram account not mapped to an
-    enabled ``internal_users`` row is told it lacks access and the command is not
-    executed.
-    """
-    user = message.from_user
-    if user is None:  # private messages always carry from_user; defensive
-        await message.answer("I can't read your account details.")
-        return None
-    internal = await find_internal_user_by_telegram_id(conn, user.id)
-    if internal is None:
-        await message.answer(
-            "You're not authorized to use this command. It's restricted to "
-            "internal staff."
-        )
-        log.info("dm.command_denied", user_id=user.id)
-    return internal
-
-
-async def _resolve_admin(
-    message: Message, conn: asyncpg.Connection
-) -> InternalUser | None:
-    """Return the caller only if they're an enabled internal **admin**.
-
-    Topic onboarding is admin-gated (group onboarding needs only internal staff):
-    topic discovery DMs go to admins, so authorizing/rejecting them is too.
-    """
-    internal = await _resolve_internal(message, conn)
-    if internal is None:
-        return None
-    if not internal.is_admin:
-        await message.answer("This command is restricted to admins.")
-        log.info("dm.command_denied_not_admin", user_id=internal.id)
-        return None
-    return internal
-
-
 @router.message(Command("pending"))
-async def cmd_pending(message: Message) -> None:
-    """List units awaiting authorization, split into groups and topics."""
+@require_role("admin")
+async def cmd_pending(message: Message, actor: InternalUser, **kwargs: Any) -> None:
+    """List units awaiting authorization, split into groups and topics (admin)."""
     async with acquire_connection() as conn:
-        if await _resolve_internal(message, conn) is None:
-            return
         pending = await list_pending(conn)
 
     if not pending:
@@ -225,8 +210,11 @@ async def cmd_pending(message: Message) -> None:
 
 
 @router.message(Command("authorize"))
-async def cmd_authorize(message: Message, command: CommandObject) -> None:
-    """Activate a pending GROUP and bind it to a partner (internal only).
+@require_role("admin")
+async def cmd_authorize(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Activate a pending GROUP and bind it to a partner (admin only).
 
     Usage: ``/authorize <chat_id> <partner name>``. The partner is created if it
     does not exist. The activation + partner upsert + audit row commit together.
@@ -243,10 +231,6 @@ async def cmd_authorize(message: Message, command: CommandObject) -> None:
     telegram_chat_id, partner_name = parsed
 
     async with acquire_connection() as conn:
-        internal = await _resolve_internal(message, conn)
-        if internal is None:
-            return
-
         async with conn.transaction():
             chat = await get_chat_unit(conn, telegram_chat_id, None)  # group-level
             if chat is None:
@@ -268,7 +252,7 @@ async def cmd_authorize(message: Message, command: CommandObject) -> None:
                 telegram_chat_id=telegram_chat_id,
                 thread_id=None,
                 partner_id=partner.id,
-                authorized_by=internal.id,
+                authorized_by=actor.id,
             )
             if activated is None:  # lost a race; unit left pending state
                 await message.answer(
@@ -281,7 +265,7 @@ async def cmd_authorize(message: Message, command: CommandObject) -> None:
                 conn,
                 action="authorize_chat",
                 actor_user_id=message.from_user.id if message.from_user else None,
-                actor_internal_id=internal.id,
+                actor_internal_id=actor.id,
                 target_entity="chat",
                 target_id=activated.id,
                 payload={
@@ -295,7 +279,7 @@ async def cmd_authorize(message: Message, command: CommandObject) -> None:
         "onboarding.authorized",
         chat_id=telegram_chat_id,
         partner=partner.name,
-        by=internal.full_name,
+        by=actor.full_name,
     )
     await message.answer(
         f"✅ Group activated and bound to partner <b>{html_escape(partner.name)}</b>. "
@@ -304,8 +288,15 @@ async def cmd_authorize(message: Message, command: CommandObject) -> None:
 
 
 @router.message(Command("reject"))
-async def cmd_reject(message: Message, command: CommandObject, bot: Bot) -> None:
-    """Decline a pending GROUP: mark it banned and leave it (internal only).
+@require_role("admin")
+async def cmd_reject(
+    message: Message,
+    actor: InternalUser,
+    command: CommandObject,
+    bot: Bot,
+    **kwargs: Any,
+) -> None:
+    """Decline a pending GROUP: mark it banned and leave it (admin only).
 
     Usage: ``/reject <chat_id>``. The DB flip + audit commit together; the
     ``bot.leave_chat`` call happens after commit and only when no other live unit
@@ -322,10 +313,6 @@ async def cmd_reject(message: Message, command: CommandObject, bot: Bot) -> None
     telegram_chat_id = parsed
 
     async with acquire_connection() as conn:
-        internal = await _resolve_internal(message, conn)
-        if internal is None:
-            return
-
         async with conn.transaction():
             rejected = await reject_chat(conn, telegram_chat_id, None)
             if rejected is None:
@@ -338,7 +325,7 @@ async def cmd_reject(message: Message, command: CommandObject, bot: Bot) -> None
                 conn,
                 action="reject_chat",
                 actor_user_id=message.from_user.id if message.from_user else None,
-                actor_internal_id=internal.id,
+                actor_internal_id=actor.id,
                 target_entity="chat",
                 target_id=rejected.id,
                 payload={"telegram_chat_id": telegram_chat_id},
@@ -357,7 +344,7 @@ async def cmd_reject(message: Message, command: CommandObject, bot: Bot) -> None
         "onboarding.rejected",
         chat_id=telegram_chat_id,
         remaining=remaining,
-        by=internal.full_name,
+        by=actor.full_name,
     )
     await message.answer(
         f"🚫 Group <code>{telegram_chat_id}</code> rejected and banned {body}."
@@ -365,7 +352,10 @@ async def cmd_reject(message: Message, command: CommandObject, bot: Bot) -> None
 
 
 @router.message(Command("authorize_topic"))
-async def cmd_authorize_topic(message: Message, command: CommandObject) -> None:
+@require_role("admin")
+async def cmd_authorize_topic(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
     """Activate a pending forum TOPIC and bind it to a partner (admin only).
 
     Usage: ``/authorize_topic <chat_id> <thread_id> <partner name>``. Guarded to a
@@ -383,10 +373,6 @@ async def cmd_authorize_topic(message: Message, command: CommandObject) -> None:
     telegram_chat_id, thread_id, partner_name = parsed
 
     async with acquire_connection() as conn:
-        internal = await _resolve_admin(message, conn)
-        if internal is None:
-            return
-
         async with conn.transaction():
             chat = await get_chat_unit(conn, telegram_chat_id, thread_id)
             if chat is None or chat.status != "pending" or chat.unit_type != "topic":
@@ -399,7 +385,7 @@ async def cmd_authorize_topic(message: Message, command: CommandObject) -> None:
                 telegram_chat_id=telegram_chat_id,
                 thread_id=thread_id,
                 partner_id=partner.id,
-                authorized_by=internal.id,
+                authorized_by=actor.id,
             )
             if activated is None:  # lost a race
                 await message.answer("No pending topic with that id.")
@@ -409,7 +395,7 @@ async def cmd_authorize_topic(message: Message, command: CommandObject) -> None:
                 conn,
                 action="authorize_topic",
                 actor_user_id=message.from_user.id if message.from_user else None,
-                actor_internal_id=internal.id,
+                actor_internal_id=actor.id,
                 target_entity="chat",
                 target_id=activated.id,
                 payload={
@@ -425,7 +411,7 @@ async def cmd_authorize_topic(message: Message, command: CommandObject) -> None:
         chat_id=telegram_chat_id,
         thread_id=thread_id,
         partner=partner.name,
-        by=internal.full_name,
+        by=actor.full_name,
     )
     await message.answer(
         f"✅ Topic activated, monitoring started for "
@@ -434,7 +420,10 @@ async def cmd_authorize_topic(message: Message, command: CommandObject) -> None:
 
 
 @router.message(Command("reject_topic"))
-async def cmd_reject_topic(message: Message, command: CommandObject) -> None:
+@require_role("admin")
+async def cmd_reject_topic(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
     """Decline a pending forum TOPIC (admin only); the bot stays in the chat.
 
     Usage: ``/reject_topic <chat_id> <thread_id>``. Sets ``status='rejected'`` and
@@ -450,10 +439,6 @@ async def cmd_reject_topic(message: Message, command: CommandObject) -> None:
     telegram_chat_id, thread_id = parsed
 
     async with acquire_connection() as conn:
-        internal = await _resolve_admin(message, conn)
-        if internal is None:
-            return
-
         async with conn.transaction():
             rejected = await reject_topic(conn, telegram_chat_id, thread_id)
             if rejected is None:
@@ -463,7 +448,7 @@ async def cmd_reject_topic(message: Message, command: CommandObject) -> None:
                 conn,
                 action="reject_topic",
                 actor_user_id=message.from_user.id if message.from_user else None,
-                actor_internal_id=internal.id,
+                actor_internal_id=actor.id,
                 target_entity="chat",
                 target_id=rejected.id,
                 payload={"telegram_chat_id": telegram_chat_id, "thread_id": thread_id},
@@ -473,7 +458,7 @@ async def cmd_reject_topic(message: Message, command: CommandObject) -> None:
         "onboarding.topic_rejected",
         chat_id=telegram_chat_id,
         thread_id=thread_id,
-        by=internal.full_name,
+        by=actor.full_name,
     )
     # Deliberately no leave_chat: the bot remains for the other topics.
     await message.answer("🚫 Topic rejected. The bot stays in the chat for other topics.")

@@ -62,11 +62,18 @@ class _ORMModel(BaseModel):
 class InternalUser(_ORMModel):
     id: UUID
     full_name: str
-    role: str | None = None
+    # role is the single source of truth for access (migration 0007). The legacy
+    # is_admin column still exists in the DB but is ignored on read (extra keys
+    # are dropped) — is_admin is exposed below as a property derived from role.
+    role: Literal["admin", "manager", "viewer"] = "manager"
     telegram_accounts: list[int] = Field(default_factory=list)
-    is_admin: bool = False
     enabled: bool = True
     created_at: datetime
+
+    @property
+    def is_admin(self) -> bool:
+        """Back-compat shim: admin iff role == 'admin' (CLAUDE.md / migration 0007)."""
+        return self.role == "admin"
 
 
 # --- 2. partners ------------------------------------------------------------

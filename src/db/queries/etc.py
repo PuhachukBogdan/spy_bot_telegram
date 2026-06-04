@@ -37,14 +37,16 @@ async def find_internal_user_by_telegram_id(
 async def list_admin_users(conn: asyncpg.Connection) -> list[InternalUser]:
     """Return all enabled admins (for onboarding DM notifications, CLAUDE.md 7.2).
 
-    A person whose ``telegram_accounts`` is empty still matches, but the bot can
-    only DM accounts that have started it; the caller handles unreachable users.
+    Matches on ``role = 'admin'`` — the single source of truth since migration
+    0007 (the legacy ``is_admin`` column is no longer read in app code). A person
+    whose ``telegram_accounts`` is empty still matches, but the bot can only DM
+    accounts that have started it; the caller handles unreachable users.
     """
     rows = await conn.fetch(
         """
         SELECT *
         FROM internal_users
-        WHERE is_admin = true
+        WHERE role = 'admin'
           AND enabled = true
         ORDER BY full_name ASC
         """
