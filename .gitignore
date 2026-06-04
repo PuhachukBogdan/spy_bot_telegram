@@ -53,6 +53,12 @@ supabase/.temp/
 supabase/.branches/
 supabase/.env
 
+# Non-code project files — kept local, not part of the technical codebase.
+# CLAUDE.md (Claude Code working context / project brief) and the .docx manual
+# generator are working/meta artifacts, not the bot itself.
+CLAUDE.md
+scripts/gen_docs.py
+
 # Internal spec docs — kept local for now; may become docs/README later
 *.docx
 
