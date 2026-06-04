@@ -11,8 +11,29 @@ asyncpg maps it to the NUMERIC columns directly.
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import cast
 
 import asyncpg
+
+from src.db.models import CostTracking
+
+
+async def get_today(conn: asyncpg.Connection) -> CostTracking | None:
+    """Today's cost row (``/cost_status``), or ``None`` if nothing spent yet."""
+    row = await conn.fetchrow("SELECT * FROM cost_tracking WHERE date = CURRENT_DATE")
+    return CostTracking.from_record(row) if row is not None else None
+
+
+async def sum_last_7_days(conn: asyncpg.Connection) -> Decimal:
+    """Total spend over the last 7 calendar days (today inclusive)."""
+    value = await conn.fetchval(
+        """
+        SELECT coalesce(sum(total_cost_usd), 0)
+        FROM cost_tracking
+        WHERE date >= CURRENT_DATE - 6
+        """
+    )
+    return cast("Decimal", value)
 
 
 async def record_whisper_cost(

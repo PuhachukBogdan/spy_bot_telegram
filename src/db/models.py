@@ -387,3 +387,45 @@ class Reminder(_ORMModel):
     created_by: UUID
     created_at: datetime | None = None
     sent_at: datetime | None = None
+
+
+# === Read projections =======================================================
+# Not table rows: aggregate / joined shapes returned by the DM listing commands
+# (partners / chats / risks). Kept typed (CLAUDE.md section 9 — no dict[str, Any]
+# in public APIs) so handlers read fields, not Record keys.
+
+
+class PartnerOverview(_ORMModel):
+    """One row of ``/partners``: a partner plus activity rollups."""
+
+    id: UUID
+    name: str
+    status: str
+    owner_manager_id: UUID | None = None
+    active_chats: int = 0
+    last_activity: datetime | None = None
+
+
+class ChatOverview(_ORMModel):
+    """One row of ``/chats``: a unit plus its partner name and last activity."""
+
+    id: UUID
+    telegram_chat_id: int
+    unit_type: str
+    message_thread_id: int | None = None
+    chat_name: str | None = None
+    status: str
+    partner_name: str | None = None
+    last_activity: datetime | None = None
+
+
+class RiskEventOverview(_ORMModel):
+    """One row of ``/risks``: a risk event plus its partner name."""
+
+    id: UUID
+    risk_level: str
+    risk_type: str
+    detected_phrase: str | None = None
+    status: str
+    created_at: datetime
+    partner_name: str | None = None

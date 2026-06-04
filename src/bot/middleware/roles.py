@@ -24,11 +24,12 @@ passes the event plus all contextual data (``command``, ``bot``, …) straight
 through, and we re-dispatch to the real handler with ``actor`` / ``partner``
 added. Every decorated handler therefore must accept ``**kwargs``.
 
-Information-disclosure posture: an unrecognized caller and a not-owned partner
-both get a neutral "not found" reply, never "you lack permission" — so the
-existence of privileged commands / partners is not leaked. Only a *known*
-internal user with the wrong role is told "Insufficient permissions" (and that
-attempt is audited).
+Information-disclosure posture: an unrecognized caller, a wrong-role caller and a
+not-owned partner ALL get the same neutral "not found" reply — never "you lack
+permission". The hidden (admin-only) functionality must stay invisible to
+managers and viewers, who may themselves be subjects of monitoring, so a
+wrong-role attempt is indistinguishable from a nonexistent command. The attempt
+is still recorded in the audit log (action ``unauthorized_command_attempt``).
 """
 
 from __future__ import annotations
@@ -86,10 +87,11 @@ def _copy_meta(wrapper: RoleHandler, handler: RoleHandler) -> None:
 def require_role(*allowed_roles: str) -> Callable[[RoleHandler], RoleHandler]:
     """Restrict a DM command to the given roles; inject the caller as ``actor``.
 
-    Replies (and stops) when the caller is not an enabled internal user
-    ("Command not found." — does not reveal the command exists) or has a role
-    outside ``allowed_roles`` ("Insufficient permissions." + an
-    ``unauthorized_command_attempt`` audit row). Otherwise calls the wrapped
+    Replies "Command not found." (and stops) when the caller is not an enabled
+    internal user OR has a role outside ``allowed_roles`` — the two cases are
+    intentionally indistinguishable so a non-admin can't discover the command
+    exists. A wrong-role attempt additionally writes an
+    ``unauthorized_command_attempt`` audit row. Otherwise calls the wrapped
     handler with ``actor=<InternalUser>`` added to its kwargs.
     """
 
@@ -123,7 +125,10 @@ def require_role(*allowed_roles: str) -> Callable[[RoleHandler], RoleHandler]:
                             "allowed": list(allowed_roles),
                         },
                     )
-                    await message.answer("Insufficient permissions.")
+                    # Same neutral reply as an unknown caller: a non-admin (e.g. a
+                    # manager — who may themselves be a subject of monitoring) must
+                    # never learn the command exists. We still audit the attempt.
+                    await message.answer("Command not found.")
                     log.info(
                         "rbac.denied",
                         user_id=user.id,

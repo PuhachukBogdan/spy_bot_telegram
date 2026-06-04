@@ -18,7 +18,86 @@ from uuid import UUID
 
 import asyncpg
 
-from src.db.models import Chat
+from src.db.models import Chat, ChatOverview
+
+
+async def list_chats_overview(
+    conn: asyncpg.Connection,
+    *,
+    status: str | None = None,
+    owner_id: UUID | None = None,
+) -> list[ChatOverview]:
+    """List units with partner name + last activity for ``/chats``.
+
+    ``status`` filters by unit status (``None`` = all). ``owner_id`` restricts to
+    units of one manager's partners (admins pass ``None``). ``last_activity`` is
+    the latest message timestamp for the unit.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT c.id, c.telegram_chat_id, c.unit_type, c.message_thread_id,
+               c.chat_name, c.status, p.name AS partner_name,
+               max(m.timestamp) AS last_activity
+        FROM chats c
+        LEFT JOIN partners p ON p.id = c.partner_id
+        LEFT JOIN messages m ON m.chat_id = c.id
+        WHERE ($1::text IS NULL OR c.status = $1)
+          AND ($2::uuid IS NULL
+               OR c.partner_id IN (
+                   SELECT id FROM partners WHERE owner_manager_id = $2))
+        GROUP BY c.id, p.name
+        ORDER BY max(m.timestamp) DESC NULLS LAST
+        """,
+        status,
+        owner_id,
+    )
+    return [ChatOverview.from_record(row) for row in rows]
+
+
+async def list_chat_overviews_by_partner(
+    conn: asyncpg.Connection, partner_id: UUID
+) -> list[ChatOverview]:
+    """Units of one partner (all statuses) with last activity, for ``/partner``."""
+    rows = await conn.fetch(
+        """
+        SELECT c.id, c.telegram_chat_id, c.unit_type, c.message_thread_id,
+               c.chat_name, c.status, p.name AS partner_name,
+               max(m.timestamp) AS last_activity
+        FROM chats c
+        LEFT JOIN partners p ON p.id = c.partner_id
+        LEFT JOIN messages m ON m.chat_id = c.id
+        WHERE c.partner_id = $1
+        GROUP BY c.id, p.name
+        ORDER BY max(m.timestamp) DESC NULLS LAST
+        """,
+        partner_id,
+    )
+    return [ChatOverview.from_record(row) for row in rows]
+
+
+async def find_chats_by_ref(
+    conn: asyncpg.Connection, ref: str, ref_as_int: int | None
+) -> list[Chat]:
+    """Resolve a ``/chat`` reference to matching units (may be more than one).
+
+    A reference can be the full ``chats.id`` UUID, its first 8 chars, the
+    ``telegram_chat_id`` (passed pre-parsed as ``ref_as_int``; a supergroup id
+    matches every topic unit), or the ``chat_name`` (case-insensitive). The caller
+    decides what to do when several units match.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT * FROM chats
+        WHERE id::text = $1
+           OR left(id::text, 8) = $1
+           OR ($2::bigint IS NOT NULL AND telegram_chat_id = $2)
+           OR chat_name ILIKE $1
+        ORDER BY topic_key
+        """,
+        ref,
+        ref_as_int,
+    )
+    return [Chat.from_record(row) for row in rows]
 
 
 async def get_chat_status(

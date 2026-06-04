@@ -130,6 +130,48 @@ async def get_message_by_id(
     return Message.from_record(row) if row is not None else None
 
 
+async def get_messages_around(
+    conn: asyncpg.Connection,
+    chat_id: UUID,
+    anchor_ts: datetime,
+    *,
+    before: int = 3,
+    after: int = 3,
+) -> tuple[list[Message], list[Message]]:
+    """Return ``(before, after)`` context messages around an anchor timestamp.
+
+    Used by ``/risk`` to show the conversation around a flagged message: up to
+    ``before`` messages strictly older and ``after`` strictly newer, both in the
+    same chat unit. Each list is returned in chronological order (oldest first).
+    The anchor itself is excluded (the caller already has it).
+    """
+    before_rows = await conn.fetch(
+        """
+        SELECT * FROM messages
+        WHERE chat_id = $1 AND timestamp < $2
+        ORDER BY timestamp DESC
+        LIMIT $3
+        """,
+        chat_id,
+        anchor_ts,
+        before,
+    )
+    after_rows = await conn.fetch(
+        """
+        SELECT * FROM messages
+        WHERE chat_id = $1 AND timestamp > $2
+        ORDER BY timestamp ASC
+        LIMIT $3
+        """,
+        chat_id,
+        anchor_ts,
+        after,
+    )
+    before_list = [Message.from_record(row) for row in reversed(before_rows)]
+    after_list = [Message.from_record(row) for row in after_rows]
+    return before_list, after_list
+
+
 async def update_message_transcription(
     conn: asyncpg.Connection, message_id: UUID, transcription: str | None
 ) -> None:

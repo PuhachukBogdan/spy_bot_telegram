@@ -7,10 +7,11 @@ Phase 13.
 Access control (migration 0007) is enforced by the decorators in
 ``src.bot.middleware.roles``:
 
-  * ``/start``, ``/help``, ``/whoami`` — open to everyone. ``/help`` shows the
-    internal command list to recognized staff and a neutral cover message to
-    outsiders (the full cover layer arrives later); ``/whoami`` reports the
-    caller's role.
+  * ``/start``, ``/help``, ``/whoami`` — open to everyone, but only an *admin*
+    sees the real bot. Managers, viewers and outsiders all get the same neutral
+    "cover" responses that never hint the bot reads messages or tracks risk; only
+    an admin's ``/start`` / ``/help`` / ``/whoami`` expose the monitoring purpose,
+    command surface and role.
   * Onboarding — ``/pending``, ``/authorize``, ``/reject``, ``/authorize_topic``,
     ``/reject_topic`` — are ``@require_role('admin')``. A non-internal caller gets
     a neutral "Command not found."; a known non-admin gets "Insufficient
@@ -50,6 +51,7 @@ Manual e2e test scenario (roles + forum topics)::
 
 from __future__ import annotations
 
+from datetime import datetime
 from html import escape as html_escape
 from typing import Any
 
@@ -58,20 +60,41 @@ from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import Message
 
-from src.bot.middleware.roles import require_role
+from src.bot.middleware.roles import require_partner_access, require_role
+from src.config import settings
 from src.db.client import acquire_connection
-from src.db.models import InternalUser
+from src.db.models import InternalUser, Partner
+from src.db.queries import notes as notes_q
+from src.db.queries import risk_events as risk_q
 from src.db.queries.audit import insert_audit_log
 from src.db.queries.chats import (
     authorize_chat,
     count_live_units,
+    find_chats_by_ref,
     get_chat_unit,
+    list_chat_overviews_by_partner,
+    list_chats_overview,
     list_pending,
     reject_chat,
     reject_topic,
 )
-from src.db.queries.etc import find_internal_user_by_telegram_id
-from src.db.queries.partners import get_or_create_partner
+from src.db.queries.cost import get_today as cost_get_today
+from src.db.queries.cost import sum_last_7_days
+from src.db.queries.etc import (
+    find_internal_user_by_identifier,
+    find_internal_user_by_telegram_id,
+    get_internal_user_by_id,
+)
+from src.db.queries.messages import get_message_by_id, get_messages_around
+from src.db.queries.partners import (
+    get_or_create_partner,
+    get_partner_by_id,
+    get_partner_by_name,
+    list_partners,
+    update_partner_owner,
+    update_partner_status,
+)
+from src.db.queries.patterns import load_enabled_patterns
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -82,84 +105,128 @@ router = Router(name="dm_commands")
 router.message.filter(F.chat.type == ChatType.PRIVATE)
 
 
-_START_TEXT = (
-    "<b>Partner Chat Risk Monitor</b>\n\n"
-    "I silently monitor partner group chats for risk signals and report to "
-    "management. I never post in partner chats — I only talk here, in DMs with "
-    "internal staff.\n\n"
-    "By messaging me you've enabled DMs, so I can now reach you with the "
-    "notifications your role allows.\n\n"
-    "Use /help to see what I can do, and /whoami to check how I recognize you."
+# Cover identity shown to EVERYONE who is not an admin (managers, viewers and
+# outsiders alike). It must never hint at what the bot does under the hood —
+# message reading, risk scoring, monitoring. The real surface-level "cover"
+# features land later; for now this is a neutral assistant face.
+_START_COVER = (
+    "<b>Partner Assistant</b>\n\n"
+    "Hi! I'm an assistant for partner communication.\n\n"
+    "Use /help to see what I can do."
 )
 
-_HELP_TEXT = (
+# Honest intro — shown ONLY to an admin (no one else ever receives this string).
+_START_ADMIN = (
+    "<b>Partner Chat Risk Monitor — admin</b>\n\n"
+    "You're recognized as an administrator. I monitor authorized partner chats "
+    "and surface risk signals to you here in DM — never in the partner chats "
+    "themselves.\n\n"
+    "Use /help for the full command list."
+)
+
+# /help body for non-admins (managers, viewers, outsiders) — the cover surface.
+# Lists only the neutral commands; no trace of the monitoring layer.
+_COVER_HELP_TEXT = (
+    "<b>Partner Assistant</b>\n\n"
+    "/start — about this bot\n"
+    "/help — this message\n"
+    "/whoami — show how I recognize you"
+)
+
+_HELP_COMMON = (
     "<b>Available commands</b>\n\n"
     "/start — intro and what I do\n"
     "/help — this message\n"
-    "/whoami — show how I recognize you and your role\n\n"
-    "<b>Admin only — onboarding:</b>\n"
-    "/pending — units (groups + topics) awaiting authorization\n"
-    "/authorize &lt;chat_id&gt; &lt;partner name&gt; — activate a group\n"
-    "/reject &lt;chat_id&gt; — decline a group (bot leaves it)\n"
-    "/authorize_topic &lt;chat_id&gt; &lt;thread_id&gt; &lt;partner name&gt; — activate a topic\n"
-    "/reject_topic &lt;chat_id&gt; &lt;thread_id&gt; — decline a topic (bot stays in the chat)\n\n"
-    "<i>Partner and risk views unlock in later phases.</i>"
+    "/whoami — show how I recognize you and your role"
 )
 
-# Shown to non-internal callers instead of the internal command list. Placeholder
-# for the fuller "cover" experience added in a later phase.
-_COVER_HELP_TEXT = (
-    "<b>Partner Chat Risk Monitor</b>\n\n"
-    "This is an internal management assistant. There are no public commands "
-    "here.\n\n"
-    "If you believe you should have access, ask an administrator to register "
-    "your Telegram account."
+# Monitoring surface — ADMIN ONLY. A manager must never learn the bot tracks
+# red flags (they may themselves be the subject of a flag), so none of this is
+# shown to, or callable by, a non-admin.
+_HELP_REVIEW = (
+    "<b>Partners, chats &amp; risks:</b>\n"
+    "/partners [filter] — partner list (active/passive/risky/inactive/all)\n"
+    "/partner &lt;name&gt; — partner card\n"
+    "/chats [filter] — chat/topic units\n"
+    "/chat &lt;id|name&gt; — chat details + recent risks\n"
+    "/risks [N|partner] — recent risk events\n"
+    "/risk &lt;id&gt; — risk card + context\n"
+    "/mark_fp · /mark_confirmed · /mark_escalated &lt;id&gt; — review a risk"
 )
+
+# Admin-only surface.
+_HELP_ADMIN = (
+    "<b>Admin only:</b>\n"
+    "/pending · /authorize · /reject · /authorize_topic · /reject_topic — onboarding\n"
+    "/set_partner_status &lt;name&gt; &lt;status&gt; — change partner status\n"
+    "/set_owner &lt;partner&gt; &lt;user&gt; — assign owning manager\n"
+    "/thresholds · /categories · /dictionary [cat] · /cost_status — settings"
+)
+
+
+def _help_for(role: str | None) -> str:
+    """Build the /help body. Only an admin sees the real command surface.
+
+    Everyone else — managers, viewers and outsiders alike — gets the neutral
+    cover text, which never hints that the bot reads messages or tracks risk.
+    """
+    if role == "admin":
+        return "\n\n".join([_HELP_COMMON, _HELP_REVIEW, _HELP_ADMIN])
+    return _COVER_HELP_TEXT
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    """Greet the user and explain the bot's purpose (open to everyone)."""
-    await message.answer(_START_TEXT)
-
-
-@router.message(Command("help"))
-async def cmd_help(message: Message) -> None:
-    """List commands for internal staff; show a cover message to outsiders."""
+    """Greet the caller. Admins get the honest intro; everyone else the cover."""
     user = message.from_user
     internal: InternalUser | None = None
     if user is not None:
         async with acquire_connection() as conn:
             internal = await find_internal_user_by_telegram_id(conn, user.id)
-    await message.answer(_HELP_TEXT if internal is not None else _COVER_HELP_TEXT)
+    is_admin = internal is not None and internal.role == "admin"
+    await message.answer(_START_ADMIN if is_admin else _START_COVER)
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    """List commands for the caller's role; show a cover message to outsiders."""
+    user = message.from_user
+    internal: InternalUser | None = None
+    if user is not None:
+        async with acquire_connection() as conn:
+            internal = await find_internal_user_by_telegram_id(conn, user.id)
+    await message.answer(_help_for(internal.role if internal is not None else None))
 
 
 @router.message(Command("whoami"))
 async def cmd_whoami(message: Message) -> None:
-    """Report how the bot identifies the caller (internal user or outsider)."""
+    """Report identity. Admins get full details; everyone else a neutral line.
+
+    A manager / viewer / outsider all get the same cover reply — it never exposes
+    the role hierarchy or the internal-user concept, so it can't hint at the
+    hidden functionality.
+    """
     user = message.from_user
     if user is None:  # defensive: private messages always carry from_user
-        await message.answer("I can't read your account details.")
+        await message.answer("You're chatting with the <b>Partner Assistant</b>.")
         return
 
     async with acquire_connection() as conn:
         internal = await find_internal_user_by_telegram_id(conn, user.id)
 
-    if internal is None:
+    if internal is not None and internal.role == "admin":
         await message.answer(
-            "You are <b>not</b> recognized as an internal user.\n"
-            f"Your Telegram id: <code>{user.id}</code>\n\n"
-            "If you should have access, ask an admin to add this id to your "
-            "<code>internal_users</code> record."
+            "You are recognized as an <b>administrator</b>.\n\n"
+            f"<b>Name:</b> {html_escape(internal.full_name)}\n"
+            f"<b>Role:</b> {html_escape(internal.role)}\n"
+            f"<b>Telegram id:</b> <code>{user.id}</code>"
         )
         return
 
+    # Managers, viewers and outsiders all get the same neutral cover reply.
     await message.answer(
-        "You are recognized as an internal user.\n\n"
-        f"<b>Name:</b> {html_escape(internal.full_name)}\n"
-        f"<b>Role:</b> {html_escape(internal.role)}\n"
-        f"<b>Admin:</b> {'yes' if internal.is_admin else 'no'}\n"
-        f"<b>Telegram id:</b> <code>{user.id}</code>"
+        "You're chatting with the <b>Partner Assistant</b>.\n"
+        f"Your Telegram id: <code>{user.id}</code>"
     )
 
 
@@ -462,6 +529,673 @@ async def cmd_reject_topic(
     )
     # Deliberately no leave_chat: the bot remains for the other topics.
     await message.answer("🚫 Topic rejected. The bot stays in the chat for other topics.")
+
+
+# =============================================================================
+# Partner / chat / risk / settings commands (Phase 13)
+#
+# Access: ADMIN ONLY — all of it. The whole monitoring surface (partners, chats,
+# risk events, settings) reveals that the bot tracks red flags, and a manager may
+# themselves be a subject of a flag, so only an admin may see or touch it. A
+# non-admin caller gets the decorator's neutral "Command not found." / wrong-role
+# audit; /help never lists these for them.
+#
+# The owner-scoping plumbing below (owner_id filters, per-row _risk_accessible,
+# require_partner_access) is now dormant — every caller is an admin — but is kept
+# intact so a future *manager-safe* view can be reintroduced without rewiring the
+# queries. It is not a second access path: the decorators are the gate.
+#
+# Every mutation writes an admin_audit_log row; access denials are audited by the
+# require_role decorator (action='unauthorized_command_attempt').
+# =============================================================================
+
+_PARTNER_FILTERS = {"active", "passive", "risky", "inactive", "all"}
+_PARTNER_STATUSES = {"active", "passive", "risky", "inactive"}
+_CHAT_FILTERS = {
+    "active",
+    "pending",
+    "abandoned",
+    "inactive",
+    "banned",
+    "rejected",
+    "all",
+}
+_MAX_LIST_ROWS = 20
+_MAX_RISK_LIMIT = 100
+
+# The 12 fixed risk categories (CLAUDE.md section 7.6) with a one-line gloss.
+_RISK_CATEGORIES: list[tuple[str, str]] = [
+    ("shadow_deal", "off-the-books arrangement between parties"),
+    ("private_channel", "moving the talk to an unmonitored channel"),
+    ("hidden_payment", "undisclosed or side payments"),
+    ("traffic_leakage", "diverting traffic away from us"),
+    ("commercial_terms", "renegotiating commercial terms off-process"),
+    ("fraud_shave", "shaving / fraud on conversions or payouts"),
+    ("access_risk", "risky access or credential sharing"),
+    ("partner_churn", "signals the partner may leave"),
+    ("payment_conflict", "disputes over payments / invoices"),
+    ("reputation_risk", "reputational / PR exposure"),
+    ("operational_sla", "SLA or operational breaches"),
+    ("employee_behavior", "concerning internal-employee behaviour"),
+]
+
+
+# --- Partner management ------------------------------------------------------
+
+
+@router.message(Command("partners"))
+@require_role("admin")
+async def cmd_partners(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """List partners with activity rollups (admin only)."""
+    filt = (command.args or "active").strip().lower() or "active"
+    if filt not in _PARTNER_FILTERS:
+        await message.answer(
+            "Usage: <code>/partners [active|passive|risky|inactive|all]</code>"
+        )
+        return
+    status = None if filt == "all" else filt
+    owner_id = None if actor.role == "admin" else actor.id
+    async with acquire_connection() as conn:
+        rows = await list_partners(conn, status=status, owner_id=owner_id)
+
+    if not rows:
+        await message.answer(f"No partners ({filt}).")
+        return
+    lines = [f"<b>Partners — {filt}</b> ({len(rows)})"]
+    for r in rows[:_MAX_LIST_ROWS]:
+        lines.append(
+            f"• <b>{html_escape(r.name)}</b> [{r.status}] — "
+            f"{r.active_chats} chat(s) — last {_fmt_dt(r.last_activity)}"
+        )
+    if len(rows) > _MAX_LIST_ROWS:
+        lines.append(
+            f"\n…and {len(rows) - _MAX_LIST_ROWS} more — use /partners with a filter."
+        )
+    await message.answer("\n".join(lines))
+    log.info("dm.partners", actor=str(actor.id), filter=filt, count=len(rows))
+
+
+@router.message(Command("partner"))
+@require_role("admin")
+@require_partner_access()
+async def cmd_partner(
+    message: Message, actor: InternalUser, partner: Partner, **kwargs: Any
+) -> None:
+    """Show a partner card: chats + recent risks + recent general notes."""
+    async with acquire_connection() as conn:
+        chats = await list_chat_overviews_by_partner(conn, partner.id)
+        risks = await risk_q.list_recent(conn, partner_id=partner.id, limit=5)
+        notes = await notes_q.list_by_partner(conn, partner.id, note_type="general")
+        owner_name = "—"
+        if partner.owner_manager_id is not None:
+            owner = await get_internal_user_by_id(conn, partner.owner_manager_id)
+            owner_name = owner.full_name if owner is not None else "—"
+
+    lines = [
+        f"<b>{html_escape(partner.name)}</b> [{partner.status}]",
+        f"Owner: {html_escape(owner_name)}",
+        f"Created: {_fmt_dt(partner.created_at)}",
+        f"\n<b>Chats ({len(chats)}):</b>",
+    ]
+    for c in chats[:10]:
+        name = html_escape(c.chat_name) if c.chat_name else "(untitled)"
+        lines.append(
+            f"[{c.unit_type}] {name} [{c.status}] — last {_fmt_dt(c.last_activity)}"
+        )
+    lines.append(f"\n<b>Recent risks ({len(risks)}):</b>")
+    for r in risks:
+        phrase = html_escape((r.detected_phrase or "")[:50])
+        lines.append(
+            f"[{r.risk_level}] {r.risk_type} — {phrase} — {_fmt_dt(r.created_at)}"
+        )
+    if notes:
+        shown = notes[:3]
+        lines.append(f"\n<b>Notes ({len(shown)}):</b>")
+        for n in shown:
+            lines.append(f"• {html_escape(n.content[:80])}")
+    await message.answer("\n".join(lines))
+    log.info("dm.partner", actor=str(actor.id), partner_id=str(partner.id))
+
+
+@router.message(Command("set_partner_status"))
+@require_role("admin")
+async def cmd_set_partner_status(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Change a partner's status (admin only); audited."""
+    parsed = _split_name_last(command.args)
+    if parsed is None or parsed[1].lower() not in _PARTNER_STATUSES:
+        await message.answer(
+            "Usage: <code>/set_partner_status &lt;name&gt; "
+            "&lt;active|passive|risky|inactive&gt;</code>"
+        )
+        return
+    name, new_status = parsed[0], parsed[1].lower()
+
+    async with acquire_connection() as conn:
+        async with conn.transaction():
+            partner = await get_partner_by_name(conn, name)
+            if partner is None:
+                await message.answer("Partner not found.")
+                return
+            old = partner.status
+            await update_partner_status(conn, partner.id, new_status)
+            await insert_audit_log(
+                conn,
+                action="set_partner_status",
+                actor_user_id=message.from_user.id if message.from_user else None,
+                actor_internal_id=actor.id,
+                target_entity="partner",
+                target_id=partner.id,
+                payload={"old": old, "new": new_status, "partner_id": str(partner.id)},
+            )
+    log.info(
+        "dm.set_partner_status",
+        partner_id=str(partner.id),
+        old=old,
+        new=new_status,
+        by=str(actor.id),
+    )
+    await message.answer(
+        f"Partner <b>{html_escape(name)}</b>: {old} → {new_status}"
+    )
+
+
+@router.message(Command("set_owner"))
+@require_role("admin")
+async def cmd_set_owner(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Assign a partner's owning manager (admin only); audited.
+
+    The user identifier is a Telegram user id (digits) or an exact (case-
+    insensitive) full name. Telegram usernames are not stored, so they can't be
+    used here.
+    """
+    parsed = _split_name_last(command.args)
+    if parsed is None:
+        await message.answer(
+            "Usage: <code>/set_owner &lt;partner name&gt; "
+            "&lt;full name | telegram_user_id&gt;</code>"
+        )
+        return
+    partner_name, identifier = parsed
+
+    async with acquire_connection() as conn:
+        async with conn.transaction():
+            partner = await get_partner_by_name(conn, partner_name)
+            if partner is None:
+                await message.answer("Partner not found.")
+                return
+            target = await find_internal_user_by_identifier(conn, identifier)
+            if target is None:
+                await message.answer("User not found.")
+                return
+            old_owner_name = "—"
+            old_owner_id = partner.owner_manager_id
+            if old_owner_id is not None:
+                old_owner = await get_internal_user_by_id(conn, old_owner_id)
+                old_owner_name = old_owner.full_name if old_owner is not None else "—"
+            await update_partner_owner(conn, partner.id, target.id)
+            await insert_audit_log(
+                conn,
+                action="set_owner",
+                actor_user_id=message.from_user.id if message.from_user else None,
+                actor_internal_id=actor.id,
+                target_entity="partner",
+                target_id=partner.id,
+                payload={
+                    "partner_id": str(partner.id),
+                    "old_owner": str(old_owner_id) if old_owner_id else None,
+                    "new_owner": str(target.id),
+                },
+            )
+    log.info(
+        "dm.set_owner",
+        partner_id=str(partner.id),
+        new_owner=str(target.id),
+        by=str(actor.id),
+    )
+    await message.answer(
+        f"Partner <b>{html_escape(partner_name)}</b> owner: "
+        f"{html_escape(old_owner_name)} → {html_escape(target.full_name)}"
+    )
+
+
+# --- Chat management ---------------------------------------------------------
+
+
+@router.message(Command("chats"))
+@require_role("admin")
+async def cmd_chats(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """List chat/topic units (admin only)."""
+    filt = (command.args or "active").strip().lower() or "active"
+    if filt not in _CHAT_FILTERS:
+        await message.answer(
+            "Usage: <code>/chats [active|pending|abandoned|inactive|banned|"
+            "rejected|all]</code>"
+        )
+        return
+    status = None if filt == "all" else filt
+    owner_id = None if actor.role == "admin" else actor.id
+    async with acquire_connection() as conn:
+        rows = await list_chats_overview(conn, status=status, owner_id=owner_id)
+
+    if not rows:
+        await message.answer(f"No chats ({filt}).")
+        return
+    lines = [f"<b>Chats — {filt}</b> ({len(rows)})"]
+    for c in rows[:_MAX_LIST_ROWS]:
+        partner = html_escape(c.partner_name) if c.partner_name else "—"
+        lines.append(
+            f"• <code>{c.telegram_chat_id}</code> [{c.unit_type}] — {partner} — "
+            f"last {_fmt_dt(c.last_activity)}"
+        )
+    if len(rows) > _MAX_LIST_ROWS:
+        lines.append(
+            f"\n…and {len(rows) - _MAX_LIST_ROWS} more — narrow with a filter."
+        )
+    await message.answer("\n".join(lines))
+    log.info("dm.chats", actor=str(actor.id), filter=filt, count=len(rows))
+
+
+@router.message(Command("chat"))
+@require_role("admin")
+async def cmd_chat(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Show one chat unit's details + its recent risks (admin only)."""
+    ref = (command.args or "").strip()
+    if not ref:
+        await message.answer("Usage: <code>/chat &lt;id | telegram_id | name&gt;</code>")
+        return
+    ref_int = int(ref) if ref.lstrip("-").isdigit() else None
+
+    async with acquire_connection() as conn:
+        matches = await find_chats_by_ref(conn, ref, ref_int)
+        # Manager scoping: keep only units of partners this manager owns.
+        if actor.role != "admin":
+            owned = []
+            for c in matches:
+                if c.partner_id is None:
+                    continue
+                p = await get_partner_by_id(conn, c.partner_id)
+                if p is not None and p.owner_manager_id == actor.id:
+                    owned.append(c)
+            matches = owned
+
+        if not matches:
+            await message.answer("Chat not found.")
+            return
+        if len(matches) > 1:
+            lines = ["Multiple units match — pick one by its id (first 8 chars):"]
+            for c in matches[:_MAX_LIST_ROWS]:
+                name = html_escape(c.chat_name) if c.chat_name else "(untitled)"
+                lines.append(
+                    f"• <code>{str(c.id)[:8]}</code> [{c.unit_type}] {name} "
+                    f"[{c.status}]"
+                )
+            await message.answer("\n".join(lines))
+            return
+
+        chat = matches[0]
+        risks = await risk_q.list_by_chat(conn, chat.id, limit=5)
+        partner_name = "—"
+        if chat.partner_id is not None:
+            p = await get_partner_by_id(conn, chat.partner_id)
+            partner_name = p.name if p is not None else "—"
+
+    name = html_escape(chat.chat_name) if chat.chat_name else "(untitled)"
+    lines = [
+        f"<b>{name}</b> [{chat.status}]",
+        f"Unit: {chat.unit_type} · id <code>{str(chat.id)[:8]}</code>",
+        f"Telegram id: <code>{chat.telegram_chat_id}</code>",
+        f"Thread: <code>{chat.message_thread_id or 0}</code>",
+        f"Partner: {html_escape(partner_name)}",
+        f"\n<b>Recent risks ({len(risks)}):</b>",
+    ]
+    for r in risks:
+        lines.append(
+            f"[{str(r.id)[:8]}] [{r.risk_level}] {r.risk_type} — {_fmt_dt(r.created_at)}"
+        )
+    await message.answer("\n".join(lines))
+    log.info("dm.chat", actor=str(actor.id), chat_id=str(chat.id))
+
+
+# --- Risk review -------------------------------------------------------------
+
+
+@router.message(Command("risks"))
+@require_role("admin")
+async def cmd_risks(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """List recent risk events: default 20, or ``N``, or by partner name."""
+    arg = (command.args or "").strip()
+    owner_id = None if actor.role == "admin" else actor.id
+
+    async with acquire_connection() as conn:
+        if not arg:
+            rows = await risk_q.list_recent(conn, limit=20, owner_id=owner_id)
+            title = "recent"
+        elif arg.isdigit():
+            limit = min(int(arg), _MAX_RISK_LIMIT)
+            rows = await risk_q.list_recent(conn, limit=limit, owner_id=owner_id)
+            title = f"last {limit}"
+        else:
+            partner = await get_partner_by_name(conn, arg)
+            if partner is None or (
+                actor.role != "admin" and partner.owner_manager_id != actor.id
+            ):
+                await message.answer("Partner not found.")
+                return
+            rows = await risk_q.list_recent(
+                conn, partner_id=partner.id, owner_id=owner_id, limit=20
+            )
+            title = html_escape(partner.name)
+
+    if not rows:
+        await message.answer(f"No risk events ({title}).")
+        return
+    lines = [f"<b>Risks — {title}</b> ({len(rows)})"]
+    for r in rows:
+        pname = html_escape(r.partner_name) if r.partner_name else "—"
+        lines.append(
+            f"<code>{str(r.id)[:8]}</code> [{r.risk_level}] {r.risk_type} | "
+            f"{pname} | {_fmt_dt(r.created_at)}"
+        )
+    await message.answer("\n".join(lines))
+    log.info("dm.risks", actor=str(actor.id), arg=arg, count=len(rows))
+
+
+@router.message(Command("risk"))
+@require_role("admin")
+async def cmd_risk(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Show a risk event's detail card + the messages around the flagged one."""
+    ref = (command.args or "").strip().lower()
+    if not ref:
+        await message.answer("Usage: <code>/risk &lt;id&gt;</code> (full or first 8 chars)")
+        return
+
+    async with acquire_connection() as conn:
+        event = await risk_q.get_by_ref(conn, ref)
+        if event is None or not await _risk_accessible(conn, actor, event.partner_id):
+            await message.answer("Risk not found.")
+            return
+        anchor = (
+            await get_message_by_id(conn, event.message_id)
+            if event.message_id is not None
+            else None
+        )
+        before: list[Any] = []
+        after: list[Any] = []
+        if event.chat_id is not None and anchor is not None:
+            before, after = await get_messages_around(
+                conn, event.chat_id, anchor.timestamp
+            )
+
+    lines = [
+        f"<b>Risk {str(event.id)[:8]}</b> [{event.risk_level}] {event.risk_type}",
+        f"Status: {event.status} · score {event.final_score}"
+        + (
+            f" · confidence {event.llm_confidence:.2f}"
+            if event.llm_confidence is not None
+            else ""
+        ),
+        f"Created: {_fmt_dt(event.created_at)}",
+    ]
+    if event.detected_phrase:
+        lines.append(f"Phrase: “{html_escape(event.detected_phrase)}”")
+    if event.llm_explanation:
+        lines.append(f"\n{html_escape(event.llm_explanation)}")
+
+    if anchor is not None:
+        lines.append("\n<b>Context:</b>")
+        for m in before:
+            lines.append(_fmt_ctx_msg(m))
+        lines.append("▶ " + _fmt_ctx_msg(anchor))
+        for m in after:
+            lines.append(_fmt_ctx_msg(m))
+    await message.answer("\n".join(lines))
+    log.info("dm.risk", actor=str(actor.id), risk_event_id=str(event.id))
+
+
+@router.message(Command("mark_fp"))
+@require_role("admin")
+async def cmd_mark_fp(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Mark a risk event as a false positive."""
+    await _mark_risk(message, actor, command, "false_positive")
+
+
+@router.message(Command("mark_confirmed"))
+@require_role("admin")
+async def cmd_mark_confirmed(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Mark a risk event as confirmed."""
+    await _mark_risk(message, actor, command, "confirmed")
+
+
+@router.message(Command("mark_escalated"))
+@require_role("admin")
+async def cmd_mark_escalated(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Mark a risk event as escalated."""
+    await _mark_risk(message, actor, command, "escalated")
+
+
+# --- Settings (admin, read-only in MVP) --------------------------------------
+
+
+@router.message(Command("thresholds"))
+@require_role("admin")
+async def cmd_thresholds(message: Message, actor: InternalUser, **kwargs: Any) -> None:
+    """Show the current scoring / budget / cadence configuration."""
+    await message.answer(
+        "<b>Thresholds &amp; limits</b>\n"
+        f"Priority lane threshold: <b>{settings.PRIORITY_SCORE_THRESHOLD}</b>\n"
+        f"Daily LLM budget: <b>${settings.DAILY_LLM_BUDGET_USD}</b>\n\n"
+        "<b>Risk levels:</b>\n"
+        "Low: 0–20 (log only)\n"
+        "Medium: 21–50 (digest)\n"
+        "High: 51–75 (Slack alert)\n"
+        "Critical: 76–100 (Slack + recipients pinged)\n\n"
+        f"Batch interval: {settings.BATCH_PROCESSING_INTERVAL_SECONDS // 60} min\n"
+        f"Context window: {settings.CONTEXT_WINDOW_MINUTES} min\n"
+        f"Pending chat timeout: {settings.ABANDONED_CHAT_TIMEOUT_HOURS // 24} days"
+    )
+
+
+@router.message(Command("categories"))
+@require_role("admin")
+async def cmd_categories(message: Message, actor: InternalUser, **kwargs: Any) -> None:
+    """List the 12 fixed risk categories with a one-line gloss."""
+    lines = ["<b>Risk categories (12)</b>"]
+    for key, desc in _RISK_CATEGORIES:
+        lines.append(f"• <b>{key}</b> — {desc}")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("dictionary"))
+@require_role("admin")
+async def cmd_dictionary(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Show enabled Tier-1 patterns: top-20 by score, or all of one category."""
+    category = (command.args or "").strip().lower() or None
+    async with acquire_connection() as conn:
+        patterns = await load_enabled_patterns(conn)
+
+    if category is not None:
+        selected = sorted(
+            (p for p in patterns if p.risk_category == category),
+            key=lambda p: p.base_score,
+            reverse=True,
+        )
+        if not selected:
+            await message.answer(f"No enabled patterns for category '{category}'.")
+            return
+        lines = [f"<b>Dictionary — {category}</b> ({len(selected)})"]
+        lines += [
+            f"• [{p.base_score}] {html_escape(p.pattern)} ({p.language})"
+            for p in selected
+        ]
+    else:
+        selected = sorted(patterns, key=lambda p: p.base_score, reverse=True)[:20]
+        lines = [
+            f"<b>Dictionary — top {len(selected)} by score</b> "
+            f"({len(patterns)} enabled total)"
+        ]
+        lines += [
+            f"• [{p.base_score}] {p.risk_category}: {html_escape(p.pattern)} "
+            f"({p.language})"
+            for p in selected
+        ]
+    await _send_lines(message, lines)
+
+
+@router.message(Command("cost_status"))
+@require_role("admin")
+async def cmd_cost_status(message: Message, actor: InternalUser, **kwargs: Any) -> None:
+    """Show today's LLM/Whisper spend vs budget + the 7-day total."""
+    async with acquire_connection() as conn:
+        today = await cost_get_today(conn)
+        last7 = await sum_last_7_days(conn)
+
+    budget = settings.DAILY_LLM_BUDGET_USD
+    if today is None:
+        await message.answer(
+            "<b>Today</b>\nNo spend recorded yet.\n"
+            f"Daily LLM budget: ${budget}\n"
+            f"Last 7 days total: ${last7:.2f}"
+        )
+        return
+    total = today.total_cost_usd if today.total_cost_usd is not None else (
+        today.llm_cost_usd + today.whisper_cost_usd
+    )
+    cb = "TRIGGERED ⛔" if today.circuit_breaker_triggered else "ok"
+    await message.answer(
+        "<b>Today</b>\n"
+        f"LLM: ${today.llm_cost_usd:.2f} ({today.llm_calls_count} calls)\n"
+        f"Whisper: ${today.whisper_cost_usd:.2f} ({today.whisper_calls_count} calls)\n"
+        f"Total: ${total:.2f} / ${budget}\n"
+        f"Circuit breaker: {cb}\n\n"
+        f"Last 7 days total: ${last7:.2f}"
+    )
+
+
+async def _mark_risk(
+    message: Message, actor: InternalUser, command: CommandObject, new_status: str
+) -> None:
+    """Shared body for /mark_fp · /mark_confirmed · /mark_escalated.
+
+    Managers may only review risks of partners they own; the check happens inside
+    the transaction, before the UPDATE. The status change + audit row commit
+    together.
+    """
+    ref = (command.args or "").strip().lower()
+    if not ref:
+        await message.answer("Usage: <code>/mark_… &lt;id&gt;</code> (full or first 8 chars)")
+        return
+
+    async with acquire_connection() as conn:
+        async with conn.transaction():
+            event = await risk_q.get_by_ref(conn, ref)
+            if event is None or not await _risk_accessible(conn, actor, event.partner_id):
+                await message.answer("Risk not found.")
+                return
+            old = event.status
+            await risk_q.update_status(conn, event.id, new_status, actor.id)
+            await insert_audit_log(
+                conn,
+                action=f"mark_{new_status}",
+                actor_user_id=message.from_user.id if message.from_user else None,
+                actor_internal_id=actor.id,
+                target_entity="risk_event",
+                target_id=event.id,
+                payload={
+                    "risk_event_id": str(event.id),
+                    "old_status": old,
+                    "new_status": new_status,
+                },
+            )
+    log.info(
+        "dm.mark_risk",
+        risk_event_id=str(event.id),
+        old=old,
+        new=new_status,
+        by=str(actor.id),
+    )
+    await message.answer(f"Risk {str(event.id)[:8]}: {old} → {new_status}")
+
+
+async def _risk_accessible(
+    conn: Any, actor: InternalUser, partner_id: Any
+) -> bool:
+    """True if the actor may view/act on a risk of ``partner_id``.
+
+    Admins always may; a manager may only when they own that partner. A risk with
+    no partner is admin-only.
+    """
+    if actor.role == "admin":
+        return True
+    if partner_id is None:
+        return False
+    partner = await get_partner_by_id(conn, partner_id)
+    return partner is not None and partner.owner_manager_id == actor.id
+
+
+def _fmt_dt(value: datetime | None) -> str:
+    """Format a timestamp for DM output (UTC, minute precision), or em dash."""
+    return value.strftime("%Y-%m-%d %H:%M") if value is not None else "—"
+
+
+def _fmt_ctx_msg(msg: Any) -> str:
+    """One-line context message: time · role · truncated text/transcription."""
+    text = msg.message_text or msg.transcription or f"[{msg.message_type}]"
+    snippet = html_escape(text[:80])
+    return f"<code>{_fmt_dt(msg.timestamp)}</code> {msg.sender_role}: {snippet}"
+
+
+async def _send_lines(message: Message, lines: list[str], *, max_chars: int = 3500) -> None:
+    """Send lines in as few messages as fit under Telegram's size limit."""
+    buf: list[str] = []
+    size = 0
+    for line in lines:
+        if buf and size + len(line) + 1 > max_chars:
+            await message.answer("\n".join(buf))
+            buf, size = [], 0
+        buf.append(line)
+        size += len(line) + 1
+    if buf:
+        await message.answer("\n".join(buf))
+
+
+def _split_name_last(args: str | None) -> tuple[str, str] | None:
+    """Split ``<name…> <last_token>`` on the final whitespace.
+
+    The name may contain spaces (optionally quoted); the trailing token is a
+    status / identifier. Returns ``(name, last_token)`` or ``None`` if malformed.
+    """
+    if not args:
+        return None
+    parts = args.strip().rsplit(maxsplit=1)
+    if len(parts) != 2:
+        return None
+    name = _strip_quotes(parts[0])
+    last = parts[1].strip()
+    if not name or not last:
+        return None
+    return name, last
 
 
 async def _leave_chat_quietly(bot: Bot, telegram_chat_id: int) -> bool:
