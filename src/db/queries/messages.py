@@ -36,6 +36,9 @@ async def insert_message(
     mentions: list[str] | None = None,
     detected_language: str | None = None,
     is_significant: bool = False,
+    source: str = "live_group",
+    business_connection_id: str | None = None,
+    business_peer_user_id: int | None = None,
     raw_payload: dict[str, Any] | None = None,
 ) -> Message | None:
     """Insert one ingested message; return it, or ``None`` if it already existed.
@@ -45,6 +48,10 @@ async def insert_message(
     24h, so a duplicate insert is a no-op and returns ``None``. Tier-1 fields
     (``has_triggers`` / ``base_score`` / ``triggered_patterns``) keep their column
     defaults here and are filled by the Phase-6 matcher.
+
+    ``source`` records how the message reached us (``live_group`` / ``live_topic``
+    / ``business`` / ``imported``); the business columns are populated only for
+    Telegram Business messages (migration 0006), ``NULL`` otherwise.
     """
     row = await conn.fetchrow(
         """
@@ -53,14 +60,16 @@ async def insert_message(
             sender_role, message_text, message_type, timestamp,
             reply_to_message_id, forward_from_id, forward_from_chat_id,
             message_thread_id, links, mentions, detected_language,
-            is_significant, raw_payload
+            is_significant, source, business_connection_id, business_peer_user_id,
+            raw_payload
         )
         VALUES (
             $1, $2, $3, $4, $5,
             $6, $7, $8, $9,
             $10, $11, $12,
             $13, $14, $15, $16,
-            $17, $18
+            $17, $18, $19, $20,
+            $21
         )
         ON CONFLICT (chat_id, telegram_message_id) DO NOTHING
         RETURNING *
@@ -82,6 +91,9 @@ async def insert_message(
         mentions,
         detected_language,
         is_significant,
+        source,
+        business_connection_id,
+        business_peer_user_id,
         raw_payload,
     )
     return Message.from_record(row) if row is not None else None

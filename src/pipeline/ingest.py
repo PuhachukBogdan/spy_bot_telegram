@@ -40,6 +40,15 @@ log = get_logger(__name__)
 # matter to a weekly summary; precomputed here so the summary filter is cheap.
 _SIGNIFICANT_MIN_CHARS = 3
 
+# How the message reached us, keyed by the monitored unit's type (migration 0006).
+# Used for the ``messages.source`` column so downstream filtering / summaries can
+# tell a forum-topic stream from a whole-group stream from a Business DM.
+_SOURCE_BY_UNIT = {
+    "group": "live_group",
+    "topic": "live_topic",
+    "business": "business",
+}
+
 
 async def ingest_message(message: Message, chat: Chat) -> None:
     """Persist one message from an active partner chat (CLAUDE.md 7.1 step 5)."""
@@ -49,6 +58,11 @@ async def ingest_message(message: Message, chat: Chat) -> None:
     links = _extract_links(message)
     mentions = _extract_mentions(message)
     is_significant = _compute_significance(text, message_type)
+    source = _SOURCE_BY_UNIT.get(chat.unit_type, "live_group")
+    # Business identity is a property of the unit (set at business onboarding);
+    # the message's own connection id wins when present. Both NULL for plain chats.
+    business_connection_id = message.business_connection_id or chat.business_connection_id
+    business_peer_user_id = chat.business_peer_user_id
 
     async with acquire_connection() as conn:
         sender_role = await _resolve_sender_role(conn, message)
@@ -75,6 +89,9 @@ async def ingest_message(message: Message, chat: Chat) -> None:
             mentions=mentions or None,
             detected_language=detect_language(text),
             is_significant=is_significant,
+            source=source,
+            business_connection_id=business_connection_id,
+            business_peer_user_id=business_peer_user_id,
             raw_payload=message.model_dump(mode="json", exclude_none=True),
         )
 
@@ -104,6 +121,7 @@ async def ingest_message(message: Message, chat: Chat) -> None:
         msg_id=message.message_id,
         type=message_type,
         role=sender_role,
+        source=source,
         significant=is_significant,
         forwarded=forward_from_id is not None or forward_from_chat_id is not None,
         forward_from_id=forward_from_id,

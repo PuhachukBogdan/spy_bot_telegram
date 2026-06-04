@@ -58,6 +58,23 @@ async def get_chat_unit(
     return Chat.from_record(row) if row is not None else None
 
 
+async def get_by_unit(
+    conn: asyncpg.Connection, telegram_chat_id: int, topic_key: int = 0
+) -> Chat | None:
+    """Return the ``Chat`` for a unit by its stored ``topic_key`` directly.
+
+    Complements :func:`get_chat_unit`: that one takes a possibly-``None`` thread
+    id and NULL-coalesces it; this one takes the already-resolved ``topic_key``
+    (0 = whole group / General topic).
+    """
+    row = await conn.fetchrow(
+        "SELECT * FROM chats WHERE telegram_chat_id = $1 AND topic_key = $2",
+        telegram_chat_id,
+        topic_key,
+    )
+    return Chat.from_record(row) if row is not None else None
+
+
 async def create_pending_chat(
     conn: asyncpg.Connection,
     telegram_chat_id: int,
@@ -65,8 +82,12 @@ async def create_pending_chat(
     chat_name: str | None,
     added_by_user_id: int | None,
     topic_name: str | None = None,
+    unit_type: str = "group",
 ) -> Chat | None:
     """Insert a freshly-discovered unit as ``status='pending'`` (onboarding step).
+
+    ``unit_type`` is ``'group'`` for a group-level unit (bot added to a group) or
+    ``'topic'`` for a forum topic discovered from its first message.
 
     Idempotent against Telegram's webhook retries, re-adds, and repeated messages
     in the same topic via ``ON CONFLICT (telegram_chat_id, topic_key) DO NOTHING``:
@@ -77,9 +98,9 @@ async def create_pending_chat(
         """
         INSERT INTO chats (
             telegram_chat_id, message_thread_id, topic_name,
-            chat_name, added_by_user_id, status
+            chat_name, added_by_user_id, status, unit_type
         )
-        VALUES ($1, $2, $3, $4, $5, 'pending')
+        VALUES ($1, $2, $3, $4, $5, 'pending', $6)
         ON CONFLICT (telegram_chat_id, topic_key) DO NOTHING
         RETURNING *
         """,
@@ -88,14 +109,37 @@ async def create_pending_chat(
         topic_name,
         chat_name,
         added_by_user_id,
+        unit_type,
     )
     return Chat.from_record(row) if row is not None else None
 
 
-async def list_pending_chats(conn: asyncpg.Connection) -> list[Chat]:
+async def list_pending(conn: asyncpg.Connection) -> list[Chat]:
     """Return all units awaiting authorization, oldest first (for ``/pending``)."""
     rows = await conn.fetch(
         "SELECT * FROM chats WHERE status = 'pending' ORDER BY created_at ASC"
+    )
+    return [Chat.from_record(row) for row in rows]
+
+
+async def list_pending_chats(conn: asyncpg.Connection) -> list[Chat]:
+    """Backwards-compatible alias for :func:`list_pending` (used by ``/pending``)."""
+    return await list_pending(conn)
+
+
+async def list_pending_topics(conn: asyncpg.Connection) -> list[Chat]:
+    """Pending units that are forum topics specifically (``unit_type = 'topic'``).
+
+    ``unit_type`` is stamped by the onboarding/ingestion layer (migration 0006);
+    until that layer writes it, freshly-discovered units default to ``'group'``,
+    so this returns rows only once topic typing is actually being set.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT * FROM chats
+        WHERE status = 'pending' AND unit_type = 'topic'
+        ORDER BY created_at ASC
+        """
     )
     return [Chat.from_record(row) for row in rows]
 
@@ -148,6 +192,32 @@ async def reject_chat(
         WHERE telegram_chat_id = $1
           AND topic_key = COALESCE($2, 0)
           AND status = 'pending'
+        RETURNING *
+        """,
+        telegram_chat_id,
+        thread_id,
+    )
+    return Chat.from_record(row) if row is not None else None
+
+
+async def reject_topic(
+    conn: asyncpg.Connection, telegram_chat_id: int, thread_id: int | None
+) -> Chat | None:
+    """Reject a pending forum-topic unit (``/reject_topic``).
+
+    Sets ``status='rejected'`` (distinct from a group-level ``'banned'``): a
+    rejected topic does NOT make the bot leave the supergroup — it stays for the
+    other topics. Guarded to a still-``'pending'`` row whose ``unit_type='topic'``
+    so it can never flip a group-level unit. Returns the row, or ``None``.
+    """
+    row = await conn.fetchrow(
+        """
+        UPDATE chats
+        SET status = 'rejected'
+        WHERE telegram_chat_id = $1
+          AND topic_key = COALESCE($2, 0)
+          AND status = 'pending'
+          AND unit_type = 'topic'
         RETURNING *
         """,
         telegram_chat_id,

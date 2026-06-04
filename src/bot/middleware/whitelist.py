@@ -28,7 +28,7 @@ from aiogram.types import Message, TelegramObject
 from src.bot.notify import notify_admins_pending
 from src.bot.topics import effective_topic_id
 from src.db.client import acquire_connection
-from src.db.queries.chats import create_pending_chat, get_chat_status
+from src.db.queries.chats import create_pending_chat, get_by_unit
 from src.db.queries.etc import list_admin_users
 from src.utils.logging import get_logger
 
@@ -51,46 +51,58 @@ class WhitelistMiddleware(BaseMiddleware):
         if chat.type == ChatType.PRIVATE:
             return await handler(event, data)
 
-        thread_id = effective_topic_id(event)
+        # topic_key: the forum topic id for a real topic message, else 0 (whole
+        # group / General / non-forum). effective_topic_id guards is_forum AND
+        # is_topic_message, so plain reply-threads do NOT become separate units.
+        topic_key = effective_topic_id(event) or 0
         async with acquire_connection() as conn:
-            status = await get_chat_status(conn, chat.id, thread_id)
+            unit = await get_by_unit(conn, chat.id, topic_key)
 
-        if status == "active":
+        if unit is not None and unit.status == "active":
             return await handler(event, data)
 
-        # Unknown forum topic: discover it (create pending + notify) so an admin
-        # can authorize it. Group-level units (thread_id None) are created by the
+        # Unknown unit AND it's a topic (topic_key != 0): try to discover it so an
+        # admin can authorize. Group-level units (topic_key 0) are created by the
         # onboarding handler, not here.
-        if status is None and thread_id is not None:
-            await self._discover_topic(event, thread_id, data)
+        if unit is None and topic_key != 0:
+            await self._maybe_discover_topic(event, topic_key, data)
 
         # Not active: ignore. Debug level — the common steady state for any unit
         # we haven't authorized, not an error.
         log.debug(
             "whitelist.skip",
             chat_id=chat.id,
-            thread_id=thread_id,
-            status=status or "unknown",
+            topic_key=topic_key,
+            status=unit.status if unit is not None else "unknown",
         )
         return None
 
-    async def _discover_topic(
+    async def _maybe_discover_topic(
         self, message: Message, thread_id: int, data: dict[str, Any]
     ) -> None:
         """Register a newly-seen forum topic as pending and DM admins once.
 
-        Idempotent via ``create_pending_chat``'s ON CONFLICT: only the first
-        message in a topic creates the row and notifies; later ones see a
-        ``'pending'`` status and never reach here again.
+        Only fires when the supergroup's group-level parent unit is already
+        ``'active'`` — we don't surface topics of a group we were never authorized
+        to watch. Idempotent via ``create_pending_chat``'s ON CONFLICT: only the
+        first message in a topic creates the row and notifies; later ones find a
+        ``'pending'`` unit and never reach here again.
         """
-        actor = message.from_user
+        chat = message.chat
+        if chat.type != ChatType.SUPERGROUP or not message.is_topic_message:
+            return
+
         async with acquire_connection() as conn:
+            parent = await get_by_unit(conn, chat.id, 0)
+            if parent is None or parent.status != "active":
+                return  # parent group not authorized → don't discover its topics
             created = await create_pending_chat(
                 conn,
-                telegram_chat_id=message.chat.id,
+                telegram_chat_id=chat.id,
                 thread_id=thread_id,
-                chat_name=message.chat.title,
-                added_by_user_id=actor.id if actor is not None else None,
+                chat_name=chat.title,
+                added_by_user_id=None,  # we don't know who created the topic
+                unit_type="topic",
             )
             if created is None:  # lost a race; already discovered
                 return
@@ -98,9 +110,9 @@ class WhitelistMiddleware(BaseMiddleware):
 
         log.info(
             "onboarding.topic_discovered",
-            chat_id=message.chat.id,
+            chat_id=chat.id,
             thread_id=thread_id,
-            chat_name=message.chat.title,
+            parent=parent.chat_name,
         )
         bot = data["bot"]
         if isinstance(bot, Bot):

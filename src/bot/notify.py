@@ -21,29 +21,48 @@ log = get_logger(__name__)
 
 
 def format_pending_notice(chat: Chat) -> str:
-    """Build the admin DM body for a newly-pending unit (group or forum topic)."""
+    """Build the admin DM body for a newly-pending unit (group or forum topic).
+
+    The suggested commands differ by unit type: a group uses the group-level
+    ``/authorize`` / ``/reject``; a forum topic uses ``/authorize_topic`` /
+    ``/reject_topic`` (which carry the thread id and never make the bot leave).
+    """
     thread = chat.message_thread_id or 0
     name = html_escape(chat.chat_name) if chat.chat_name else "<i>(untitled)</i>"
-    if chat.topic_name:
-        topic = f"{html_escape(chat.topic_name)} (thread <code>{thread}</code>)"
-    elif thread:
-        topic = f"thread <code>{thread}</code>"
-    else:
-        topic = "whole group / General"
     added_by = (
         f"<code>{chat.added_by_user_id}</code>"
         if chat.added_by_user_id is not None
         else "unknown"
     )
+
+    if chat.unit_type == "topic":
+        topic = (
+            f"{html_escape(chat.topic_name)} (thread <code>{thread}</code>)"
+            if chat.topic_name
+            else f"thread <code>{thread}</code>"
+        )
+        header = "📂 <b>New topic pending authorization</b>"
+        authorize = (
+            f"<code>/authorize_topic {chat.telegram_chat_id} {thread} "
+            "&lt;partner name&gt;</code>"
+        )
+        reject = f"<code>/reject_topic {chat.telegram_chat_id} {thread}</code>"
+    else:
+        topic = "whole group / General"
+        header = "🆕 <b>New group pending authorization</b>"
+        authorize = (
+            f"<code>/authorize {chat.telegram_chat_id} &lt;partner name&gt;</code>"
+        )
+        reject = f"<code>/reject {chat.telegram_chat_id}</code>"
+
     return (
-        "🆕 <b>New unit pending authorization</b>\n\n"
+        f"{header}\n\n"
         f"<b>Chat:</b> {name}\n"
         f"<b>Chat id:</b> <code>{chat.telegram_chat_id}</code>\n"
         f"<b>Topic:</b> {topic}\n"
         f"<b>Added by:</b> {added_by}\n\n"
-        "Authorize:  "
-        f"<code>/authorize {chat.telegram_chat_id} {thread} &lt;partner name&gt;</code>\n"
-        f"Reject:  <code>/reject {chat.telegram_chat_id} {thread}</code>\n\n"
+        f"Authorize:  {authorize}\n"
+        f"Reject:  {reject}\n\n"
         "Until authorized, I store nothing from this unit."
     )
 

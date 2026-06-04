@@ -33,7 +33,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Self
+from typing import Any, Literal, Self
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -97,6 +97,12 @@ class Chat(_ORMModel):
     authorized_by: UUID | None = None
     authorized_at: datetime | None = None
     chat_purpose: str | None = None
+    # Migration 0006: unit typing + Telegram Business binding. For a business
+    # unit, telegram_chat_id holds the partner's TG user_id (a private chat has
+    # chat.id == user.id).
+    unit_type: Literal["group", "topic", "business"] = "group"
+    business_connection_id: str | None = None
+    business_peer_user_id: int | None = None
     created_at: datetime
 
 
@@ -124,8 +130,13 @@ class Message(_ORMModel):
     has_triggers: bool = False
     triggered_patterns: dict[str, Any] | list[Any] | None = None
     base_score: int = 0
-    source: str = "live"
+    source: str = "live"  # live / live_group / live_topic / business / imported
     raw_payload: dict[str, Any] | None = None
+    # Migration 0006: business provenance + soft-deletion record.
+    business_connection_id: str | None = None
+    business_peer_user_id: int | None = None
+    deleted_at: datetime | None = None
+    deletion_payload: dict[str, Any] | None = None
     created_at: datetime
 
 
@@ -312,3 +323,60 @@ class ProcessingQueue(_ORMModel):
     scheduled_for: datetime
     created_at: datetime
     completed_at: datetime | None = None
+
+
+# === Migration 0006: topics & Telegram Business mode ========================
+# These four models double as create() input payloads, so the server-generated
+# id / created_at are optional (None before insert, populated by RETURNING *).
+
+
+# --- 18. business_connections -----------------------------------------------
+class BusinessConnection(_ORMModel):
+    id: UUID | None = None
+    business_connection_id: str
+    business_account_user_id: int
+    internal_user_id: UUID | None = None
+    status: Literal["pending", "active", "revoked", "disabled"] = "pending"
+    rights: dict[str, Any] = Field(default_factory=dict)
+    connected_at: datetime
+    revoked_at: datetime | None = None
+    approved_by: UUID | None = None
+    approved_at: datetime | None = None
+    raw_payload: dict[str, Any] | None = None
+    created_at: datetime | None = None
+
+
+# --- 19. partner_contacts ---------------------------------------------------
+class PartnerContact(_ORMModel):
+    id: UUID | None = None
+    partner_id: UUID
+    telegram_user_id: int
+    full_name: str | None = None
+    notes: str | None = None
+    created_at: datetime | None = None
+
+
+# --- 20. notes --------------------------------------------------------------
+class Note(_ORMModel):
+    id: UUID | None = None
+    partner_id: UUID
+    chat_id: UUID | None = None
+    note_type: Literal["general", "handoff", "open_question"]
+    content: str
+    created_by: UUID
+    created_at: datetime | None = None
+    resolved_at: datetime | None = None
+    resolved_by: UUID | None = None
+
+
+# --- 21. reminders ----------------------------------------------------------
+class Reminder(_ORMModel):
+    id: UUID | None = None
+    target_user_id: UUID
+    partner_id: UUID | None = None
+    content: str
+    fire_at: datetime
+    status: Literal["pending", "sent", "cancelled", "failed"] = "pending"
+    created_by: UUID
+    created_at: datetime | None = None
+    sent_at: datetime | None = None
