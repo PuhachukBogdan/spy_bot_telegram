@@ -14,6 +14,12 @@ topic)`` (see ``bot/topics.py``). Policy:
 
 Onboarding events (``my_chat_member`` / ``chat_member``) are *not* messages, so
 they bypass this middleware; the group-level unit is created there.
+
+Telegram Business updates (``business_message`` / ``edited_business_message`` /
+``deleted_business_messages`` / ``business_connection``) ride their OWN dispatcher
+observers, not the ``message`` observer this middleware is attached to, so they
+never pass through here. Their equivalent gate — drop unless the connection grant
+is ``active`` AND the chat unit is ``active`` — lives in ``handlers/business.py``.
 """
 
 from __future__ import annotations

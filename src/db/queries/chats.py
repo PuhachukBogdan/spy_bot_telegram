@@ -18,7 +18,7 @@ from uuid import UUID
 
 import asyncpg
 
-from src.db.models import Chat, ChatOverview
+from src.db.models import Chat, ChatAdderSummary, ChatOverview
 
 
 async def list_chats_overview(
@@ -193,6 +193,137 @@ async def create_pending_chat(
     return Chat.from_record(row) if row is not None else None
 
 
+async def create_active_chat(
+    conn: asyncpg.Connection,
+    *,
+    telegram_chat_id: int,
+    thread_id: int | None,
+    chat_name: str | None,
+    added_by_user_id: int | None,
+    authorized_by: UUID,
+    unit_type: str = "group",
+) -> Chat | None:
+    """Insert a unit straight as ``status='active'`` — trusted-adder onboarding.
+
+    Used when a *known internal user* adds the bot to a group: we trust the user
+    (they passed verification once) rather than approve every chat, so the unit is
+    live immediately with ``authorized_by`` = the adder and ``authorized_at=now()``.
+    No partner is bound yet — an admin attaches one later with ``/bind_partner``.
+    Idempotent via ``ON CONFLICT DO NOTHING`` (returns ``None`` on a re-add of a
+    unit we already track, so the onboarding handler skips re-notifying).
+    """
+    row = await conn.fetchrow(
+        """
+        INSERT INTO chats (
+            telegram_chat_id, message_thread_id, chat_name,
+            added_by_user_id, status, unit_type, authorized_by, authorized_at
+        )
+        VALUES ($1, $2, $3, $4, 'active', $5, $6, now())
+        ON CONFLICT (telegram_chat_id, topic_key) DO NOTHING
+        RETURNING *
+        """,
+        telegram_chat_id,
+        thread_id,
+        chat_name,
+        added_by_user_id,
+        unit_type,
+        authorized_by,
+    )
+    return Chat.from_record(row) if row is not None else None
+
+
+async def create_business_chat(
+    conn: asyncpg.Connection,
+    *,
+    telegram_chat_id: int,
+    business_connection_id: str,
+    business_peer_user_id: int,
+    partner_id: UUID | None,
+    status: str,
+    chat_name: str | None = None,
+    authorized_by: UUID | None = None,
+) -> Chat | None:
+    """Insert a Telegram-Business monitored unit (migration 0006).
+
+    For a business unit ``telegram_chat_id`` holds the partner's TG user_id (a
+    private chat has ``chat.id == user.id``), so ``topic_key`` is 0 and the
+    existing ``UNIQUE(telegram_chat_id, topic_key)`` keeps each partner DM
+    distinct. ``status`` is ``'active'`` for an auto-linked known contact or
+    ``'pending'`` for an unknown one; ``authorized_at`` is stamped only when
+    active. Idempotent via ``ON CONFLICT DO NOTHING`` — returns ``None`` if a unit
+    for this id already exists (lost a race with a concurrent first message).
+    """
+    row = await conn.fetchrow(
+        """
+        INSERT INTO chats (
+            telegram_chat_id, message_thread_id, chat_name, status, unit_type,
+            business_connection_id, business_peer_user_id, partner_id,
+            authorized_by, authorized_at
+        )
+        VALUES ($1, NULL, $2, $3, 'business', $4, $5, $6, $7,
+                CASE WHEN $3 = 'active' THEN now() ELSE NULL END)
+        ON CONFLICT (telegram_chat_id, topic_key) DO NOTHING
+        RETURNING *
+        """,
+        telegram_chat_id,
+        chat_name,
+        status,
+        business_connection_id,
+        business_peer_user_id,
+        partner_id,
+        authorized_by,
+    )
+    return Chat.from_record(row) if row is not None else None
+
+
+async def link_business_chat(
+    conn: asyncpg.Connection,
+    *,
+    telegram_chat_id: int,
+    business_connection_id: str,
+    business_peer_user_id: int,
+    partner_id: UUID,
+    authorized_by: UUID,
+    chat_name: str | None = None,
+) -> Chat | None:
+    """Activate (or create) a business unit and bind it to a partner (``/link_business_chat``).
+
+    Upserts on ``(telegram_chat_id, topic_key)``: flips a ``'pending'`` unit (left
+    by the first message from an unknown contact) to ``'active'`` and attaches the
+    partner, or creates the unit active if none exists yet. The ``DO UPDATE`` is
+    guarded to ``unit_type='business'`` so it can never hijack a group/topic unit
+    (business peer ids are positive, group ids negative — they don't collide, but
+    the guard is cheap insurance and makes a hijack return ``None``).
+    """
+    row = await conn.fetchrow(
+        """
+        INSERT INTO chats (
+            telegram_chat_id, message_thread_id, chat_name, status, unit_type,
+            business_connection_id, business_peer_user_id, partner_id,
+            authorized_by, authorized_at
+        )
+        VALUES ($1, NULL, $2, 'active', 'business', $3, $4, $5, $6, now())
+        ON CONFLICT (telegram_chat_id, topic_key) DO UPDATE
+        SET status = 'active',
+            partner_id = $5,
+            business_connection_id = $3,
+            business_peer_user_id = $4,
+            authorized_by = $6,
+            authorized_at = now(),
+            chat_name = COALESCE(EXCLUDED.chat_name, chats.chat_name)
+        WHERE chats.unit_type = 'business'
+        RETURNING *
+        """,
+        telegram_chat_id,
+        chat_name,
+        business_connection_id,
+        business_peer_user_id,
+        partner_id,
+        authorized_by,
+    )
+    return Chat.from_record(row) if row is not None else None
+
+
 async def list_pending(conn: asyncpg.Connection) -> list[Chat]:
     """Return all units awaiting authorization, oldest first (for ``/pending``)."""
     rows = await conn.fetch(
@@ -252,6 +383,62 @@ async def authorize_chat(
         thread_id,
         partner_id,
         authorized_by,
+    )
+    return Chat.from_record(row) if row is not None else None
+
+
+async def bind_partner_to_chat(
+    conn: asyncpg.Connection,
+    *,
+    telegram_chat_id: int,
+    thread_id: int | None,
+    partner_id: UUID,
+) -> Chat | None:
+    """Attach (or re-attach) a partner to an already-active unit (``/bind_partner``).
+
+    Decoupled from authorization: a trusted-adder unit goes live with no partner,
+    and the admin binds one afterwards. Guarded to ``status='active'`` so it never
+    silently re-activates a removed/banned unit. Returns the row, or ``None`` if no
+    active unit matched.
+    """
+    row = await conn.fetchrow(
+        """
+        UPDATE chats
+        SET partner_id = $3
+        WHERE telegram_chat_id = $1
+          AND topic_key = COALESCE($2, 0)
+          AND status = 'active'
+        RETURNING *
+        """,
+        telegram_chat_id,
+        thread_id,
+        partner_id,
+    )
+    return Chat.from_record(row) if row is not None else None
+
+
+async def deactivate_chat(
+    conn: asyncpg.Connection, telegram_chat_id: int, thread_id: int | None
+) -> Chat | None:
+    """Disconnect a live unit (``/chat_delete``): set ``status='removed'``.
+
+    Distinct from ``'banned'`` (reject of a *pending* group) and ``'rejected'``
+    (reject of a *pending* topic): ``'removed'`` is an admin deliberately
+    disconnecting an already-active/pending unit during oversight. Guarded so a
+    unit that is already removed/banned/rejected is not re-flipped. The caller
+    decides whether to also leave the Telegram chat. Returns the row, or ``None``.
+    """
+    row = await conn.fetchrow(
+        """
+        UPDATE chats
+        SET status = 'removed'
+        WHERE telegram_chat_id = $1
+          AND topic_key = COALESCE($2, 0)
+          AND status NOT IN ('removed', 'banned', 'rejected')
+        RETURNING *
+        """,
+        telegram_chat_id,
+        thread_id,
     )
     return Chat.from_record(row) if row is not None else None
 
@@ -377,3 +564,94 @@ async def update_chat_telegram_id(
     )
     # asyncpg execute returns a tag like "UPDATE 3"; take the trailing count.
     return int(result.split()[-1]) if result else 0
+
+
+# --- Admin panel (oversight: who connected which chats) ----------------------
+# The panel groups live units by the internal user who added the bot. A unit's
+# adder is a Telegram user id (chats.added_by_user_id); an internal user owns
+# several Telegram accounts (internal_users.telegram_accounts JSONB array), so
+# the match is JSONB containment: telegram_accounts @> to_jsonb(added_by_user_id).
+# Only live units (active / pending) are surfaced — removed/banned units drop off.
+
+
+async def list_managers_with_chat_counts(
+    conn: asyncpg.Connection,
+) -> list[ChatAdderSummary]:
+    """Internal users who have added ≥1 live unit, with their unit count (panel home)."""
+    rows = await conn.fetch(
+        """
+        SELECT u.id AS internal_user_id, u.full_name, u.role,
+               count(c.id) AS chat_count
+        FROM internal_users u
+        JOIN chats c
+          ON u.telegram_accounts @> to_jsonb(c.added_by_user_id)
+         AND c.status IN ('active', 'pending')
+        WHERE u.enabled = true
+        GROUP BY u.id, u.full_name, u.role
+        ORDER BY u.full_name ASC
+        """
+    )
+    return [ChatAdderSummary.from_record(row) for row in rows]
+
+
+async def count_unattributed_chats(conn: asyncpg.Connection) -> int:
+    """Count live units whose adder is unknown / not an internal user (panel home)."""
+    return cast(
+        "int",
+        await conn.fetchval(
+            """
+            SELECT count(*) FROM chats c
+            WHERE c.status IN ('active', 'pending')
+              AND NOT EXISTS (
+                  SELECT 1 FROM internal_users u
+                  WHERE u.telegram_accounts @> to_jsonb(c.added_by_user_id))
+            """
+        ),
+    )
+
+
+async def list_chats_by_adder(
+    conn: asyncpg.Connection, internal_user_id: UUID
+) -> list[ChatOverview]:
+    """Live units added by one internal user, with partner + last activity (drill-down)."""
+    rows = await conn.fetch(
+        """
+        SELECT c.id, c.telegram_chat_id, c.unit_type, c.message_thread_id,
+               c.chat_name, c.status, p.name AS partner_name,
+               max(m.timestamp) AS last_activity
+        FROM chats c
+        JOIN internal_users u
+          ON u.id = $1
+         AND u.telegram_accounts @> to_jsonb(c.added_by_user_id)
+        LEFT JOIN partners p ON p.id = c.partner_id
+        LEFT JOIN messages m ON m.chat_id = c.id
+        WHERE c.status IN ('active', 'pending')
+        GROUP BY c.id, p.name
+        ORDER BY c.created_at DESC
+        """,
+        internal_user_id,
+    )
+    return [ChatOverview.from_record(row) for row in rows]
+
+
+async def list_unattributed_chats(
+    conn: asyncpg.Connection,
+) -> list[ChatOverview]:
+    """Live units whose adder is unknown / not an internal user (drill-down)."""
+    rows = await conn.fetch(
+        """
+        SELECT c.id, c.telegram_chat_id, c.unit_type, c.message_thread_id,
+               c.chat_name, c.status, p.name AS partner_name,
+               max(m.timestamp) AS last_activity
+        FROM chats c
+        LEFT JOIN partners p ON p.id = c.partner_id
+        LEFT JOIN messages m ON m.chat_id = c.id
+        WHERE c.status IN ('active', 'pending')
+          AND NOT EXISTS (
+              SELECT 1 FROM internal_users u
+              WHERE u.telegram_accounts @> to_jsonb(c.added_by_user_id))
+        GROUP BY c.id, p.name
+        ORDER BY c.created_at DESC
+        """
+    )
+    return [ChatOverview.from_record(row) for row in rows]

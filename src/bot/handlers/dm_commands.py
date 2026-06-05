@@ -51,7 +51,7 @@ Manual e2e test scenario (roles + forum topics)::
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from html import escape as html_escape
 from typing import Any
 
@@ -64,14 +64,18 @@ from src.bot.middleware.roles import require_partner_access, require_role
 from src.config import settings
 from src.db.client import acquire_connection
 from src.db.models import InternalUser, Partner
+from src.db.queries import business_connections as bc_q
 from src.db.queries import notes as notes_q
 from src.db.queries import risk_events as risk_q
 from src.db.queries.audit import insert_audit_log
 from src.db.queries.chats import (
     authorize_chat,
+    bind_partner_to_chat,
     count_live_units,
+    deactivate_chat,
     find_chats_by_ref,
     get_chat_unit,
+    link_business_chat,
     list_chat_overviews_by_partner,
     list_chats_overview,
     list_pending,
@@ -81,9 +85,13 @@ from src.db.queries.chats import (
 from src.db.queries.cost import get_today as cost_get_today
 from src.db.queries.cost import sum_last_7_days
 from src.db.queries.etc import (
+    create_internal_user,
     find_internal_user_by_identifier,
     find_internal_user_by_telegram_id,
     get_internal_user_by_id,
+    get_internal_user_by_telegram_id_any,
+    list_internal_users,
+    set_user_enabled,
 )
 from src.db.queries.messages import get_message_by_id, get_messages_around
 from src.db.queries.partners import (
@@ -157,10 +165,18 @@ _HELP_REVIEW = (
 # Admin-only surface.
 _HELP_ADMIN = (
     "<b>Admin only:</b>\n"
+    "/admin — connected-chats panel (who linked what, drill down, ids)\n"
+    '/users [all] · /add_manager &lt;id&gt; "Name" · /disable_user &lt;id|name&gt;'
+    " — team access\n"
     "/pending · /authorize · /reject · /authorize_topic · /reject_topic — onboarding\n"
+    '/bind_partner &lt;chat_id&gt; "Partner" — attach a partner to an active group\n'
+    "/chat_delete &lt;id&gt; — disconnect a unit and leave the chat\n"
     "/set_partner_status &lt;name&gt; &lt;status&gt; — change partner status\n"
     "/set_owner &lt;partner&gt; &lt;user&gt; — assign owning manager\n"
-    "/thresholds · /categories · /dictionary [cat] · /cost_status — settings"
+    "/thresholds · /categories · /dictionary [cat] · /cost_status — settings\n"
+    "/business_connections — list Business connection grants\n"
+    "/approve_business · /reject_business &lt;conn_id&gt; — approve / disable a grant\n"
+    '/link_business_chat &lt;conn_id&gt; &lt;user_id&gt; "Partner" — link an unknown DM'
 )
 
 
@@ -558,6 +574,7 @@ _CHAT_FILTERS = {
     "inactive",
     "banned",
     "rejected",
+    "removed",
     "all",
 }
 _MAX_LIST_ROWS = 20
@@ -777,7 +794,7 @@ async def cmd_chats(
     if filt not in _CHAT_FILTERS:
         await message.answer(
             "Usage: <code>/chats [active|pending|abandoned|inactive|banned|"
-            "rejected|all]</code>"
+            "rejected|removed|all]</code>"
         )
         return
     status = None if filt == "all" else filt
@@ -864,6 +881,316 @@ async def cmd_chat(
         )
     await message.answer("\n".join(lines))
     log.info("dm.chat", actor=str(actor.id), chat_id=str(chat.id))
+
+
+@router.message(Command("bind_partner"))
+@require_role("admin")
+async def cmd_bind_partner(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Attach a partner to an already-active GROUP unit (admin only); audited.
+
+    Companion to the trusted-adder onboarding: a unit a manager added goes live
+    with no partner, and the admin binds one here. Usage:
+    ``/bind_partner <chat_id> <partner name>``. The partner is created if new. For
+    a forum topic, use ``/authorize_topic`` (topics still flow through discovery).
+    """
+    parsed = _parse_authorize_args(command.args)
+    if parsed is None:
+        await message.answer(
+            'Usage: <code>/bind_partner &lt;chat_id&gt; "Partner Name"</code>\n'
+            "Example: <code>/bind_partner -1001234567890 Acme Corp</code>\n"
+            "(for a forum topic use <code>/authorize_topic</code>)"
+        )
+        return
+    telegram_chat_id, partner_name = parsed
+
+    async with acquire_connection() as conn:
+        async with conn.transaction():
+            chat = await get_chat_unit(conn, telegram_chat_id, None)  # group-level
+            if chat is None or chat.status != "active":
+                await message.answer(
+                    f"No active group <code>{telegram_chat_id}</code>. "
+                    "(I only bind units that are already live.)"
+                )
+                return
+            partner = await get_or_create_partner(conn, partner_name)
+            updated = await bind_partner_to_chat(
+                conn,
+                telegram_chat_id=telegram_chat_id,
+                thread_id=None,
+                partner_id=partner.id,
+            )
+            if updated is None:  # lost a race; unit left active
+                await message.answer(
+                    f"No active group <code>{telegram_chat_id}</code>."
+                )
+                return
+            await insert_audit_log(
+                conn,
+                action="bind_partner",
+                actor_user_id=message.from_user.id if message.from_user else None,
+                actor_internal_id=actor.id,
+                target_entity="chat",
+                target_id=updated.id,
+                payload={
+                    "telegram_chat_id": telegram_chat_id,
+                    "partner_id": str(partner.id),
+                    "partner_name": partner.name,
+                },
+            )
+    log.info(
+        "dm.bind_partner",
+        chat_id=telegram_chat_id,
+        partner=partner.name,
+        by=str(actor.id),
+    )
+    await message.answer(
+        f"🔗 Group <code>{telegram_chat_id}</code> bound to partner "
+        f"<b>{html_escape(partner.name)}</b>."
+    )
+
+
+@router.message(Command("chat_delete"))
+@require_role("admin")
+async def cmd_chat_delete(
+    message: Message,
+    actor: InternalUser,
+    command: CommandObject,
+    bot: Bot,
+    **kwargs: Any,
+) -> None:
+    """Disconnect a live unit and leave the chat when safe (admin only); audited.
+
+    Usage: ``/chat_delete <id>`` where ``id`` is a unit id (full or first 8 chars)
+    or a ``telegram_chat_id``. Sets ``status='removed'``. For a group/topic the bot
+    leaves the Telegram chat only when no other live unit of it remains (leaving
+    would kill sibling topics); a business unit is just removed (we can't leave a
+    business DM). If the reference matches several units, you're asked to pick one
+    by its unit id.
+    """
+    ref = (command.args or "").strip()
+    if not ref:
+        await message.answer(
+            "Usage: <code>/chat_delete &lt;id&gt;</code> (unit id or telegram id)"
+        )
+        return
+    ref_int = int(ref) if ref.lstrip("-").isdigit() else None
+
+    async with acquire_connection() as conn:
+        matches = await find_chats_by_ref(conn, ref, ref_int)
+        live = [c for c in matches if c.status in ("active", "pending")]
+        if not live:
+            await message.answer("No active unit with that id.")
+            return
+        if len(live) > 1:
+            lines = ["Multiple units match — re-run with a unit id (first 8 chars):"]
+            for c in live[:_MAX_LIST_ROWS]:
+                name = html_escape(c.chat_name) if c.chat_name else "(untitled)"
+                lines.append(
+                    f"• <code>{str(c.id)[:8]}</code> [{c.unit_type}] {name} [{c.status}]"
+                )
+            await message.answer("\n".join(lines))
+            return
+
+        chat = live[0]
+        async with conn.transaction():
+            removed = await deactivate_chat(
+                conn, chat.telegram_chat_id, chat.message_thread_id
+            )
+            if removed is None:
+                await message.answer("No active unit with that id.")
+                return
+            await insert_audit_log(
+                conn,
+                action="chat_delete",
+                actor_user_id=message.from_user.id if message.from_user else None,
+                actor_internal_id=actor.id,
+                target_entity="chat",
+                target_id=removed.id,
+                payload={
+                    "telegram_chat_id": chat.telegram_chat_id,
+                    "thread_id": chat.message_thread_id,
+                    "unit_type": chat.unit_type,
+                },
+            )
+        # Decide whether leaving the Telegram chat is safe (after the unit is
+        # already 'removed', so it's excluded from the live count).
+        remaining = await count_live_units(conn, chat.telegram_chat_id)
+
+    note = ""
+    if chat.unit_type != "business":
+        if remaining == 0:
+            left = await _leave_chat_quietly(bot, chat.telegram_chat_id)
+            note = " and left the chat" if left else " (couldn't leave — already gone?)"
+        else:
+            note = f" (staying — {remaining} other unit(s) still monitored)"
+    log.info(
+        "dm.chat_delete",
+        unit_id=str(chat.id),
+        chat_id=chat.telegram_chat_id,
+        remaining=remaining,
+        by=str(actor.id),
+    )
+    await message.answer(
+        f"🗑 Unit <code>{str(chat.id)[:8]}</code> removed{note}."
+    )
+
+
+# --- Team / access management ------------------------------------------------
+# The trusted-adder onboarding hinges on the adder being a whitelisted internal
+# user, so an admin needs an in-bot way to grant/list/revoke that trust (no more
+# hand-editing internal_users in Studio). A prospective manager learns their own
+# Telegram id from the cover /whoami, passes it to an admin out-of-band, and the
+# admin whitelists it here. All admin-only; all audited.
+
+
+@router.message(Command("users"))
+@require_role("admin")
+async def cmd_users(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """List internal users (admin only). ``/users all`` includes disabled ones."""
+    include_disabled = (command.args or "").strip().lower() == "all"
+    async with acquire_connection() as conn:
+        users = await list_internal_users(conn, include_disabled=include_disabled)
+
+    if not users:
+        await message.answer("No internal users.")
+        return
+    scope = "all" if include_disabled else "enabled"
+    lines = [f"<b>Internal users — {scope}</b> ({len(users)})"]
+    for u in users[:_MAX_LIST_ROWS]:
+        accounts = (
+            ", ".join(f"<code>{a}</code>" for a in u.telegram_accounts)
+            if u.telegram_accounts
+            else "—"
+        )
+        flag = "" if u.enabled else " · <i>disabled</i>"
+        lines.append(
+            f"• <b>{html_escape(u.full_name)}</b> [{u.role}]{flag} — {accounts}"
+        )
+    if len(users) > _MAX_LIST_ROWS:
+        lines.append(f"\n…and {len(users) - _MAX_LIST_ROWS} more (use /users all).")
+    await message.answer("\n".join(lines))
+    log.info("dm.users", actor=str(actor.id), count=len(users))
+
+
+@router.message(Command("add_manager"))
+@require_role("admin")
+async def cmd_add_manager(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Whitelist a manager by Telegram id (admin only); audited.
+
+    Usage: ``/add_manager <telegram_id> "Full Name"``. Once whitelisted, every chat
+    the manager adds the bot to auto-activates (no per-chat approval). If the id
+    already maps to an enabled user it's a no-op report; a disabled match is
+    re-enabled instead of duplicated.
+    """
+    parsed = _parse_add_manager_args(command.args)
+    if parsed is None:
+        await message.answer(
+            'Usage: <code>/add_manager &lt;telegram_id&gt; "Full Name"</code>\n'
+            'Example: <code>/add_manager 123456789 "Ivan Petrov"</code>\n'
+            "Tip: the person can get their id from /whoami and send it to you."
+        )
+        return
+    telegram_id, full_name = parsed
+
+    async with acquire_connection() as conn:
+        async with conn.transaction():
+            existing = await get_internal_user_by_telegram_id_any(conn, telegram_id)
+            if existing is not None and existing.enabled:
+                await message.answer(
+                    f"Already whitelisted: <b>{html_escape(existing.full_name)}</b> "
+                    f"[{existing.role}]."
+                )
+                return
+            if existing is not None:  # disabled → restore trust
+                await set_user_enabled(conn, existing.id, True)
+                await insert_audit_log(
+                    conn,
+                    action="enable_user",
+                    actor_user_id=message.from_user.id if message.from_user else None,
+                    actor_internal_id=actor.id,
+                    target_entity="internal_user",
+                    target_id=existing.id,
+                    payload={"telegram_id": telegram_id, "role": existing.role},
+                )
+                log.info("dm.enable_user", telegram_id=telegram_id, by=str(actor.id))
+                await message.answer(
+                    f"♻️ Re-enabled <b>{html_escape(existing.full_name)}</b> "
+                    f"[{existing.role}]."
+                )
+                return
+            created = await create_internal_user(
+                conn, full_name=full_name, telegram_id=telegram_id, role="manager"
+            )
+            await insert_audit_log(
+                conn,
+                action="add_manager",
+                actor_user_id=message.from_user.id if message.from_user else None,
+                actor_internal_id=actor.id,
+                target_entity="internal_user",
+                target_id=created.id,
+                payload={
+                    "telegram_id": telegram_id,
+                    "full_name": full_name,
+                    "role": "manager",
+                },
+            )
+    log.info("dm.add_manager", telegram_id=telegram_id, by=str(actor.id))
+    await message.answer(
+        f"✅ <b>{html_escape(full_name)}</b> whitelisted as <b>manager</b> "
+        f"(id <code>{telegram_id}</code>).\n"
+        "Chats they add me to now auto-activate — review them in /admin."
+    )
+
+
+@router.message(Command("disable_user"))
+@require_role("admin")
+async def cmd_disable_user(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Revoke an internal user's trust (admin only); audited.
+
+    Usage: ``/disable_user <telegram_id | full name>``. Sets ``enabled=false`` — the
+    user becomes an outsider: their commands stop and any chat they add henceforth
+    goes to pending. Existing monitored chats are untouched. You can't disable
+    yourself.
+    """
+    identifier = (command.args or "").strip()
+    if not identifier:
+        await message.answer(
+            "Usage: <code>/disable_user &lt;telegram_id | full name&gt;</code>"
+        )
+        return
+
+    async with acquire_connection() as conn:
+        async with conn.transaction():
+            target = await find_internal_user_by_identifier(conn, identifier)
+            if target is None:
+                await message.answer("User not found.")
+                return
+            if target.id == actor.id:
+                await message.answer("You can't disable yourself.")
+                return
+            await set_user_enabled(conn, target.id, False)
+            await insert_audit_log(
+                conn,
+                action="disable_user",
+                actor_user_id=message.from_user.id if message.from_user else None,
+                actor_internal_id=actor.id,
+                target_entity="internal_user",
+                target_id=target.id,
+                payload={"role": target.role, "full_name": target.full_name},
+            )
+    log.info("dm.disable_user", target=str(target.id), by=str(actor.id))
+    await message.answer(
+        f"🚫 <b>{html_escape(target.full_name)}</b> [{target.role}] disabled. "
+        "Existing chats stay; new adds from them will go to pending."
+    )
 
 
 # --- Risk review -------------------------------------------------------------
@@ -1093,6 +1420,172 @@ async def cmd_cost_status(message: Message, actor: InternalUser, **kwargs: Any) 
     )
 
 
+# --- Telegram Business connections (admin) -----------------------------------
+
+
+@router.message(Command("business_connections"))
+@require_role("admin")
+async def cmd_business_connections(
+    message: Message, actor: InternalUser, **kwargs: Any
+) -> None:
+    """List all Business connection grants with status and owner (admin only)."""
+    async with acquire_connection() as conn:
+        rows = await bc_q.list_all(conn)
+
+    if not rows:
+        await message.answer("No Business connection grants yet.")
+        return
+
+    lines = [f"<b>Business connections ({len(rows)})</b>"]
+    for r in rows:
+        owner = f"<code>{r.business_account_user_id}</code>"
+        lines.append(
+            f"• <code>{html_escape(r.business_connection_id)}</code> "
+            f"[{r.status}] — owner {owner} — {_fmt_dt(r.connected_at)}"
+        )
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("approve_business"))
+@require_role("admin")
+async def cmd_approve_business(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Approve a pending Business connection grant (admin only); audited."""
+    bc_id = (command.args or "").strip()
+    if not bc_id:
+        await message.answer(
+            "Usage: <code>/approve_business &lt;connection_id&gt;</code>"
+        )
+        return
+    async with acquire_connection() as conn:
+        async with conn.transaction():
+            grant = await bc_q.get_by_connection_id(conn, bc_id)
+            if grant is None:
+                await message.answer("Business connection not found.")
+                return
+            if grant.status == "active":
+                await message.answer("That connection is already active.")
+                return
+            await bc_q.update_status(
+                conn, bc_id, "active", approved_by=actor.id, approved_at=datetime.now(UTC)
+            )
+            await insert_audit_log(
+                conn,
+                action="approve_business",
+                actor_user_id=message.from_user.id if message.from_user else None,
+                actor_internal_id=actor.id,
+                target_entity="business_connection",
+                target_id=grant.id,
+                payload={"bc_id": bc_id, "old_status": grant.status},
+            )
+    log.info("dm.approve_business", bc_id=bc_id, by=str(actor.id))
+    await message.answer(
+        f"✅ Business connection <code>{html_escape(bc_id)}</code> approved — "
+        "monitoring active."
+    )
+
+
+@router.message(Command("reject_business"))
+@require_role("admin")
+async def cmd_reject_business(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Decline a Business connection grant (admin only); audited.
+
+    Sets ``status='disabled'`` (a deliberate refusal on our side, distinct from
+    ``'revoked'`` which Telegram reports when the owner turns the bot off). Either
+    way, business messages on that connection are dropped.
+    """
+    bc_id = (command.args or "").strip()
+    if not bc_id:
+        await message.answer(
+            "Usage: <code>/reject_business &lt;connection_id&gt;</code>"
+        )
+        return
+    async with acquire_connection() as conn:
+        async with conn.transaction():
+            grant = await bc_q.get_by_connection_id(conn, bc_id)
+            if grant is None:
+                await message.answer("Business connection not found.")
+                return
+            await bc_q.update_status(conn, bc_id, "disabled")
+            await insert_audit_log(
+                conn,
+                action="reject_business",
+                actor_user_id=message.from_user.id if message.from_user else None,
+                actor_internal_id=actor.id,
+                target_entity="business_connection",
+                target_id=grant.id,
+                payload={"bc_id": bc_id, "old_status": grant.status},
+            )
+    log.info("dm.reject_business", bc_id=bc_id, by=str(actor.id))
+    await message.answer(
+        f"🚫 Business connection <code>{html_escape(bc_id)}</code> disabled."
+    )
+
+
+@router.message(Command("link_business_chat"))
+@require_role("admin")
+async def cmd_link_business_chat(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Link an unknown business DM to a partner and activate it (admin only)."""
+    parsed = _parse_link_business_args(command.args)
+    if parsed is None:
+        await message.answer(
+            "Usage: <code>/link_business_chat &lt;connection_id&gt; "
+            '&lt;peer_user_id&gt; "Partner Name"</code>'
+        )
+        return
+    bc_id, peer_user_id, partner_name = parsed
+
+    async with acquire_connection() as conn:
+        async with conn.transaction():
+            grant = await bc_q.get_by_connection_id(conn, bc_id)
+            if grant is None:
+                await message.answer("Business connection not found.")
+                return
+            partner = await get_or_create_partner(conn, partner_name)
+            unit = await link_business_chat(
+                conn,
+                telegram_chat_id=peer_user_id,
+                business_connection_id=bc_id,
+                business_peer_user_id=peer_user_id,
+                partner_id=partner.id,
+                authorized_by=actor.id,
+            )
+            if unit is None:
+                await message.answer(
+                    "Couldn't link — that id is held by a non-business unit."
+                )
+                return
+            await insert_audit_log(
+                conn,
+                action="link_business_chat",
+                actor_user_id=message.from_user.id if message.from_user else None,
+                actor_internal_id=actor.id,
+                target_entity="chat",
+                target_id=unit.id,
+                payload={
+                    "bc_id": bc_id,
+                    "peer_user_id": peer_user_id,
+                    "partner_id": str(partner.id),
+                },
+            )
+    log.info(
+        "dm.link_business_chat",
+        bc_id=bc_id,
+        peer_user_id=peer_user_id,
+        partner_id=str(partner.id),
+        by=str(actor.id),
+    )
+    await message.answer(
+        f"🔗 Business chat with <code>{peer_user_id}</code> linked to "
+        f"<b>{html_escape(partner.name)}</b> — monitoring active."
+    )
+
+
 async def _mark_risk(
     message: Message, actor: InternalUser, command: CommandObject, new_status: str
 ) -> None:
@@ -1269,6 +1762,44 @@ def _parse_reject_topic_args(args: str | None) -> tuple[int, int] | None:
     if chat_id is None or thread_id is None:
         return None
     return chat_id, thread_id
+
+
+def _parse_add_manager_args(args: str | None) -> tuple[int, str] | None:
+    """Split ``<telegram_id> <full name>`` for /add_manager, or return ``None``.
+
+    The id must be a positive integer (Telegram user ids are positive — a negative
+    value would be a chat id, a likely paste error). The name may be quoted and
+    contain spaces.
+    """
+    if not args:
+        return None
+    parts = args.strip().split(maxsplit=1)
+    if len(parts) != 2:
+        return None
+    telegram_id = _parse_int(parts[0])
+    full_name = _strip_quotes(parts[1])
+    if telegram_id is None or telegram_id <= 0 or not full_name:
+        return None
+    return telegram_id, full_name
+
+
+def _parse_link_business_args(args: str | None) -> tuple[str, int, str] | None:
+    """Split ``<connection_id> <peer_user_id> <partner name>`` for /link_business_chat.
+
+    Returns ``(connection_id, peer_user_id, partner_name)`` or ``None`` if
+    malformed. The partner name may be quoted and contain spaces.
+    """
+    if not args:
+        return None
+    parts = args.strip().split(maxsplit=2)
+    if len(parts) != 3:
+        return None
+    bc_id = parts[0].strip()
+    peer_user_id = _parse_int(parts[1])
+    partner_name = _strip_quotes(parts[2])
+    if not bc_id or peer_user_id is None or not partner_name:
+        return None
+    return bc_id, peer_user_id, partner_name
 
 
 def _parse_int(token: str | None) -> int | None:

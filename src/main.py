@@ -36,6 +36,23 @@ log = get_logger(__name__)
 # Header Telegram sends with each webhook call, echoing the secret we registered.
 _SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
 
+# Telegram only sends the update types we explicitly ask for. The default set
+# OMITS business_* updates (and chat_member / callback_query), so without this
+# list the Business secretary handlers and the inline admin panel would never
+# fire. We must therefore also re-list every type we already rely on (message /
+# edited_message / my_chat_member); leaving one out would silently stop it.
+_ALLOWED_UPDATES = [
+    "message",
+    "edited_message",
+    "my_chat_member",
+    "chat_member",
+    "callback_query",
+    "business_connection",
+    "business_message",
+    "edited_business_message",
+    "deleted_business_messages",
+]
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -56,6 +73,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await bot.set_webhook(
             url=settings.TELEGRAM_WEBHOOK_URL,
             secret_token=settings.TELEGRAM_WEBHOOK_SECRET.get_secret_value(),
+            allowed_updates=_ALLOWED_UPDATES,
             drop_pending_updates=False,
         )
         log.info("startup.webhook.set", url=settings.TELEGRAM_WEBHOOK_URL)

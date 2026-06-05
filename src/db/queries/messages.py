@@ -215,6 +215,37 @@ async def update_message_text(
     )
 
 
+async def mark_message_deleted(
+    conn: asyncpg.Connection,
+    *,
+    chat_id: UUID,
+    telegram_message_id: int,
+    deletion_payload: dict[str, Any] | None,
+) -> int:
+    """Soft-delete a stored message: stamp ``deleted_at`` + the raw payload.
+
+    Used by the Telegram Business ``deleted_business_messages`` handler (migration
+    0006): a partner can delete a message on their side, and we keep the row but
+    record that it was deleted (deletion in a partner chat can itself be a risk
+    signal). Returns the number of rows updated — ``0`` when we never stored that
+    message (e.g. it predates the chat being linked), so the caller can tell how
+    many of a batch actually existed. Idempotent: re-deleting just rewrites
+    ``deleted_at``.
+    """
+    result = await conn.execute(
+        """
+        UPDATE messages
+        SET deleted_at = now(), deletion_payload = $3
+        WHERE chat_id = $1 AND telegram_message_id = $2
+        """,
+        chat_id,
+        telegram_message_id,
+        deletion_payload,
+    )
+    # asyncpg execute returns a tag like "UPDATE 1"; take the trailing count.
+    return int(result.split()[-1]) if result else 0
+
+
 async def update_message_triggers(
     conn: asyncpg.Connection,
     message_id: UUID,

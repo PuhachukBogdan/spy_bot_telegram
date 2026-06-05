@@ -14,6 +14,8 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
+from src.bot.handlers.admin_panel import router as admin_panel_router
+from src.bot.handlers.business import router as business_router
 from src.bot.handlers.chat_member import router as onboarding_router
 from src.bot.handlers.dm_commands import router as dm_commands_router
 from src.bot.handlers.edits import router as edits_router
@@ -41,5 +43,13 @@ dp.include_router(onboarding_router)
 # dm_commands is private-only; messages is group-only — disjoint, but dm_commands
 # is included first so a (private) command never reaches the ingestion router.
 dp.include_router(dm_commands_router)
+# The admin panel is private-only too (its own /admin command + inline-button
+# callbacks). Included after dm_commands; the /admin command lives only here, so
+# order vs dm_commands is immaterial, but it stays ahead of the group routers.
+dp.include_router(admin_panel_router)
 dp.include_router(messages_router)
 dp.include_router(edits_router)
+# Telegram Business updates ride their own observers (not dp.message), so the
+# audit/whitelist middlewares above never touch them; the business router
+# self-gates on the connection grant + chat-unit status (see handlers/business.py).
+dp.include_router(business_router)

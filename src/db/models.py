@@ -419,6 +419,15 @@ class ChatOverview(_ORMModel):
     last_activity: datetime | None = None
 
 
+class ChatAdderSummary(_ORMModel):
+    """One row of the admin panel home: an internal user who connected chats."""
+
+    internal_user_id: UUID
+    full_name: str
+    role: str
+    chat_count: int = 0
+
+
 class RiskEventOverview(_ORMModel):
     """One row of ``/risks``: a risk event plus its partner name."""
 

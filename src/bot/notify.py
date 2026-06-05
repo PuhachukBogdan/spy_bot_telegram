@@ -67,31 +67,59 @@ def format_pending_notice(chat: Chat) -> str:
     )
 
 
-async def notify_admins_pending(
-    bot: Bot, admins: list[InternalUser], chat: Chat
-) -> None:
-    """DM every reachable admin about a unit awaiting authorization.
+def format_auto_active_notice(chat: Chat, adder: InternalUser) -> str:
+    """Admin FYI DM: a trusted internal user connected a chat (now auto-active).
+
+    Sent when a known internal user adds the bot to a group — no approval is
+    needed (we trust the verified user, not each chat), so this is an oversight
+    notice, not an action request. It nudges the admin to attach a partner and
+    points at the panel. The adder themselves is *not* DM'd (cover posture).
+    """
+    name = html_escape(chat.chat_name) if chat.chat_name else "<i>(untitled)</i>"
+    return (
+        "✅ <b>New chat auto-activated</b>\n\n"
+        f"<b>Chat:</b> {name}\n"
+        f"<b>Chat id:</b> <code>{chat.telegram_chat_id}</code>\n"
+        f"<b>Connected by:</b> {html_escape(adder.full_name)} "
+        f"(role={html_escape(adder.role)})\n\n"
+        "Monitoring is live. Bind a partner:\n"
+        f'<code>/bind_partner {chat.telegram_chat_id} "Partner Name"</code>\n'
+        "Review all connections: /admin"
+    )
+
+
+async def notify_internal_user(bot: Bot, user: InternalUser, text: str) -> bool:
+    """DM one internal user; return whether delivery succeeded.
 
     A person may have several Telegram accounts but can only be DM'd on ones that
     have started the bot (Telegram restriction, CLAUDE.md 11.3). We try each
-    account and stop after the first success, so each admin gets one notification;
-    an admin with no reachable account is logged, not retried.
+    account and stop after the first success, so the user gets one message; a user
+    with no reachable account is logged (not retried) and ``False`` is returned.
     """
-    text = format_pending_notice(chat)
+    for account_id in user.telegram_accounts:
+        try:
+            await bot.send_message(account_id, text)
+            return True
+        except TelegramAPIError as exc:
+            # Most commonly: the user has not started the bot, or blocked it.
+            log.debug(
+                "notify.dm_failed",
+                user=user.full_name,
+                account_id=account_id,
+                error=str(exc),
+            )
+    log.warning("notify.user_unreachable", user=user.full_name)
+    return False
+
+
+async def notify_admins(bot: Bot, admins: list[InternalUser], text: str) -> None:
+    """DM every reachable admin a free-text message (one notification each)."""
     for admin in admins:
-        delivered = False
-        for account_id in admin.telegram_accounts:
-            try:
-                await bot.send_message(account_id, text)
-                delivered = True
-                break
-            except TelegramAPIError as exc:
-                # Most commonly: admin has not started the bot, or blocked it.
-                log.debug(
-                    "onboarding.admin_dm_failed",
-                    admin=admin.full_name,
-                    account_id=account_id,
-                    error=str(exc),
-                )
-        if not delivered:
-            log.warning("onboarding.admin_unreachable", admin=admin.full_name)
+        await notify_internal_user(bot, admin, text)
+
+
+async def notify_admins_pending(
+    bot: Bot, admins: list[InternalUser], chat: Chat
+) -> None:
+    """DM every reachable admin about a unit awaiting authorization."""
+    await notify_admins(bot, admins, format_pending_notice(chat))
