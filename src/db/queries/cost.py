@@ -36,6 +36,29 @@ async def sum_last_7_days(conn: asyncpg.Connection) -> Decimal:
     return cast("Decimal", value)
 
 
+async def record_llm_cost(
+    conn: asyncpg.Connection, cost_usd: Decimal, calls: int = 1
+) -> None:
+    """Add LLM spend (OpenRouter Tier-2/priority) to today's row, creating it if
+    absent.
+
+    Mirrors :func:`record_whisper_cost`: upsert on the ``date`` PK so concurrent
+    workers accumulate; ``total_cost_usd`` is GENERATED, never written here.
+    """
+    await conn.execute(
+        """
+        INSERT INTO cost_tracking (date, llm_cost_usd, llm_calls_count)
+        VALUES (CURRENT_DATE, $1, $2)
+        ON CONFLICT (date) DO UPDATE
+        SET llm_cost_usd = cost_tracking.llm_cost_usd + EXCLUDED.llm_cost_usd,
+            llm_calls_count = cost_tracking.llm_calls_count
+                              + EXCLUDED.llm_calls_count
+        """,
+        cost_usd,
+        calls,
+    )
+
+
 async def record_whisper_cost(
     conn: asyncpg.Connection, cost_usd: Decimal, calls: int = 1
 ) -> None:

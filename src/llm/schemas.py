@@ -1,1 +1,114 @@
-﻿"""Pydantic schemas for structured outputs. Phase 8."""
+"""Structured-output contract for Tier-2 LLM risk analysis. Phase 8.
+
+The LLM is never trusted to return free-form text. Tier-2 calls force a single
+tool/function call whose arguments validate against :class:`RiskAnalysis`, so the
+pipeline always receives typed, bounded data (CLAUDE.md / pipeline §7.6).
+
+This module is the single source of truth for:
+  * the 12 risk categories (:class:`RiskType`) and 4 severity levels
+    (:class:`RiskLevel`) — mirrors the free-text ``risk_events.risk_type`` /
+    ``risk_level`` columns, which carry no DB CHECK;
+  * the per-finding / per-response Pydantic models the tool arguments parse into;
+  * :func:`build_risk_analysis_tool`, the OpenAI/OpenRouter function-tool dict the
+    client passes with ``tool_choice`` to force JSON.
+
+It has zero I/O and zero network — pure contract, fully unit-testable.
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+# The forced-tool name. The client sets tool_choice to this so the model cannot
+# answer in prose.
+RISK_ANALYSIS_TOOL_NAME = "report_risk_events"
+
+
+class RiskType(StrEnum):
+    """The 12 risk categories. Enum values are the exact strings stored in
+    ``risk_events.risk_type`` (pipeline §7.6 — no DB CHECK, this is the guard)."""
+
+    SHADOW_DEAL = "shadow_deal"
+    PRIVATE_CHANNEL = "private_channel"
+    HIDDEN_PAYMENT = "hidden_payment"
+    TRAFFIC_LEAKAGE = "traffic_leakage"
+    COMMERCIAL_TERMS = "commercial_terms"
+    FRAUD_SHAVE = "fraud_shave"
+    ACCESS_RISK = "access_risk"
+    PARTNER_CHURN = "partner_churn"
+    PAYMENT_CONFLICT = "payment_conflict"
+    REPUTATION_RISK = "reputation_risk"
+    OPERATIONAL_SLA = "operational_sla"
+    EMPLOYEE_BEHAVIOR = "employee_behavior"
+
+
+class RiskLevel(StrEnum):
+    """Severity tiers stored in ``risk_events.risk_level`` and used by alert
+    routing (pipeline §7.7). Derived from the final score downstream — NOT part
+    of the LLM tool output, which returns a numeric score instead."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class RiskFinding(BaseModel):
+    """One risk the LLM attributes to a flagged message (pipeline §7.6 output).
+
+    ``score`` 0-100 and ``confidence`` 0-1 are both bounded so a malformed model
+    response fails validation rather than poisoning downstream scoring. A benign-
+    in-context message is returned with ``confidence < 0.3`` (a deliberate
+    false-positive signal) rather than omitted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(description="UUID of the flagged message this risk is for")
+    risk_type: RiskType = Field(description="One of the 12 risk categories")
+    score: int = Field(ge=0, le=100, description="Risk score 0-100")
+    confidence: float = Field(ge=0.0, le=1.0, description="LLM confidence 0-1")
+    explanation: str = Field(
+        description="One-to-two sentence justification, no chain-of-thought"
+    )
+    context_message_ids: list[str] = Field(
+        default_factory=list,
+        description="UUIDs of surrounding messages that establish the risk",
+    )
+
+
+class RiskAnalysis(BaseModel):
+    """The complete tool payload: every risk found in the analysed excerpt.
+
+    An empty list is a valid, meaningful answer ("nothing risky here") — the
+    client treats a no-tool-call response as this.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    risk_events: list[RiskFinding] = Field(default_factory=list)
+
+
+def build_risk_analysis_tool() -> dict[str, Any]:
+    """Return the OpenAI/OpenRouter function-tool dict for forced risk analysis.
+
+    Parameters are derived from :class:`RiskAnalysis` so the schema can never
+    drift from the model the arguments parse into. Pair with
+    ``tool_choice={"type": "function", "function": {"name": RISK_ANALYSIS_TOOL_NAME}}``
+    to force the call.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": RISK_ANALYSIS_TOOL_NAME,
+            "description": (
+                "Report every genuine risk signal found in the conversation "
+                "excerpt. Return an empty list if nothing is risky. Include "
+                "benign-in-context matches with confidence below 0.3."
+            ),
+            "parameters": RiskAnalysis.model_json_schema(),
+        },
+    }
