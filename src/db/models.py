@@ -31,7 +31,7 @@ no default are required; nullable columns default to ``None``.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any, Literal, Self
 from uuid import UUID
@@ -68,6 +68,12 @@ class InternalUser(_ORMModel):
     role: Literal["admin", "manager", "viewer"] = "manager"
     telegram_accounts: list[int] = Field(default_factory=list)
     enabled: bool = True
+    # Migration 0008: working hours for the operational_sla track. start/end are
+    # NULL until the user runs /set_hours; work_timezone is an IANA name and
+    # always present (DEFAULT 'UTC'). asyncpg decodes TIME -> datetime.time.
+    work_hours_start: time | None = None
+    work_hours_end: time | None = None
+    work_timezone: str = "UTC"
     created_at: datetime
 
     @property

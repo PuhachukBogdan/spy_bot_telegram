@@ -31,6 +31,9 @@ dependencies = [
     "openai>=1.35",
     # Slack
     "slack-sdk>=3.27",
+    # IANA timezone database — zoneinfo has no system tzdata on Windows (and may
+    # lack it in slim containers); needed for per-manager work-hours timezones.
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

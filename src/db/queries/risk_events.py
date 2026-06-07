@@ -8,11 +8,79 @@ already-acquired ``asyncpg.Connection`` (project-wide convention). Owner scoping
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID
 
 import asyncpg
 
 from src.db.models import RiskEvent, RiskEventOverview
+
+
+async def save_risk_event(
+    conn: asyncpg.Connection,
+    *,
+    risk_type: str,
+    risk_level: str,
+    base_score: int,
+    final_score: int,
+    message_id: UUID | None = None,
+    partner_id: UUID | None = None,
+    chat_id: UUID | None = None,
+    sender_id: int | None = None,
+    triggered_patterns: dict[str, Any] | list[Any] | None = None,
+    context_modifiers: dict[str, Any] | None = None,
+    llm_confidence: float | None = None,
+    llm_multiplier: float | None = None,
+    llm_verdict: str | None = None,
+    llm_explanation: str | None = None,
+    disagreement: bool = False,
+    detected_phrase: str | None = None,
+    context_message_ids: list[UUID] | None = None,
+    status: str = "new",
+) -> RiskEvent:
+    """Insert one risk event and return the stored row.
+
+    Low-level write shared by every producer: the batch processor (§7.4) and
+    priority lane (§7.5) pass the full LLM-path fields (computed by
+    :func:`src.pipeline.scoring.score_finding`); the operational_sla job passes
+    only the rule-path fields (``base_score`` == ``final_score``, the ``llm_*``
+    arguments left ``None``). JSONB / UUID[] params ride the pool's codecs.
+    The caller owns the surrounding transaction (so the insert commits together
+    with its cost/audit rows).
+    """
+    row = await conn.fetchrow(
+        """
+        INSERT INTO risk_events (
+            message_id, partner_id, chat_id, sender_id,
+            risk_type, risk_level, triggered_patterns, context_modifiers,
+            base_score, llm_confidence, llm_multiplier, llm_verdict,
+            llm_explanation, final_score, disagreement, detected_phrase,
+            context_message_ids, status
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                $15, $16, $17, $18)
+        RETURNING *
+        """,
+        message_id,
+        partner_id,
+        chat_id,
+        sender_id,
+        risk_type,
+        risk_level,
+        triggered_patterns,
+        context_modifiers,
+        base_score,
+        llm_confidence,
+        llm_multiplier,
+        llm_verdict,
+        llm_explanation,
+        final_score,
+        disagreement,
+        detected_phrase,
+        context_message_ids,
+        status,
+    )
+    return RiskEvent.from_record(row)
 
 
 async def list_recent(

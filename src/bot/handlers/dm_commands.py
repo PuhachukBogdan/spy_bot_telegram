@@ -92,6 +92,7 @@ from src.db.queries.etc import (
     get_internal_user_by_telegram_id_any,
     list_internal_users,
     set_user_enabled,
+    update_work_hours,
 )
 from src.db.queries.messages import get_message_by_id, get_messages_around
 from src.db.queries.partners import (
@@ -104,6 +105,7 @@ from src.db.queries.partners import (
 )
 from src.db.queries.patterns import load_enabled_patterns
 from src.utils.logging import get_logger
+from src.utils.workhours import parse_work_hours
 
 log = get_logger(__name__)
 
@@ -132,8 +134,8 @@ _START_ADMIN = (
     "Use /help for the full command list."
 )
 
-# /help body for non-admins (managers, viewers, outsiders) — the cover surface.
-# Lists only the neutral commands; no trace of the monitoring layer.
+# /help body for outsiders — the cover surface. Lists only the neutral commands;
+# no trace of the monitoring layer.
 _COVER_HELP_TEXT = (
     "<b>Partner Assistant</b>\n\n"
     "/start — about this bot\n"
@@ -141,11 +143,19 @@ _COVER_HELP_TEXT = (
     "/whoami — show how I recognize you"
 )
 
+# Cover surface for a recognized internal user (manager / viewer). Same neutral
+# face plus /set_hours — framed as a scheduling convenience, it reveals nothing
+# about monitoring, but lets a manager record the work hours the SLA track needs.
+_COVER_HELP_INTERNAL = (
+    _COVER_HELP_TEXT + "\n/set_hours — set your working hours and timezone"
+)
+
 _HELP_COMMON = (
     "<b>Available commands</b>\n\n"
     "/start — intro and what I do\n"
     "/help — this message\n"
-    "/whoami — show how I recognize you and your role"
+    "/whoami — show how I recognize you and your role\n"
+    "/set_hours — set your working hours and timezone"
 )
 
 # Monitoring surface — ADMIN ONLY. A manager must never learn the bot tracks
@@ -183,11 +193,14 @@ _HELP_ADMIN = (
 def _help_for(role: str | None) -> str:
     """Build the /help body. Only an admin sees the real command surface.
 
-    Everyone else — managers, viewers and outsiders alike — gets the neutral
-    cover text, which never hints that the bot reads messages or tracks risk.
+    A recognized manager/viewer gets the cover text plus /set_hours; an outsider
+    gets the bare cover. Neither variant hints that the bot reads messages or
+    tracks risk.
     """
     if role == "admin":
         return "\n\n".join([_HELP_COMMON, _HELP_REVIEW, _HELP_ADMIN])
+    if role in ("manager", "viewer"):
+        return _COVER_HELP_INTERNAL
     return _COVER_HELP_TEXT
 
 
@@ -243,6 +256,47 @@ async def cmd_whoami(message: Message) -> None:
     await message.answer(
         "You're chatting with the <b>Partner Assistant</b>.\n"
         f"Your Telegram id: <code>{user.id}</code>"
+    )
+
+
+@router.message(Command("set_hours"))
+@require_role("admin", "manager", "viewer")
+async def cmd_set_hours(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Set the caller's own working hours + timezone (any internal user).
+
+    Feeds the operational_sla track: a partner message left unanswered beyond the
+    SLA threshold *during the owning manager's working hours* raises a flag, and
+    the weekly summary rolls those up per manager. The command is framed as a
+    neutral scheduling convenience — it fits the "Partner Assistant" cover and
+    reveals nothing about monitoring. Outsiders get the decorator's neutral
+    "Command not found." Usage: ``/set_hours 09:00-18:00 Europe/Kiev``.
+    """
+    parsed = parse_work_hours(command.args or "")
+    if parsed is None:
+        await message.answer(
+            "Set your working hours and timezone so I can keep things to your "
+            "shift.\n\n"
+            "Usage: <code>/set_hours HH:MM-HH:MM Timezone</code>\n"
+            "Example: <code>/set_hours 09:00-18:00 Europe/Kiev</code>\n"
+            "Example: <code>/set_hours 08:30-17:30 Asia/Almaty</code>"
+        )
+        return
+
+    async with acquire_connection() as conn:
+        await update_work_hours(
+            conn,
+            actor.id,
+            start=parsed.start,
+            end=parsed.end,
+            timezone=parsed.timezone,
+        )
+    log.info("dm.set_hours", actor=str(actor.id), timezone=parsed.timezone)
+    await message.answer(
+        "✅ Working hours saved: "
+        f"<b>{parsed.start.strftime('%H:%M')}–{parsed.end.strftime('%H:%M')}</b> "
+        f"({html_escape(parsed.timezone)})."
     )
 
 
@@ -1326,16 +1380,26 @@ async def cmd_mark_escalated(
 @router.message(Command("thresholds"))
 @require_role("admin")
 async def cmd_thresholds(message: Message, actor: InternalUser, **kwargs: Any) -> None:
-    """Show the current scoring / budget / cadence configuration."""
+    """Show the current scoring / budget / cadence configuration (from config).
+
+    The risk-level bands are read from ``settings`` (the single source of truth
+    shared with ``src.pipeline.scoring``) so this display can never drift from the
+    values the pipeline actually scores with.
+    """
+    med = settings.RISK_LEVEL_MEDIUM_MIN
+    high = settings.RISK_LEVEL_HIGH_MIN
+    crit = settings.RISK_LEVEL_CRITICAL_MIN
     await message.answer(
         "<b>Thresholds &amp; limits</b>\n"
         f"Priority lane threshold: <b>{settings.PRIORITY_SCORE_THRESHOLD}</b>\n"
         f"Daily LLM budget: <b>${settings.DAILY_LLM_BUDGET_USD}</b>\n\n"
-        "<b>Risk levels:</b>\n"
-        "Low: 0–20 (log only)\n"
-        "Medium: 21–50 (digest)\n"
-        "High: 51–75 (Slack alert)\n"
-        "Critical: 76–100 (Slack + recipients pinged)\n\n"
+        "<b>Risk levels (final score):</b>\n"
+        f"Low: 0–{med - 1} (log only)\n"
+        f"Medium: {med}–{high - 1} (summary)\n"
+        f"High: {high}–{crit - 1} (real-time alert)\n"
+        f"Critical: {crit}–100 (real-time alert)\n"
+        f"Real-time alert fires at: <b>{settings.ALERT_MIN_RISK_LEVEL}+</b>\n\n"
+        f"SLA response threshold: {settings.SLA_RESPONSE_THRESHOLD_MINUTES} work-min\n"
         f"Batch interval: {settings.BATCH_PROCESSING_INTERVAL_SECONDS // 60} min\n"
         f"Context window: {settings.CONTEXT_WINDOW_MINUTES} min\n"
         f"Pending chat timeout: {settings.ABANDONED_CHAT_TIMEOUT_HOURS // 24} days"

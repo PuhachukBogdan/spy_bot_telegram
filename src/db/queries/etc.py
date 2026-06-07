@@ -6,6 +6,7 @@ and authorization checks). Each takes an already-acquired ``asyncpg.Connection``
 
 from __future__ import annotations
 
+from datetime import time
 from uuid import UUID
 
 import asyncpg
@@ -119,6 +120,35 @@ async def create_internal_user(
         [telegram_id],
     )
     return InternalUser.from_record(row)
+
+
+async def update_work_hours(
+    conn: asyncpg.Connection,
+    internal_id: UUID,
+    *,
+    start: time,
+    end: time,
+    timezone: str,
+) -> InternalUser | None:
+    """Set an internal user's working hours + timezone (``/set_hours``).
+
+    Feeds the operational_sla track (migration 0008). ``timezone`` is a canonical
+    IANA name already validated by ``src.utils.workhours.parse_work_hours``.
+    Returns the updated row, or ``None`` if the id was unknown.
+    """
+    row = await conn.fetchrow(
+        """
+        UPDATE internal_users
+        SET work_hours_start = $2, work_hours_end = $3, work_timezone = $4
+        WHERE id = $1
+        RETURNING *
+        """,
+        internal_id,
+        start,
+        end,
+        timezone,
+    )
+    return InternalUser.from_record(row) if row is not None else None
 
 
 async def set_user_enabled(

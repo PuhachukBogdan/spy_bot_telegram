@@ -85,6 +85,25 @@ class Settings(BaseSettings):
     CONTEXT_WINDOW_MINUTES: int = 30
     ABANDONED_CHAT_TIMEOUT_HOURS: int = 168
 
+    # === Risk scoring (final_score -> risk_level bands; pipeline §7.6) ===
+    # Locked 2026-06-07 (risk-architecture session). A final_score at/above each
+    # floor takes that level; anything below RISK_LEVEL_MEDIUM_MIN is 'low'. These
+    # are the single source of truth — src.pipeline.scoring and the /thresholds
+    # command both read them, so the bands can never drift between code and UI.
+    RISK_LEVEL_MEDIUM_MIN: int = 30
+    RISK_LEVEL_HIGH_MIN: int = 60
+    RISK_LEVEL_CRITICAL_MIN: int = 80
+    # Real-time alerts fire only at/above this level; lower levels are stored and
+    # surface in the weekly/monthly summary instead. Locked: high + critical.
+    ALERT_MIN_RISK_LEVEL: Literal["low", "medium", "high", "critical"] = "high"
+
+    # === SLA (operational_sla track — time-based, no LLM) ===
+    # A partner message with no internal reply for this many WORK minutes (counted
+    # against the owning manager's work hours, migration 0008) raises an
+    # operational_sla risk. The job lands in a later phase; the threshold lives in
+    # config now so the value is fixed in one place.
+    SLA_RESPONSE_THRESHOLD_MINUTES: int = 20
+
     # === Bot ===
     BOT_DM_LANGUAGE: str = "en"
     ENVIRONMENT: Literal["production", "staging", "dev"] = "production"
