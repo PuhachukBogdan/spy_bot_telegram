@@ -172,6 +172,54 @@ async def get_messages_around(
     return before_list, after_list
 
 
+async def get_chat_analysis_window(
+    conn: asyncpg.Connection,
+    chat_id: UUID,
+    *,
+    since: datetime | None,
+    limit: int,
+    context_before: int,
+) -> tuple[list[Message], list[Message]]:
+    """Return ``(context, new)`` for one Tier-2 analysis pass (Phase 9).
+
+    ``new`` is the messages with ``timestamp > since`` (or all, when ``since`` is
+    NULL — first run), oldest first, capped at ``limit``; ``context`` is up to
+    ``context_before`` messages strictly older than the first new one, for the LLM
+    to read the lead-up. Soft-deleted messages (``deleted_at`` set) are excluded.
+    Returns ``([], [])`` when there is nothing new.
+    """
+    new_rows = await conn.fetch(
+        """
+        SELECT * FROM messages
+        WHERE chat_id = $1
+          AND ($2::timestamptz IS NULL OR timestamp > $2)
+          AND deleted_at IS NULL
+        ORDER BY timestamp ASC
+        LIMIT $3
+        """,
+        chat_id,
+        since,
+        limit,
+    )
+    new = [Message.from_record(row) for row in new_rows]
+    if not new:
+        return [], []
+
+    ctx_rows = await conn.fetch(
+        """
+        SELECT * FROM messages
+        WHERE chat_id = $1 AND timestamp < $2 AND deleted_at IS NULL
+        ORDER BY timestamp DESC
+        LIMIT $3
+        """,
+        chat_id,
+        new[0].timestamp,
+        context_before,
+    )
+    context = [Message.from_record(row) for row in reversed(ctx_rows)]
+    return context, new
+
+
 async def update_message_transcription(
     conn: asyncpg.Connection, message_id: UUID, transcription: str | None
 ) -> None:

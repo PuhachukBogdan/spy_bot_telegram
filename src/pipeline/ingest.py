@@ -12,6 +12,7 @@ Tier-1 rule matching (CLAUDE.md 7.1 steps 6-9) hooks in here in Phase 6; for now
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import asyncpg
@@ -29,7 +30,7 @@ from src.db.client import acquire_connection
 from src.db.models import Chat
 from src.db.queries.etc import find_internal_user_by_telegram_id
 from src.db.queries.messages import insert_message, update_message_triggers
-from src.db.queries.queue import enqueue_task
+from src.db.queries.queue import enqueue_chat_analysis, enqueue_task
 from src.pipeline.tier1 import MatchResult, pattern_cache
 from src.utils.language import detect_language
 from src.utils.logging import get_logger
@@ -112,7 +113,7 @@ async def ingest_message(message: Message, chat: Chat) -> None:
             base_score=result.base_score,
             triggered_patterns=result.triggered_patterns,
         )
-        await _enqueue_followups(conn, stored.id, message_type, result)
+        await _enqueue_followups(conn, stored.id, chat.id, message_type, result)
 
     log.info(
         "ingest.stored",
@@ -133,19 +134,29 @@ async def ingest_message(message: Message, chat: Chat) -> None:
 async def _enqueue_followups(
     conn: asyncpg.Connection,
     message_id: UUID,
+    chat_id: UUID,
     message_type: str,
     result: MatchResult,
 ) -> None:
     """Queue heavy follow-up work (CLAUDE.md 7.1 steps 8-9).
 
-    Voice / video notes go to the Whisper queue (transcription runs Tier-1 again
-    in Phase 7). Otherwise a base_score at/above the threshold gets a real-time
-    priority LLM pass (Phase 10).
+    Voice / video notes go to the Whisper queue first (transcription re-runs Tier-1
+    and then enqueues analysis itself). Everything else ensures the chat's single
+    ``analyze_chat`` task exists (decision A — unified Tier-2 lane): a Tier-1 score
+    at/above the threshold runs it now (priority bump), otherwise it runs on the
+    batch interval. The per-chat dedup lives in ``enqueue_chat_analysis``.
     """
     if message_type in ("voice", "video_note"):
         await enqueue_task(conn, "whisper_transcribe", {"message_id": str(message_id)})
-    elif result.base_score >= settings.PRIORITY_SCORE_THRESHOLD:
-        await enqueue_task(conn, "priority_llm", {"message_id": str(message_id)})
+        return
+    immediate = result.base_score >= settings.PRIORITY_SCORE_THRESHOLD
+    run_at = datetime.now(UTC) if immediate else _batch_run_at()
+    await enqueue_chat_analysis(conn, chat_id, run_at)
+
+
+def _batch_run_at() -> datetime:
+    """When a non-priority chat should next be analysed (now + batch interval)."""
+    return datetime.now(UTC) + timedelta(seconds=settings.BATCH_PROCESSING_INTERVAL_SECONDS)
 
 
 def _classify_type(message: Message) -> str:

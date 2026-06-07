@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from uuid import UUID
 
 import asyncpg
 
@@ -37,6 +38,44 @@ async def enqueue_task(
         payload,
     )
     return int(task_id)
+
+
+async def enqueue_chat_analysis(
+    conn: asyncpg.Connection, chat_id: UUID, run_at: datetime
+) -> None:
+    """Ensure exactly one pending ``analyze_chat`` task for a chat; bump its time.
+
+    The unified Tier-2 lane (decision A, 2026-06-07) keeps a single pending task
+    per chat: a burst of messages does not pile up tasks, and a high Tier-1 score
+    simply pulls the chat's waiting task forward. If a pending task already exists
+    we move its ``scheduled_for`` earlier when ``run_at`` is sooner (``LEAST`` —
+    never push a bumped task back); otherwise we insert a new one. Dedup is on the
+    JSONB ``payload->>'chat_id'``.
+
+    (A rare race can create two tasks for the same chat; the worker is idempotent —
+    a second task simply finds nothing new past the advanced watermark.)
+    """
+    bumped = await conn.fetchval(
+        """
+        UPDATE processing_queue
+        SET scheduled_for = LEAST(scheduled_for, $2)
+        WHERE task_type = 'analyze_chat'
+          AND status = 'pending'
+          AND payload->>'chat_id' = $1
+        RETURNING id
+        """,
+        str(chat_id),
+        run_at,
+    )
+    if bumped is None:
+        await conn.execute(
+            """
+            INSERT INTO processing_queue (task_type, payload, scheduled_for)
+            VALUES ('analyze_chat', jsonb_build_object('chat_id', $1::text), $2)
+            """,
+            str(chat_id),
+            run_at,
+        )
 
 
 async def claim_tasks(

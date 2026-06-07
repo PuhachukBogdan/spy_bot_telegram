@@ -116,6 +116,9 @@ class Chat(_ORMModel):
     unit_type: Literal["group", "topic", "business"] = "group"
     business_connection_id: str | None = None
     business_peer_user_id: int | None = None
+    # Migration 0009: Tier-2 analysis watermark. Messages newer than this have not
+    # been sent to the LLM yet; the batch worker advances it after each pass.
+    last_processed_at: datetime | None = None
     created_at: datetime
 
 

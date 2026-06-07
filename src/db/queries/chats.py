@@ -137,6 +137,31 @@ async def get_chat_unit(
     return Chat.from_record(row) if row is not None else None
 
 
+async def get_chat_by_id(conn: asyncpg.Connection, chat_id: UUID) -> Chat | None:
+    """Return a chat unit by its primary key, or ``None`` (Tier-2 worker)."""
+    row = await conn.fetchrow("SELECT * FROM chats WHERE id = $1", chat_id)
+    return Chat.from_record(row) if row is not None else None
+
+
+async def update_chat_last_processed(
+    conn: asyncpg.Connection, chat_id: UUID, ts: datetime
+) -> None:
+    """Advance the Tier-2 analysis watermark (migration 0009); never move it back.
+
+    ``GREATEST`` guards against a re-ordered / duplicate task setting an older
+    timestamp, so the watermark only ever moves forward.
+    """
+    await conn.execute(
+        """
+        UPDATE chats
+        SET last_processed_at = GREATEST(COALESCE(last_processed_at, $2), $2)
+        WHERE id = $1
+        """,
+        chat_id,
+        ts,
+    )
+
+
 async def get_by_unit(
     conn: asyncpg.Connection, telegram_chat_id: int, topic_key: int = 0
 ) -> Chat | None:

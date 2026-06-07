@@ -97,6 +97,18 @@ class Settings(BaseSettings):
     # surface in the weekly/monthly summary instead. Locked: high + critical.
     ALERT_MIN_RISK_LEVEL: Literal["low", "medium", "high", "critical"] = "high"
 
+    # === Tier-2 analysis worker (unified batch + priority lane, decision A) ===
+    # One per-chat analyze_chat task; the worker polls this often for due tasks
+    # (immediate/bumped tasks need quick pickup). Per-tick claim size + max retries
+    # mirror the whisper worker.
+    ANALYSIS_POLL_INTERVAL_SECONDS: int = 15
+    ANALYSIS_BATCH_SIZE: int = 5
+    ANALYSIS_MAX_ATTEMPTS: int = 3
+    # Window bounds for one analysis pass: at most this many new messages (since
+    # the chat watermark) plus a few older ones for context.
+    ANALYSIS_WINDOW_LIMIT: int = 60
+    ANALYSIS_CONTEXT_BEFORE: int = 5
+
     # === SLA (operational_sla track — time-based, no LLM) ===
     # A partner message with no internal reply for this many WORK minutes (counted
     # against the owning manager's work hours, migration 0008) raises an

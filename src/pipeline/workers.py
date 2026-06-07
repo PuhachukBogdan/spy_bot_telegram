@@ -26,6 +26,7 @@ from src.db.queries.chats import (
     mark_chat_abandoned,
 )
 from src.db.queries.queue import claim_tasks
+from src.pipeline.batch_processor import process_analysis_task
 from src.pipeline.tier1 import pattern_cache
 from src.pipeline.transcription import process_whisper_task
 from src.utils.logging import get_logger
@@ -145,6 +146,36 @@ async def whisper_worker_loop(
             raise
         except Exception as exc:  # never let one bad tick kill the loop
             log.error("worker.whisper.error", error=str(exc))
+        await asyncio.sleep(interval)
+
+
+async def analysis_worker_loop(
+    interval_seconds: int | None = None,
+    batch_size: int | None = None,
+) -> None:
+    """Consume ``analyze_chat`` tasks forever (CLAUDE.md Phase 9, unified lane).
+
+    Each tick claims a small batch of due tasks (``FOR UPDATE SKIP LOCKED``, ordered
+    by ``scheduled_for`` so bumped/priority chats go first) and processes them
+    sequentially; each task self-resolves to done/failed/retry inside
+    ``process_analysis_task``. The claim runs in its own short connection so the
+    slow LLM call never holds a row lock. Per-iteration errors are logged and
+    swallowed; cancellation propagates.
+    """
+    interval = interval_seconds or settings.ANALYSIS_POLL_INTERVAL_SECONDS
+    batch = batch_size or settings.ANALYSIS_BATCH_SIZE
+    log.info("worker.analysis.start", interval_s=interval, batch=batch)
+    while True:
+        try:
+            async with acquire_connection() as conn:
+                tasks = await claim_tasks(conn, "analyze_chat", batch)
+            for task in tasks:
+                await process_analysis_task(task)
+        except asyncio.CancelledError:
+            log.info("worker.analysis.stop")
+            raise
+        except Exception as exc:  # never let one bad tick kill the loop
+            log.error("worker.analysis.error", error=str(exc))
         await asyncio.sleep(interval)
 
 

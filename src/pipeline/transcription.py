@@ -45,7 +45,12 @@ from src.db.queries.messages import (
     update_message_transcription,
     update_message_triggers,
 )
-from src.db.queries.queue import complete_task, enqueue_task, fail_task, retry_task
+from src.db.queries.queue import (
+    complete_task,
+    enqueue_chat_analysis,
+    fail_task,
+    retry_task,
+)
 from src.pipeline.tier1 import pattern_cache
 from src.utils.logging import get_logger
 
@@ -189,10 +194,17 @@ async def _transcribe_message(bot: Bot, message_id: UUID) -> None:
             base_score=result.base_score,
             triggered_patterns=result.triggered_patterns,
         )
-        # Now that the voice note carries text, a high score earns a priority
-        # LLM pass just like a typed message would (CLAUDE.md 7.1 step 9).
-        if result.base_score >= settings.PRIORITY_SCORE_THRESHOLD:
-            await enqueue_task(conn, "priority_llm", {"message_id": str(message_id)})
+        # Now that the voice note carries text, queue the chat for Tier-2 analysis
+        # like a typed message: a high score runs it now, otherwise on the batch
+        # interval (decision A — unified analyze_chat lane).
+        immediate = result.base_score >= settings.PRIORITY_SCORE_THRESHOLD
+        run_at = (
+            datetime.now(UTC)
+            if immediate
+            else datetime.now(UTC)
+            + timedelta(seconds=settings.BATCH_PROCESSING_INTERVAL_SECONDS)
+        )
+        await enqueue_chat_analysis(conn, message.chat_id, run_at)
         await record_whisper_cost(conn, _whisper_cost(duration_s))
 
     log.info(
