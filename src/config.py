@@ -139,6 +139,13 @@ class Settings(BaseSettings):
     # config now so the value is fixed in one place.
     SLA_RESPONSE_THRESHOLD_MINUTES: int = 20
 
+    # === Summary / HTML report (Phase 16) ===
+    # Shared bearer token for POST /summary/generate and GET /reports/...
+    # n8n passes it as ?token=; browser links carry it as a query param.
+    SUMMARY_ACCESS_TOKEN: SecretStr = SecretStr("change-me-before-deploy")
+    # Public base URL of this server, used to build the report link posted to Slack.
+    SERVER_BASE_URL: str = "http://localhost:8080"
+
     # === Bot ===
     BOT_DM_LANGUAGE: str = "en"
     ENVIRONMENT: Literal["production", "staging", "dev"] = "production"

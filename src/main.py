@@ -1,8 +1,8 @@
-"""Entry point: setup, register handlers, start app. Phase 1/3.
+"""Entry point: setup, register handlers, start app. Phase 1/3/16.
 
 FastAPI app that owns the DB pool lifecycle and the Telegram webhook
 registration. Incoming updates are verified against the webhook secret and fed
-into the aiogram dispatcher. The Slack-callback handler is a stub until Phase 12.
+into the aiogram dispatcher.
 """
 
 from __future__ import annotations
@@ -12,6 +12,8 @@ import contextlib
 import hmac
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from typing import Literal
 
 from aiogram.types import Update
 from fastapi import FastAPI, Request, Response
@@ -25,6 +27,7 @@ from src.alerts.slack_callbacks import handle_slack_action, verify_slack_signatu
 from src.bot.instance import bot, dp  # noqa: E402  (after setup_logging on purpose)
 from src.config import settings  # noqa: E402
 from src.db.client import acquire_connection, close_pool, get_pool  # noqa: E402
+from src.db.queries.summaries import get_rendered_html  # noqa: E402
 from src.pipeline.tier1 import pattern_cache  # noqa: E402
 from src.pipeline.workers import (  # noqa: E402
     abandoned_chat_cleanup_loop,
@@ -33,6 +36,7 @@ from src.pipeline.workers import (  # noqa: E402
     pattern_reload_loop,
     whisper_worker_loop,
 )
+from src.summary.generator import generate_report  # noqa: E402
 
 log = get_logger(__name__)
 
@@ -186,6 +190,51 @@ async def slack_callback(request: Request) -> Response:
         return Response(status_code=401)
     await handle_slack_action(raw_body)
     return Response(status_code=200)
+
+
+@app.post("/summary/generate")
+async def summary_generate(
+    request: Request,
+    period: Literal["weekly", "monthly"] = "weekly",
+    token: str = "",
+) -> Response:
+    """Trigger HTML report generation for the given period.
+
+    Called by n8n cron: POST /summary/generate?period=weekly&token=SECRET
+    Returns JSON {ok, url} on success; 401 on bad token.
+    """
+    expected = settings.SUMMARY_ACCESS_TOKEN.get_secret_value()
+    if not token or not hmac.compare_digest(token, expected):
+        log.warning("summary_generate.bad_token", remote=request.client)
+        return Response(status_code=401)
+    url = await generate_report(period_type=period)
+    return _json({"ok": True, "url": url})
+
+
+@app.get("/reports/{period_type}/{date}")
+async def get_report(
+    period_type: str,
+    date: str,
+    token: str = "",
+) -> Response:
+    """Serve a pre-rendered HTML report.
+
+    URL shape: GET /reports/weekly/2026-06-02?token=SECRET
+    Returns 401 on bad token, 400 on bad date, 404 if no report exists yet,
+    200 text/html otherwise.
+    """
+    expected = settings.SUMMARY_ACCESS_TOKEN.get_secret_value()
+    if not token or not hmac.compare_digest(token, expected):
+        return Response(status_code=401)
+    try:
+        period_start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=UTC)
+    except ValueError:
+        return Response(status_code=400)
+    async with acquire_connection() as conn:
+        html = await get_rendered_html(conn, period_type, period_start)
+    if html is None:
+        return Response(status_code=404)
+    return Response(content=html, media_type="text/html")
 
 
 def _json(payload: dict[str, object], status_code: int = 200) -> Response:
