@@ -401,6 +401,28 @@ class Reminder(_ORMModel):
     sent_at: datetime | None = None
 
 
+# === Migration 0011: manager activity signals ================================
+
+
+# --- 22. activity_signals ---------------------------------------------------
+class ActivitySignalRow(_ORMModel):
+    """LLM-detected manager activity signal (proposal or closed deal).
+
+    ``sender_id`` is the Telegram user ID of the message author. Attributed to
+    a manager at query time via
+    ``internal_users.telegram_accounts @> jsonb_build_array(sender_id)`` — no
+    denormalization stored here.
+    """
+
+    id: UUID
+    chat_id: UUID | None = None
+    message_id: UUID | None = None
+    sender_id: int | None = None
+    signal_type: str  # 'manager_proposal' | 'deal_closed'
+    description: str | None = None
+    created_at: datetime
+
+
 # === Read projections =======================================================
 # Not table rows: aggregate / joined shapes returned by the DM listing commands
 # (partners / chats / risks). Kept typed (CLAUDE.md section 9 — no dict[str, Any]

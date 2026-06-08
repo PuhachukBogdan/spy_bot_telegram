@@ -12,10 +12,12 @@ else runs on the batch interval. This worker claims a due task and:
      verdict);
   4. scores each finding (:mod:`src.pipeline.scoring`: the rule score is a hint and
      never raises the result), writes a ``risk_events`` row per finding, records
-     the LLM call + cost, and advances the watermark — all in one transaction.
+     the LLM call + cost, and advances the watermark — all in one transaction;
+  5. AFTER that transaction commits, dispatches the high+critical findings to Slack
+     (:mod:`src.alerts.dispatch`) — outside any transaction, so a Slack network
+     call never holds a DB connection.
 
-Real-time alert dispatch (high+critical -> Slack) is Phase 11; here we persist and
-log a would-alert line. The driving loop lives in :mod:`src.pipeline.workers`.
+The driving loop lives in :mod:`src.pipeline.workers`.
 """
 
 from __future__ import annotations
@@ -24,12 +26,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
+from aiogram import Bot
+
+from src.alerts.dispatch import dispatch_alerts
 from src.config import settings
 from src.db.client import acquire_connection
-from src.db.models import Chat, Message, ProcessingQueue
+from src.db.models import Chat, Message, ProcessingQueue, RiskEvent
+from src.db.queries.activity_signals import save_activity_signal
 from src.db.queries.chats import get_chat_by_id, update_chat_last_processed
 from src.db.queries.cost import record_llm_cost
 from src.db.queries.messages import get_chat_analysis_window
+from src.db.queries.partners import get_partner_by_id
 from src.db.queries.queue import complete_task, defer_task, fail_task, retry_task
 from src.db.queries.risk_events import save_risk_event
 from src.llm.audit import record_llm_call
@@ -130,7 +137,7 @@ def _detected_phrase(message: Message) -> str | None:
     return text[:_DETECTED_PHRASE_MAX] if text else None
 
 
-async def process_analysis_task(task: ProcessingQueue) -> None:
+async def process_analysis_task(bot: Bot, task: ProcessingQueue) -> None:
     """Process one claimed ``analyze_chat`` task; always reach a terminal state."""
     chat_id_raw = task.payload.get("chat_id")
     if not chat_id_raw:
@@ -141,7 +148,7 @@ async def process_analysis_task(task: ProcessingQueue) -> None:
     chat_id = UUID(str(chat_id_raw))
 
     try:
-        await _analyze_chat(chat_id)
+        await _analyze_chat(bot, chat_id)
     except _Skip as exc:
         async with acquire_connection() as conn:
             await complete_task(conn, task.id)
@@ -199,7 +206,7 @@ async def _reschedule_or_fail(task: ProcessingQueue, chat_id: UUID, error: str) 
     )
 
 
-async def _analyze_chat(chat_id: UUID) -> None:
+async def _analyze_chat(bot: Bot, chat_id: UUID) -> None:
     """Analyse one chat's new messages end to end. May raise (transient -> retry)."""
     async with acquire_connection() as conn:
         chat = await get_chat_by_id(conn, chat_id)
@@ -250,7 +257,20 @@ async def _analyze_chat(chat_id: UUID) -> None:
     )
     scored = prepare_scored_findings(result.analysis, new)
 
-    await _persist(chat, new, conversation_block, result, scored, newest_ts)
+    alertable = await _persist(chat, new, conversation_block, result, scored, newest_ts)
+
+    # Dispatch AFTER the transaction has committed — never inside it (a Slack
+    # network call must not hold a DB connection). A crash between commit and here
+    # leaves the risk persisted but un-alerted; that's the rare, acceptable edge.
+    if alertable:
+        async with acquire_connection() as conn:
+            partner = (
+                await get_partner_by_id(conn, chat.partner_id)
+                if chat.partner_id is not None
+                else None
+            )
+        partner_name = partner.name if partner is not None else None
+        await dispatch_alerts(bot, chat, partner_name, alertable)
 
 
 async def _persist(
@@ -260,14 +280,19 @@ async def _persist(
     result: LlmResult,
     scored: list[ScoredFinding],
     newest_ts: datetime,
-) -> None:
-    """Write the LLM-call audit row, cost, every risk_events row, and the watermark.
+) -> list[RiskEvent]:
+    """Write the LLM-call audit row, cost, every risk_events row, activity signals,
+    and the watermark.
 
     One transaction so a chat never gets risk rows without its watermark advancing
-    (which would re-analyse and duplicate them) and vice-versa.
+    (which would re-analyse and duplicate them) and vice-versa. Returns the saved
+    risk events that should fire a real-time alert (high+critical), for the caller
+    to dispatch once this transaction has committed.
     """
     any_disagreement = any(s.score.disagreement for s in scored)
     message_ids = [m.id for m in new_messages]
+    alertable: list[RiskEvent] = []
+    msg_by_id = {str(m.id): m for m in new_messages}
 
     async with acquire_connection() as conn, conn.transaction():
         await record_llm_call(
@@ -308,14 +333,21 @@ async def _persist(
                 context_message_ids=_to_uuid_list(s.finding.context_message_ids),
             )
             if should_alert(s.score.risk_level):
-                # Phase 11 will send this to Slack; for now we record + log it.
-                log.info(
-                    "analysis.would_alert",
-                    risk_event_id=str(event.id),
-                    level=s.score.risk_level,
-                    risk_type=s.finding.risk_type.value,
-                    final_score=s.score.final_score,
-                )
+                alertable.append(event)
+
+        for sig in result.analysis.activity_signals:
+            msg = msg_by_id.get(sig.message_id)
+            if msg is None:
+                log.info("analysis.signal_outside_window", message_id=sig.message_id)
+                continue
+            await save_activity_signal(
+                conn,
+                chat_id=chat.id,
+                message_id=msg.id,
+                sender_id=msg.sender_id,
+                signal_type=sig.signal_type.value,
+                description=sig.description,
+            )
 
         await update_chat_last_processed(conn, chat.id, newest_ts)
 
@@ -324,5 +356,7 @@ async def _persist(
         chat_id=str(chat.id),
         new=len(new_messages),
         findings=len(scored),
-        alerts=sum(1 for s in scored if should_alert(s.score.risk_level)),
+        signals=len(result.analysis.activity_signals),
+        alerts=len(alertable),
     )
+    return alertable

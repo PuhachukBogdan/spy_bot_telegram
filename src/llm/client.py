@@ -121,6 +121,7 @@ async def analyze_risk(
         "llm.analyzed",
         model=model,
         events=len(analysis.risk_events),
+        signals=len(analysis.activity_signals),
         tokens_in=tokens_in,
         tokens_out=tokens_out,
         latency_ms=latency_ms,

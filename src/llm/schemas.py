@@ -27,6 +27,35 @@ from pydantic import BaseModel, ConfigDict, Field
 RISK_ANALYSIS_TOOL_NAME = "report_risk_events"
 
 
+class ActivitySignalType(StrEnum):
+    """Manager activity signal types detected alongside risk events.
+
+    Stored in ``activity_signals.signal_type``; used by the manager-centric
+    weekly/monthly summary to count proposals and closed deals per manager.
+    """
+
+    MANAGER_PROPOSAL = "manager_proposal"
+    DEAL_CLOSED = "deal_closed"
+
+
+class ActivitySignal(BaseModel):
+    """One manager activity signal the LLM detected in the conversation.
+
+    Only report signals where an internal employee (manager/staff) is the
+    actor — partner-side proposals are not counted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(description="UUID of the message containing the signal")
+    signal_type: ActivitySignalType = Field(
+        description="'manager_proposal' or 'deal_closed'"
+    )
+    description: str = Field(
+        description="One sentence describing what was proposed or agreed"
+    )
+
+
 class RiskType(StrEnum):
     """The 12 risk categories. Enum values are the exact strings stored in
     ``risk_events.risk_type`` (pipeline §7.6 — no DB CHECK, this is the guard)."""
@@ -81,15 +110,15 @@ class RiskFinding(BaseModel):
 
 
 class RiskAnalysis(BaseModel):
-    """The complete tool payload: every risk found in the analysed excerpt.
+    """The complete tool payload: risks + manager activity signals found in the excerpt.
 
-    An empty list is a valid, meaningful answer ("nothing risky here") — the
-    client treats a no-tool-call response as this.
+    Both lists default to empty — a no-tool-call response is treated as this.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     risk_events: list[RiskFinding] = Field(default_factory=list)
+    activity_signals: list[ActivitySignal] = Field(default_factory=list)
 
 
 def build_risk_analysis_tool() -> dict[str, Any]:
@@ -106,8 +135,9 @@ def build_risk_analysis_tool() -> dict[str, Any]:
             "name": RISK_ANALYSIS_TOOL_NAME,
             "description": (
                 "Report every genuine risk signal found in the conversation "
-                "excerpt. Return an empty list if nothing is risky. Include "
-                "benign-in-context matches with confidence below 0.3."
+                "excerpt, AND any manager activity signals (proposals, closed "
+                "deals). Return empty lists if nothing is found. Include "
+                "benign-in-context risk matches with confidence below 0.3."
             ),
             "parameters": RiskAnalysis.model_json_schema(),
         },
