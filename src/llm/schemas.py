@@ -57,8 +57,13 @@ class ActivitySignal(BaseModel):
 
 
 class RiskType(StrEnum):
-    """The 12 risk categories. Enum values are the exact strings stored in
-    ``risk_events.risk_type`` (pipeline §7.6 — no DB CHECK, this is the guard)."""
+    """The 12 conversation risk categories + data_leak for document analysis.
+
+    Enum values are the exact strings stored in ``risk_events.risk_type``
+    (pipeline §7.6 — no DB CHECK, this is the guard).
+    ``DATA_LEAK`` is assigned by the file-analysis worker, never by the LLM
+    conversation tool (which uses the other 12).
+    """
 
     SHADOW_DEAL = "shadow_deal"
     PRIVATE_CHANNEL = "private_channel"
@@ -72,6 +77,7 @@ class RiskType(StrEnum):
     REPUTATION_RISK = "reputation_risk"
     OPERATIONAL_SLA = "operational_sla"
     EMPLOYEE_BEHAVIOR = "employee_behavior"
+    DATA_LEAK = "data_leak"
 
 
 class RiskLevel(StrEnum):

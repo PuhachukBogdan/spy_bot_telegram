@@ -149,6 +149,8 @@ async def _enqueue_followups(
     if message_type in ("voice", "video_note"):
         await enqueue_task(conn, "whisper_transcribe", {"message_id": str(message_id)})
         return
+    if message_type == "document":
+        await enqueue_task(conn, "analyze_file", {"message_id": str(message_id)})
     immediate = result.base_score >= settings.PRIORITY_SCORE_THRESHOLD
     run_at = datetime.now(UTC) if immediate else _batch_run_at()
     await enqueue_chat_analysis(conn, chat_id, run_at)
@@ -278,6 +280,6 @@ def _text_and_entities(message: Message) -> tuple[str | None, list[MessageEntity
 
 def _compute_significance(message_text: str | None, message_type: str) -> bool:
     """Precompute ``is_significant`` for the summary noise filter (heuristic)."""
-    if message_type in ("voice", "video_note"):
-        return True  # will carry text once transcribed (Phase 7)
+    if message_type in ("voice", "video_note", "document"):
+        return True  # voice/video carries text post-transcription; document gets file analysis
     return bool(message_text and len(message_text.strip()) >= _SIGNIFICANT_MIN_CHARS)

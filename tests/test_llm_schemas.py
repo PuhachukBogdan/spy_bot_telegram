@@ -15,8 +15,8 @@ from src.llm.schemas import (
 )
 
 
-def test_twelve_risk_categories() -> None:
-    assert len(RiskType) == 12
+def test_risk_categories_count() -> None:
+    assert len(RiskType) == 13  # 12 conversation categories + data_leak (file analysis)
     assert RiskType.PRIVATE_CHANNEL == "private_channel"  # value matches DB string
 
 

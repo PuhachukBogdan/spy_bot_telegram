@@ -27,6 +27,7 @@ from src.db.queries.chats import (
 )
 from src.db.queries.queue import claim_tasks
 from src.pipeline.batch_processor import process_analysis_task
+from src.pipeline.file_processor import process_file_task
 from src.pipeline.tier1 import pattern_cache
 from src.pipeline.transcription import process_whisper_task
 from src.utils.logging import get_logger
@@ -178,6 +179,39 @@ async def analysis_worker_loop(
             raise
         except Exception as exc:  # never let one bad tick kill the loop
             log.error("worker.analysis.error", error=str(exc))
+        await asyncio.sleep(interval)
+
+
+async def file_analysis_worker_loop(
+    bot: Bot,
+    interval_seconds: int | None = None,
+    batch_size: int | None = None,
+) -> None:
+    """Consume ``analyze_file`` tasks forever.
+
+    Each tick claims a small batch and processes them sequentially. Runs even
+    when ``FILE_ANALYSIS_ENABLED=false`` so the queue drains. Per-iteration
+    errors are logged and swallowed; cancellation propagates.
+    """
+    interval = interval_seconds or settings.FILE_ANALYSIS_POLL_INTERVAL_SECONDS
+    batch = batch_size or settings.FILE_ANALYSIS_BATCH_SIZE
+    log.info(
+        "worker.file_analysis.start",
+        interval_s=interval,
+        batch=batch,
+        enabled=settings.FILE_ANALYSIS_ENABLED,
+    )
+    while True:
+        try:
+            async with acquire_connection() as conn:
+                tasks = await claim_tasks(conn, "analyze_file", batch)
+            for task in tasks:
+                await process_file_task(bot, task)
+        except asyncio.CancelledError:
+            log.info("worker.file_analysis.stop")
+            raise
+        except Exception as exc:
+            log.error("worker.file_analysis.error", error=str(exc))
         await asyncio.sleep(interval)
 
 

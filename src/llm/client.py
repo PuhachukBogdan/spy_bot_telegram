@@ -28,6 +28,11 @@ from openai.types.chat import (
 )
 
 from src.config import settings
+from src.llm.file_schemas import (
+    FILE_RISK_TOOL_NAME,
+    FileRiskAnalysis,
+    build_file_risk_tool,
+)
 from src.llm.schemas import (
     RISK_ANALYSIS_TOOL_NAME,
     RiskAnalysis,
@@ -60,6 +65,19 @@ async def close_client() -> None:
     if _client is not None:
         await _client.close()
         _client = None
+
+
+@dataclass(slots=True)
+class LlmFileResult:
+    """Parsed outcome of one file-risk analysis call."""
+
+    analysis: FileRiskAnalysis
+    model: str
+    raw_response: str
+    tokens_in: int | None
+    tokens_out: int | None
+    cost_usd: Decimal | None
+    latency_ms: int
 
 
 @dataclass(slots=True)
@@ -135,6 +153,81 @@ async def analyze_risk(
         cost_usd=cost_usd,
         latency_ms=latency_ms,
     )
+
+
+async def analyze_file_risk(
+    *, model: str, system_prompt: str, file_name: str, file_content: str
+) -> LlmFileResult:
+    """Run a forced-tool file-risk analysis call and return the parsed result.
+
+    File content is wrapped in a ``<file>`` envelope (HTML-escaped) to isolate
+    untrusted data from the system prompt (prompt-injection defence).
+    """
+    from html import escape
+
+    client = get_client()
+    file_block = (
+        f'<file name="{escape(file_name, quote=True)}">\n'
+        f"{escape(file_content)}\n"
+        f"</file>"
+    )
+    messages: list[ChatCompletionMessageParam] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": file_block},
+    ]
+    tools = cast("list[ChatCompletionToolParam]", [build_file_risk_tool()])
+    tool_choice = cast(
+        "ChatCompletionToolChoiceOptionParam",
+        {"type": "function", "function": {"name": FILE_RISK_TOOL_NAME}},
+    )
+
+    @with_llm_retry()
+    async def _call() -> ChatCompletion:
+        return await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            temperature=0,
+            extra_body={"usage": {"include": True}},
+        )
+
+    start = time.perf_counter()
+    response = await _call()
+    latency_ms = int((time.perf_counter() - start) * 1000)
+
+    analysis, raw = _parse_file_analysis(response)
+    tokens_in, tokens_out, cost_usd = _parse_usage(response)
+    log.info(
+        "llm.file_analyzed",
+        model=model,
+        findings=len(analysis.findings),
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        latency_ms=latency_ms,
+    )
+    return LlmFileResult(
+        analysis=analysis,
+        model=model,
+        raw_response=raw,
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        cost_usd=cost_usd,
+        latency_ms=latency_ms,
+    )
+
+
+def _parse_file_analysis(response: ChatCompletion) -> tuple[FileRiskAnalysis, str]:
+    """Extract and validate the file-risk tool payload; empty analysis if no call."""
+    message = response.choices[0].message
+    tool_calls = message.tool_calls
+    if not tool_calls:
+        return FileRiskAnalysis(), message.content or ""
+    first = tool_calls[0]
+    if first.type != "function":
+        return FileRiskAnalysis(), message.content or ""
+    arguments = first.function.arguments
+    return FileRiskAnalysis.model_validate_json(arguments), arguments
 
 
 def _parse_analysis(response: ChatCompletion) -> tuple[RiskAnalysis, str]:

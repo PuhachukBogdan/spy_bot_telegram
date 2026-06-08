@@ -28,6 +28,7 @@ from src.pipeline.tier1 import pattern_cache  # noqa: E402
 from src.pipeline.workers import (  # noqa: E402
     abandoned_chat_cleanup_loop,
     analysis_worker_loop,
+    file_analysis_worker_loop,
     pattern_reload_loop,
     whisper_worker_loop,
 )
@@ -94,13 +95,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     analysis_task = asyncio.create_task(
         analysis_worker_loop(bot), name="analysis_worker"
     )
+    file_task = asyncio.create_task(
+        file_analysis_worker_loop(bot), name="file_analysis_worker"
+    )
     log.info("startup.whisper.worker", enabled=settings.WHISPER_ENABLED)
+    log.info("startup.file_analysis.worker", enabled=settings.FILE_ANALYSIS_ENABLED)
 
     try:
         yield
     finally:
         # --- shutdown ---
-        for task in (cleanup_task, pattern_task, whisper_task, analysis_task):
+        for task in (cleanup_task, pattern_task, whisper_task, analysis_task, file_task):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task

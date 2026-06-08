@@ -34,6 +34,10 @@ dependencies = [
     # IANA timezone database — zoneinfo has no system tzdata on Windows (and may
     # lack it in slim containers); needed for per-manager work-hours timezones.
     "tzdata>=2024.1",
+    # Document file-content analysis (Phase 12-file)
+    "python-docx>=1.1",
+    "pypdf>=4.0",
+    "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]
@@ -75,4 +79,8 @@ plugins = ["pydantic.mypy"]
 # symbols as Any rather than erroring on the import under strict mode.
 [[tool.mypy.overrides]]
 module = ["asyncpg", "asyncpg.*", "langdetect", "langdetect.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["docx", "docx.*", "openpyxl", "openpyxl.*"]
 ignore_missing_imports = true

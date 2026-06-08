@@ -63,6 +63,17 @@ class Settings(BaseSettings):
     # OpenAI Audio API hard limit is 25 MB; skip anything larger than the API.
     WHISPER_MAX_FILE_BYTES: int = 25 * 1024 * 1024
 
+    # === File analysis (document content risk detection) ===
+    # Kill-switch: when false the worker drains the queue without spending.
+    FILE_ANALYSIS_ENABLED: bool = True
+    # Skip files larger than this (bytes); 20 MB covers most business docs.
+    FILE_MAX_BYTES: int = 20 * 1024 * 1024
+    # Truncate extracted text to this many chars before the LLM call.
+    FILE_MAX_TEXT_CHARS: int = 40_000
+    FILE_ANALYSIS_POLL_INTERVAL_SECONDS: int = 10
+    FILE_ANALYSIS_BATCH_SIZE: int = 3
+    FILE_ANALYSIS_MAX_ATTEMPTS: int = 3
+
     # === Slack ===
     SLACK_BOT_TOKEN: SecretStr
     SLACK_SIGNING_SECRET: SecretStr
