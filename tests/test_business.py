@@ -68,9 +68,11 @@ def deps(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     m.audit = AsyncMock()
     m.ingest = AsyncMock()
     m.enqueue = AsyncMock()
+    m.bump = AsyncMock()
     monkeypatch.setattr(biz, "insert_audit_log", m.audit)
     monkeypatch.setattr(biz, "ingest_message", m.ingest)
-    monkeypatch.setattr(biz, "enqueue_task", m.enqueue)
+    monkeypatch.setattr(biz, "enqueue_chat_analysis", m.enqueue)
+    monkeypatch.setattr(biz, "bump_message_for_analysis", m.bump)
 
     # messages queries
     m.get_message = AsyncMock(return_value=None)

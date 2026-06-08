@@ -23,12 +23,13 @@ from src.config import settings
 from src.db.client import acquire_connection
 from src.db.queries.chats import get_chat_unit
 from src.db.queries.messages import (
+    bump_message_for_analysis,
     get_message,
     insert_message_edit,
     update_message_text,
     update_message_triggers,
 )
-from src.db.queries.queue import enqueue_task
+from src.db.queries.queue import enqueue_chat_analysis
 from src.pipeline.tier1 import pattern_cache
 from src.utils.logging import get_logger
 
@@ -71,8 +72,10 @@ async def on_edited_message(edited: Message) -> None:
         await update_message_text(conn, existing.id, new_text)
 
         # Re-run Tier-1 on the edited text (CLAUDE.md 7.3): an edit can introduce
-        # or remove triggers. Only enqueue a priority pass if the score newly
-        # crossed the threshold, to avoid re-queueing on every benign edit.
+        # or remove triggers. Only bump the chat's analysis task to run now if the
+        # score newly crossed the threshold, to avoid re-queueing on every benign
+        # edit (decision A — unified analyze_chat lane; priority is an earlier
+        # scheduled_for, not a separate queue).
         result = pattern_cache.match(new_text, existing.sender_role)
         await update_message_triggers(
             conn,
@@ -83,9 +86,10 @@ async def on_edited_message(edited: Message) -> None:
         )
         threshold = settings.PRIORITY_SCORE_THRESHOLD
         if existing.base_score < threshold <= result.base_score:
-            await enqueue_task(
-                conn, "priority_llm", {"message_id": str(existing.id)}
-            )
+            # Bump the edited message to the head of the analysis window (its
+            # send-time is behind the watermark) and pull the chat's pass forward.
+            await bump_message_for_analysis(conn, existing.id)
+            await enqueue_chat_analysis(conn, chat.id, datetime.now(UTC))
 
     log.info(
         "edit.recorded",

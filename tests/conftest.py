@@ -232,7 +232,10 @@ class Make:
         text: str = "old",
         sender_role: str = "partner",
         tmid: int = 10,
+        is_significant: bool = False,
+        created_at: datetime | None = None,
     ) -> Message:
+        now = datetime.now(UTC)
         return Message(
             id=uuid4(),
             telegram_message_id=tmid,
@@ -241,8 +244,9 @@ class Make:
             message_type="text",
             message_text=text,
             base_score=base_score,
-            timestamp=datetime.now(UTC),
-            created_at=datetime.now(UTC),
+            is_significant=is_significant,
+            timestamp=now,
+            created_at=created_at or now,
         )
 
     # -- aiogram update stand-ins --------------------------------------------

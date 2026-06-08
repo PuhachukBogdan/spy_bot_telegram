@@ -108,6 +108,14 @@ class Settings(BaseSettings):
     # the chat watermark) plus a few older ones for context.
     ANALYSIS_WINDOW_LIMIT: int = 60
     ANALYSIS_CONTEXT_BEFORE: int = 5
+    # Cost gate: a tail pass waits for a real batch instead of burning an LLM call
+    # on every trickle. It runs only once at least this many *significant* new
+    # messages have accumulated — UNLESS a priority (Tier-1 >= PRIORITY_SCORE_
+    # THRESHOLD) message is waiting, or the oldest unprocessed message is older
+    # than ANALYSIS_MAX_WAIT_SECONDS (so a quiet chat is still analysed eventually,
+    # the "ждём, но не вечно" rule).
+    ANALYSIS_MIN_BATCH_MESSAGES: int = 5
+    ANALYSIS_MAX_WAIT_SECONDS: int = 3600
 
     # === SLA (operational_sla track — time-based, no LLM) ===
     # A partner message with no internal reply for this many WORK minutes (counted

@@ -30,7 +30,7 @@ from src.db.models import Chat, Message, ProcessingQueue
 from src.db.queries.chats import get_chat_by_id, update_chat_last_processed
 from src.db.queries.cost import record_llm_cost
 from src.db.queries.messages import get_chat_analysis_window
-from src.db.queries.queue import complete_task, fail_task, retry_task
+from src.db.queries.queue import complete_task, defer_task, fail_task, retry_task
 from src.db.queries.risk_events import save_risk_event
 from src.llm.audit import record_llm_call
 from src.llm.client import LlmResult, analyze_risk
@@ -53,6 +53,10 @@ _DETECTED_PHRASE_MAX = 200
 
 class _Skip(Exception):
     """The task has nothing to do (chat gone): complete it, don't retry."""
+
+
+class _Defer(Exception):
+    """Not enough has accumulated yet: reschedule the task, don't spend the LLM."""
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,24 @@ def prepare_scored_findings(
     return scored
 
 
+def should_defer_batch(new: list[Message], *, now: datetime) -> bool:
+    """True if a tail pass should wait for a fuller batch (cost gate, pure).
+
+    Defers only a *trickle*: at least one significant message but fewer than
+    ``ANALYSIS_MIN_BATCH_MESSAGES`` of them, the oldest still younger than
+    ``ANALYSIS_MAX_WAIT_SECONDS``, and nothing crossed the priority threshold. A
+    priority hit, an old-enough backlog, or a full batch all force the pass
+    through; an empty-of-significance window is the cost guard's job, not a defer.
+    """
+    if any(m.base_score >= settings.PRIORITY_SCORE_THRESHOLD for m in new):
+        return False
+    significant = [m for m in new if m.is_significant]
+    if not significant or len(significant) >= settings.ANALYSIS_MIN_BATCH_MESSAGES:
+        return False
+    age_seconds = (now - new[0].created_at).total_seconds()
+    return age_seconds < settings.ANALYSIS_MAX_WAIT_SECONDS
+
+
 def _to_uuid_list(raw_ids: list[str]) -> list[UUID] | None:
     """Best-effort parse of LLM-returned id strings into UUIDs (skip malformed)."""
     out: list[UUID] = []
@@ -124,6 +146,16 @@ async def process_analysis_task(task: ProcessingQueue) -> None:
         async with acquire_connection() as conn:
             await complete_task(conn, task.id)
         log.info("analysis.skipped", task_id=task.id, chat_id=str(chat_id), reason=str(exc))
+        return
+    except _Defer as exc:  # too little to analyse yet — wait for a fuller batch
+        run_at = datetime.now(UTC) + timedelta(
+            seconds=settings.BATCH_PROCESSING_INTERVAL_SECONDS
+        )
+        async with acquire_connection() as conn:
+            await defer_task(conn, task.id, run_at)
+        log.info(
+            "analysis.deferred", task_id=task.id, chat_id=str(chat_id), reason=str(exc)
+        )
         return
     except PromptNotFoundError as exc:  # config error — retrying won't help
         async with acquire_connection() as conn:
@@ -184,7 +216,10 @@ async def _analyze_chat(chat_id: UUID) -> None:
     if not new:
         return  # nothing new since the watermark
 
-    newest_ts = new[-1].timestamp
+    # The cursor is created_at (migration 0010), so the watermark advances to the
+    # newest message's created_at — second-granular Telegram timestamps can no
+    # longer collide at the boundary and silently drop a same-second neighbour.
+    newest_ts = new[-1].created_at
 
     # Cost guard: if no new message carries analysable text, skip the LLM and just
     # advance the watermark (stickers/joins/etc. don't need Tier-2).
@@ -193,6 +228,12 @@ async def _analyze_chat(chat_id: UUID) -> None:
             await update_chat_last_processed(conn, chat_id, newest_ts)
         log.info("analysis.insignificant", chat_id=str(chat_id), new=len(new))
         return
+
+    # Cost gate: hold a trickle until it grows into a real batch (or ages out, or a
+    # priority message forces it). The watermark is deliberately NOT advanced, so
+    # these messages are re-evaluated on the next pass.
+    if should_defer_batch(new, now=datetime.now(UTC)):
+        raise _Defer(f"{sum(m.is_significant for m in new)} significant, awaiting batch")
 
     async with acquire_connection() as conn:
         system_prompt = await load_template(conn, _TIER2_PROMPT)

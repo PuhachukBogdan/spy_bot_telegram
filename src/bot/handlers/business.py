@@ -50,13 +50,14 @@ from src.db.queries.etc import (
     list_admin_users,
 )
 from src.db.queries.messages import (
+    bump_message_for_analysis,
     get_message,
     insert_message_edit,
     mark_message_deleted,
     update_message_text,
     update_message_triggers,
 )
-from src.db.queries.queue import enqueue_task
+from src.db.queries.queue import enqueue_chat_analysis
 from src.pipeline.ingest import ingest_message
 from src.pipeline.tier1 import pattern_cache
 from src.utils.logging import get_logger
@@ -338,7 +339,10 @@ async def on_edited_business_message(edited: Message) -> None:
         )
         threshold = settings.PRIORITY_SCORE_THRESHOLD
         if existing.base_score < threshold <= result.base_score:
-            await enqueue_task(conn, "priority_llm", {"message_id": str(existing.id)})
+            # Bump the edited message to the head of the analysis window (its
+            # send-time is behind the watermark) and pull the chat's pass forward.
+            await bump_message_for_analysis(conn, existing.id)
+            await enqueue_chat_analysis(conn, unit.id, datetime.now(UTC))
 
     log.info(
         "business.edit_recorded",

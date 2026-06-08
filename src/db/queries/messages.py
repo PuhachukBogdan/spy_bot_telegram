@@ -182,19 +182,22 @@ async def get_chat_analysis_window(
 ) -> tuple[list[Message], list[Message]]:
     """Return ``(context, new)`` for one Tier-2 analysis pass (Phase 9).
 
-    ``new`` is the messages with ``timestamp > since`` (or all, when ``since`` is
-    NULL — first run), oldest first, capped at ``limit``; ``context`` is up to
-    ``context_before`` messages strictly older than the first new one, for the LLM
-    to read the lead-up. Soft-deleted messages (``deleted_at`` set) are excluded.
-    Returns ``([], [])`` when there is nothing new.
+    The cursor is ``created_at`` (ingestion time: microsecond, monotonic, and
+    bumpable on edit via :func:`bump_message_for_analysis`), NOT the Telegram
+    ``timestamp`` — see migration 0010 for why. ``new`` is the messages with
+    ``created_at > since`` (or all, when ``since`` is NULL — first run), oldest
+    first, capped at ``limit``; ``context`` is up to ``context_before`` messages
+    strictly older than the first new one, for the LLM to read the lead-up.
+    Soft-deleted messages (``deleted_at`` set) are excluded. Returns ``([], [])``
+    when there is nothing new.
     """
     new_rows = await conn.fetch(
         """
         SELECT * FROM messages
         WHERE chat_id = $1
-          AND ($2::timestamptz IS NULL OR timestamp > $2)
+          AND ($2::timestamptz IS NULL OR created_at > $2)
           AND deleted_at IS NULL
-        ORDER BY timestamp ASC
+        ORDER BY created_at ASC
         LIMIT $3
         """,
         chat_id,
@@ -208,16 +211,33 @@ async def get_chat_analysis_window(
     ctx_rows = await conn.fetch(
         """
         SELECT * FROM messages
-        WHERE chat_id = $1 AND timestamp < $2 AND deleted_at IS NULL
-        ORDER BY timestamp DESC
+        WHERE chat_id = $1 AND created_at < $2 AND deleted_at IS NULL
+        ORDER BY created_at DESC
         LIMIT $3
         """,
         chat_id,
-        new[0].timestamp,
+        new[0].created_at,
         context_before,
     )
     context = [Message.from_record(row) for row in reversed(ctx_rows)]
     return context, new
+
+
+async def bump_message_for_analysis(
+    conn: asyncpg.Connection, message_id: UUID
+) -> None:
+    """Move a message to the head of its chat's Tier-2 analysis window (Phase 9.1).
+
+    The window cursor is ``created_at`` (see :func:`get_chat_analysis_window`).
+    Setting it to ``now()`` makes an already-analysed message re-enter the next
+    pass as the newest item — used when an edit introduces a risk phrase after the
+    watermark already passed the message, so the edited text gets a fresh look with
+    current context. Only ``created_at`` moves; the Telegram ``timestamp`` (true
+    send-time, used by the review surface) is untouched.
+    """
+    await conn.execute(
+        "UPDATE messages SET created_at = now() WHERE id = $1", message_id
+    )
 
 
 async def update_message_transcription(

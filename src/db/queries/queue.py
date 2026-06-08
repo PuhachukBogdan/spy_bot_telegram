@@ -2,8 +2,9 @@
 
 Postgres-as-queue (CLAUDE.md tech stack: no Redis). The enqueue side lands in
 Phase 6; the consume side (``claim_tasks`` + the completion helpers) lands in
-Phase 7 for the Whisper worker and is reused by the priority/batch workers
-(phases 9/10). Takes an already-acquired ``asyncpg.Connection``.
+Phase 7 for the Whisper worker and is reused by the unified ``analyze_chat``
+worker (phase 9 — decision A folded the old priority lane into it). Takes an
+already-acquired ``asyncpg.Connection``.
 """
 
 from __future__ import annotations
@@ -24,9 +25,10 @@ async def enqueue_task(
 ) -> int:
     """Insert a pending task and return its id.
 
-    ``task_type`` is ``whisper_transcribe`` / ``priority_llm`` / ``batch_llm``.
-    ``payload`` is passed natively for the pool's jsonb codec. ``scheduled_for``
-    defaults to ``now()`` so the task is immediately eligible.
+    The only current ``task_type`` is ``whisper_transcribe``; the ``analyze_chat``
+    lane has its own dedup-aware :func:`enqueue_chat_analysis`. ``payload`` is
+    passed natively for the pool's jsonb codec. ``scheduled_for`` defaults to
+    ``now()`` so the task is immediately eligible.
     """
     task_id = await conn.fetchval(
         """
@@ -135,6 +137,31 @@ async def fail_task(conn: asyncpg.Connection, task_id: int, error: str) -> None:
         "UPDATE processing_queue SET status = 'failed', error = $2 WHERE id = $1",
         task_id,
         error,
+    )
+
+
+async def defer_task(
+    conn: asyncpg.Connection, task_id: int, run_at: datetime
+) -> None:
+    """Put a claimed task back to ``pending`` without spending a retry.
+
+    Used by the batch worker's cost gate: a chat that has not accumulated enough
+    to be worth an LLM call is simply rescheduled for later. ``claim_tasks``
+    already bumped ``attempts``; we undo that here (``GREATEST(... - 1, 0)``) so an
+    indefinitely-quiet chat is never marked ``failed`` by deferrals — unlike
+    :func:`retry_task`, which records an error and keeps the attempt.
+    """
+    await conn.execute(
+        """
+        UPDATE processing_queue
+        SET status = 'pending',
+            scheduled_for = $2,
+            attempts = GREATEST(attempts - 1, 0),
+            error = NULL
+        WHERE id = $1
+        """,
+        task_id,
+        run_at,
     )
 
 

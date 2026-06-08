@@ -153,6 +153,9 @@ class Message(_ORMModel):
     business_peer_user_id: int | None = None
     deleted_at: datetime | None = None
     deletion_payload: dict[str, Any] | None = None
+    # Ingestion time, and also the Tier-2 analysis cursor (migration 0010): the
+    # batch worker windows on created_at, and a threshold-crossing edit bumps it to
+    # now() so the edited message is re-analysed. The true send-time is ``timestamp``.
     created_at: datetime
 
 

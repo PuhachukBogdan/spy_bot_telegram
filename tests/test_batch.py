@@ -8,13 +8,14 @@ end-to-end LLM/DB orchestration is covered by the live e2e smoke, not here.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+from src.config import settings
 from src.db.queries.queue import enqueue_chat_analysis
 from src.llm.schemas import RiskAnalysis, RiskFinding
-from src.pipeline.batch_processor import prepare_scored_findings
+from src.pipeline.batch_processor import prepare_scored_findings, should_defer_batch
 from tests.conftest import Make
 
 # --- prepare_scored_findings (pure) ------------------------------------------
@@ -117,3 +118,42 @@ async def test_enqueue_inserts_when_no_pending_task() -> None:
     assert len(conn.execute_calls) == 1
     assert "INSERT" in conn.execute_calls[0][0]
     assert conn.execute_calls[0][1] == (str(chat_id), run_at)
+
+
+# --- should_defer_batch (cost gate, pure) ------------------------------------
+
+
+def test_defer_trickle_below_min_and_young() -> None:
+    # One significant message, well under the batch minimum, just arrived -> wait.
+    mk = Make()
+    new = [mk.message_row(is_significant=True, text="hi")]
+    assert should_defer_batch(new, now=datetime.now(UTC)) is True
+
+
+def test_no_defer_when_priority_message_present() -> None:
+    # A Tier-1 hit at/above the threshold forces the pass through regardless of size.
+    mk = Make()
+    new = [mk.message_row(is_significant=True, base_score=settings.PRIORITY_SCORE_THRESHOLD)]
+    assert should_defer_batch(new, now=datetime.now(UTC)) is False
+
+
+def test_no_defer_when_batch_full() -> None:
+    # At least ANALYSIS_MIN_BATCH_MESSAGES significant messages -> analyse now.
+    mk = Make()
+    new = [mk.message_row(is_significant=True) for _ in range(settings.ANALYSIS_MIN_BATCH_MESSAGES)]
+    assert should_defer_batch(new, now=datetime.now(UTC)) is False
+
+
+def test_no_defer_when_oldest_aged_out() -> None:
+    # A lone significant message older than the max wait is analysed, not starved.
+    mk = Make()
+    old = datetime.now(UTC) - timedelta(seconds=settings.ANALYSIS_MAX_WAIT_SECONDS + 60)
+    new = [mk.message_row(is_significant=True, created_at=old)]
+    assert should_defer_batch(new, now=datetime.now(UTC)) is False
+
+
+def test_no_defer_when_nothing_significant() -> None:
+    # Zero significant messages is the cost guard's job (advance watermark), not a defer.
+    mk = Make()
+    new = [mk.message_row(is_significant=False, text="")]
+    assert should_defer_batch(new, now=datetime.now(UTC)) is False
