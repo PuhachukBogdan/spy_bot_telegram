@@ -1,41 +1,164 @@
 {
-  "_spec": {
-    "version": "0.1",
-    "status": "design — not yet built (Phase 16)",
-    "last_updated": "2026-06-08",
-    "purpose": "Weekly manager-centric risk summary delivered to Slack as .html",
-    "trigger": {
-      "type": "cron",
-      "schedule": "0 8 * * 1",
-      "description": "Every Monday at 08:00 UTC"
-    },
-    "report_structure": {
-      "page_1": {
-        "title": "Manager × Category heat-map",
-        "rows": "internal_users WHERE role = 'manager'",
-        "columns": "12 risk categories (shadow_deal, private_channel, hidden_payment, traffic_leakage, commercial_terms, fraud_shave, access_risk, partner_churn, payment_conflict, reputation_risk, operational_sla, employee_behavior)",
-        "cell_value": "COUNT(risk_events) in the past 7 days",
-        "attribution": "risk_events.partner_id → partners.owner_manager_id → internal_users (JOIN, no denorm)"
+  "name": "Weekly Risk Summary",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * 1"
+            }
+          ]
+        }
       },
-      "page_2_plus": {
-        "title": "Per-manager timelines",
-        "one_section_per": "manager",
-        "content": "Chronological risk_events across all manager's partners",
-        "highlighting": "HIGH + CRITICAL bold/colour; medium/low grey",
-        "link": "/risk <8-char-id> for each event"
-      }
+      "id": "a1b2c3d4-0001-4000-8000-000000000001",
+      "name": "Every Monday 08:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
     },
-    "delivery": {
-      "format": "html_file",
-      "channel": "SLACK_CHANNEL_WEEKLY",
-      "filename_pattern": "weekly-risk-report-{YYYY-MM-DD}.html"
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SERVER_BASE_URL }}/summary/generate",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "period",
+              "value": "weekly"
+            },
+            {
+              "name": "token",
+              "value": "={{ $env.SUMMARY_ACCESS_TOKEN }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 120000
+        }
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000002",
+      "name": "POST /summary/generate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [460, 300],
+      "onError": "continueErrorOutput"
     },
-    "db_query_hint": "SELECT re.*, p.name as partner_name, p.owner_manager_id, u.full_name as manager_name FROM risk_events re JOIN partners p ON p.id = re.partner_id JOIN internal_users u ON u.id = p.owner_manager_id WHERE re.created_at >= now() - interval '7 days' ORDER BY u.full_name, re.created_at",
-    "on_no_activity": "INSERT INTO summaries_skipped (period, reason) and skip posting",
-    "llm_narrative": {
-      "enabled_optional": true,
-      "model": "LLM_MODEL_SUMMARY (claude-sonnet-4-6)",
-      "prompt": "Generate a 2-3 sentence risk summary for manager {name} covering their {N} risk events this week. Highlight the most concerning pattern. Be factual."
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "check-status",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "ok",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000003",
+      "name": "Success?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first();\nconst url = item.json.url ?? '(no url)';\nconsole.log(`[weekly-summary] report ready: ${url}`);\nreturn [{ json: { url } }];"
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000004",
+      "name": "Log success",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first();\nconst err = JSON.stringify(item.json);\nconsole.error(`[weekly-summary] generation failed: ${err}`);\nreturn [{ json: { error: err } }];"
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000005",
+      "name": "Log error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 400]
     }
-  }
+  ],
+  "connections": {
+    "Every Monday 08:00 UTC": {
+      "main": [
+        [
+          {
+            "node": "POST /summary/generate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "POST /summary/generate": {
+      "main": [
+        [
+          {
+            "node": "Success?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Success?": {
+      "main": [
+        [
+          {
+            "node": "Log success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "id": "weekly-risk-summary-v1",
+  "meta": {
+    "note": "Requires env vars SERVER_BASE_URL and SUMMARY_ACCESS_TOKEN set in n8n. Activate after deploying the FastAPI server. Schedule: every Monday 08:00 UTC."
+  },
+  "tags": ["summary", "weekly", "risk"]
 }
