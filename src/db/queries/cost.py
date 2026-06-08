@@ -59,6 +59,31 @@ async def record_llm_cost(
     )
 
 
+async def trip_circuit_breaker(conn: asyncpg.Connection) -> bool:
+    """Set circuit_breaker_triggered=true for today's row.
+
+    Returns True if the row was newly tripped (was false before), False if it
+    was already open or there is no row for today. Uses a targeted UPDATE so
+    concurrent workers can't double-trip.
+    """
+    result: str = await conn.execute(
+        """
+        UPDATE cost_tracking
+        SET circuit_breaker_triggered = true
+        WHERE date = CURRENT_DATE AND NOT circuit_breaker_triggered
+        """
+    )
+    return result == "UPDATE 1"
+
+
+async def is_circuit_open(conn: asyncpg.Connection) -> bool:
+    """True if today's circuit breaker is tripped."""
+    val = await conn.fetchval(
+        "SELECT circuit_breaker_triggered FROM cost_tracking WHERE date = CURRENT_DATE"
+    )
+    return bool(val)
+
+
 async def record_whisper_cost(
     conn: asyncpg.Connection, cost_usd: Decimal, calls: int = 1
 ) -> None:

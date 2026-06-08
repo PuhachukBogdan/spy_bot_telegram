@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 
+from src.alerts.system import send_budget_exceeded_alert
 from src.config import settings
 from src.db.client import acquire_connection
 from src.db.queries.audit import insert_audit_log
@@ -25,6 +27,7 @@ from src.db.queries.chats import (
     list_stale_pending_chats,
     mark_chat_abandoned,
 )
+from src.db.queries.cost import get_today, is_circuit_open, trip_circuit_breaker
 from src.db.queries.queue import claim_tasks
 from src.pipeline.batch_processor import process_analysis_task
 from src.pipeline.file_processor import process_file_task
@@ -150,6 +153,39 @@ async def whisper_worker_loop(
         await asyncio.sleep(interval)
 
 
+async def _budget_gate(bot: Bot, worker_name: str) -> bool:
+    """Return True if the daily LLM budget is exhausted (worker must skip this tick).
+
+    Side effect when newly tripped: calls ``trip_circuit_breaker`` then fires
+    ``send_budget_exceeded_alert`` (best-effort). Never raises — a gate error
+    returns False so workers are not blocked by monitoring failure.
+    """
+    try:
+        async with acquire_connection() as conn:
+            if await is_circuit_open(conn):
+                log.debug("worker.budget_gate.open", worker=worker_name)
+                return True
+            today = await get_today(conn)
+        spend: Decimal = (today.total_cost_usd or Decimal("0")) if today else Decimal("0")
+        if spend >= settings.DAILY_LLM_BUDGET_USD:
+            async with acquire_connection() as conn:
+                newly_tripped = await trip_circuit_breaker(conn)
+            if newly_tripped:
+                log.warning(
+                    "worker.budget_gate.tripped",
+                    spend=str(spend),
+                    limit=str(settings.DAILY_LLM_BUDGET_USD),
+                )
+                await send_budget_exceeded_alert(
+                    bot, spend, settings.DAILY_LLM_BUDGET_USD
+                )
+            return True
+        return False
+    except Exception as exc:
+        log.error("worker.budget_gate.error", worker=worker_name, error=str(exc))
+        return False
+
+
 async def analysis_worker_loop(
     bot: Bot,
     interval_seconds: int | None = None,
@@ -170,6 +206,9 @@ async def analysis_worker_loop(
     log.info("worker.analysis.start", interval_s=interval, batch=batch)
     while True:
         try:
+            if await _budget_gate(bot, "analysis"):
+                await asyncio.sleep(interval)
+                continue
             async with acquire_connection() as conn:
                 tasks = await claim_tasks(conn, "analyze_chat", batch)
             for task in tasks:
@@ -203,6 +242,9 @@ async def file_analysis_worker_loop(
     )
     while True:
         try:
+            if await _budget_gate(bot, "file_analysis"):
+                await asyncio.sleep(interval)
+                continue
             async with acquire_connection() as conn:
                 tasks = await claim_tasks(conn, "analyze_file", batch)
             for task in tasks:
