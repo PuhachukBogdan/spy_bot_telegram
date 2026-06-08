@@ -1,4 +1,4 @@
-"""Pydantic v2 models for all 17 tables. Phase 2.
+"""Pydantic v2 models for all 22 tables.
 
 One model per table in ``supabase/migrations/0001_initial_schema.sql``. These
 are primarily *row* models: build them from an ``asyncpg.Record`` with
