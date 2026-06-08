@@ -96,6 +96,10 @@ class Settings(BaseSettings):
     # Real-time alerts fire only at/above this level; lower levels are stored and
     # surface in the weekly/monthly summary instead. Locked: high + critical.
     ALERT_MIN_RISK_LEVEL: Literal["low", "medium", "high", "critical"] = "high"
+    # Alert cooldown (Phase 11): a repeat risk of the SAME type in the SAME chat
+    # within this window is threaded under the prior Slack alert instead of firing a
+    # fresh channel ping. Critical alerts and a never-seen risk type bypass it.
+    ALERT_COOLDOWN_MINUTES: int = 60
 
     # === Tier-2 analysis worker (unified batch + priority lane, decision A) ===
     # One per-chat analyze_chat task; the worker polls this often for due tasks

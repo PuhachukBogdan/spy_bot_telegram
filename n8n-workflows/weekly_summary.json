@@ -1,1 +1,41 @@
-﻿{}
+{
+  "_spec": {
+    "version": "0.1",
+    "status": "design — not yet built (Phase 16)",
+    "last_updated": "2026-06-08",
+    "purpose": "Weekly manager-centric risk summary delivered to Slack as .html",
+    "trigger": {
+      "type": "cron",
+      "schedule": "0 8 * * 1",
+      "description": "Every Monday at 08:00 UTC"
+    },
+    "report_structure": {
+      "page_1": {
+        "title": "Manager × Category heat-map",
+        "rows": "internal_users WHERE role = 'manager'",
+        "columns": "12 risk categories (shadow_deal, private_channel, hidden_payment, traffic_leakage, commercial_terms, fraud_shave, access_risk, partner_churn, payment_conflict, reputation_risk, operational_sla, employee_behavior)",
+        "cell_value": "COUNT(risk_events) in the past 7 days",
+        "attribution": "risk_events.partner_id → partners.owner_manager_id → internal_users (JOIN, no denorm)"
+      },
+      "page_2_plus": {
+        "title": "Per-manager timelines",
+        "one_section_per": "manager",
+        "content": "Chronological risk_events across all manager's partners",
+        "highlighting": "HIGH + CRITICAL bold/colour; medium/low grey",
+        "link": "/risk <8-char-id> for each event"
+      }
+    },
+    "delivery": {
+      "format": "html_file",
+      "channel": "SLACK_CHANNEL_WEEKLY",
+      "filename_pattern": "weekly-risk-report-{YYYY-MM-DD}.html"
+    },
+    "db_query_hint": "SELECT re.*, p.name as partner_name, p.owner_manager_id, u.full_name as manager_name FROM risk_events re JOIN partners p ON p.id = re.partner_id JOIN internal_users u ON u.id = p.owner_manager_id WHERE re.created_at >= now() - interval '7 days' ORDER BY u.full_name, re.created_at",
+    "on_no_activity": "INSERT INTO summaries_skipped (period, reason) and skip posting",
+    "llm_narrative": {
+      "enabled_optional": true,
+      "model": "LLM_MODEL_SUMMARY (claude-sonnet-4-6)",
+      "prompt": "Generate a 2-3 sentence risk summary for manager {name} covering their {N} risk events this week. Highlight the most concerning pattern. Be factual."
+    }
+  }
+}

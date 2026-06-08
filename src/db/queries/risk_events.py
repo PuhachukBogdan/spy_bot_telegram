@@ -8,6 +8,7 @@ already-acquired ``asyncpg.Connection`` (project-wide convention). Owner scoping
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -148,6 +149,49 @@ async def get_by_ref(conn: asyncpg.Connection, ref: str) -> RiskEvent | None:
         ref,
     )
     return RiskEvent.from_record(row) if row is not None else None
+
+
+async def set_slack_message_ts(
+    conn: asyncpg.Connection, risk_event_id: UUID, slack_ts: str
+) -> None:
+    """Record the Slack message ts of a dispatched alert (Phase 11).
+
+    Written *after* the alert reaches Slack — it anchors the (chat × risk_type)
+    cooldown thread (:func:`find_recent_alert_ts`) and, later, Slack-interactivity
+    callbacks (Phase 12). Only set on rows that actually delivered.
+    """
+    await conn.execute(
+        "UPDATE risk_events SET slack_message_ts = $2 WHERE id = $1",
+        risk_event_id,
+        slack_ts,
+    )
+
+
+async def find_recent_alert_ts(
+    conn: asyncpg.Connection, *, chat_id: UUID, risk_type: str, since: datetime
+) -> str | None:
+    """Slack ts of the most recent delivered alert for (chat, risk_type) since ``since``.
+
+    Drives the alert cooldown (Phase 11): a repeat risk of the same type in the
+    same chat within the window is threaded under this ts instead of re-pinging the
+    channel. Only rows that actually reached Slack (``slack_message_ts`` set)
+    qualify; ``None`` means "no recent alert — post fresh".
+    """
+    ts = await conn.fetchval(
+        """
+        SELECT slack_message_ts
+        FROM risk_events
+        WHERE chat_id = $1 AND risk_type = $2
+          AND slack_message_ts IS NOT NULL
+          AND created_at >= $3
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        chat_id,
+        risk_type,
+        since,
+    )
+    return str(ts) if ts is not None else None
 
 
 async def update_status(

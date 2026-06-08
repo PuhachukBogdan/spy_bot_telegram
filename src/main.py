@@ -92,7 +92,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         whisper_worker_loop(bot), name="whisper_worker"
     )
     analysis_task = asyncio.create_task(
-        analysis_worker_loop(), name="analysis_worker"
+        analysis_worker_loop(bot), name="analysis_worker"
     )
     log.info("startup.whisper.worker", enabled=settings.WHISPER_ENABLED)
 
