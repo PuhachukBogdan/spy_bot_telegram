@@ -97,11 +97,13 @@ def build_alert_blocks(
     partner_name: str | None,
     *,
     mention_prefix: str = "",
+    include_actions: bool = True,
 ) -> tuple[list[dict[str, Any]], str]:
     """Render one risk event into (Block Kit blocks, fallback text).
 
-    ``mention_prefix`` (e.g. ``"<@U123> "``) is prepended for critical pings so the
-    fallback text — used by Slack notifications — actually @-mentions recipients.
+    ``mention_prefix`` (e.g. ``"<@U123> "``) is prepended for critical pings.
+    ``include_actions=False`` omits the review buttons — used when updating an
+    already-reviewed message so the buttons cannot be clicked a second time.
     """
     badge = _LEVEL_BADGE.get(event.risk_level, event.risk_level.upper())
     partner = partner_name or "—"  # —
@@ -147,4 +149,32 @@ def build_alert_blocks(
             ],
         }
     )
+    if include_actions:
+        blocks.append(
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "✓ Confirm"},
+                        "style": "primary",
+                        "action_id": "mark_confirmed",
+                        "value": str(event.id),
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "✗ False Positive"},
+                        "style": "danger",
+                        "action_id": "mark_fp",
+                        "value": str(event.id),
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "⬆ Escalate"},
+                        "action_id": "mark_escalated",
+                        "value": str(event.id),
+                    },
+                ],
+            }
+        )
     return blocks, text

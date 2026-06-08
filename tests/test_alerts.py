@@ -50,8 +50,9 @@ def _chat(name: str | None = None) -> Chat:
 
 
 def _context_text(blocks: list[dict[str, Any]]) -> str:
-    ctx = blocks[-1]
-    assert ctx["type"] == "context"
+    # Find the context block that contains the /risk review link (not the
+    # reviewed-by line that may be appended later; actions block may follow it).
+    ctx = next(b for b in blocks if b["type"] == "context")
     return str(ctx["elements"][0]["text"])
 
 

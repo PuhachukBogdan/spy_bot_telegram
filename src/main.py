@@ -21,6 +21,7 @@ from src.utils.logging import get_logger, setup_logging
 
 setup_logging()
 
+from src.alerts.slack_callbacks import handle_slack_action, verify_slack_signature  # noqa: E402
 from src.bot.instance import bot, dp  # noqa: E402  (after setup_logging on purpose)
 from src.config import settings  # noqa: E402
 from src.db.client import acquire_connection, close_pool, get_pool  # noqa: E402
@@ -172,9 +173,19 @@ async def webhook(request: Request) -> Response:
 
 
 @app.post("/slack/callback")
-async def slack_callback(request: Request) -> dict[str, bool]:
-    """Slack interactivity callback. Signature check + actions land in Phase 12."""
-    return {"ok": True}
+async def slack_callback(request: Request) -> Response:
+    """Slack interactivity callback: verify signature, dispatch action.
+
+    Slack expects a 200 within 3 seconds. Signature verification is synchronous;
+    action dispatch (DB + message update) runs inline — all async operations are
+    fast enough to complete well within the timeout.
+    """
+    raw_body = await request.body()
+    if not verify_slack_signature(request.headers, raw_body):
+        log.warning("slack_callback.bad_signature")
+        return Response(status_code=401)
+    await handle_slack_action(raw_body)
+    return Response(status_code=200)
 
 
 def _json(payload: dict[str, object], status_code: int = 200) -> Response:

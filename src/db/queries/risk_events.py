@@ -195,11 +195,15 @@ async def find_recent_alert_ts(
 
 
 async def update_status(
-    conn: asyncpg.Connection, risk_event_id: UUID, status: str, reviewed_by: UUID
+    conn: asyncpg.Connection,
+    risk_event_id: UUID,
+    status: str,
+    reviewed_by: UUID | None,
 ) -> RiskEvent | None:
-    """Set a risk event's review status (``/mark_*``); stamp reviewer + time.
+    """Set a risk event's review status; stamp reviewer + time.
 
-    Returns the updated row, or ``None`` if the id was unknown.
+    ``reviewed_by`` is None when the action originates from Slack (no internal
+    user UUID is available). Returns the updated row, or None if unknown id.
     """
     row = await conn.fetchrow(
         """
