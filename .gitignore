@@ -58,6 +58,7 @@ supabase/.env
 # generator are working/meta artifacts, not the bot itself.
 CLAUDE.md
 scripts/gen_docs.py
+scripts/gen_ops_guide.py
 
 # Internal spec docs — kept local for now; may become docs/README later
 *.docx
