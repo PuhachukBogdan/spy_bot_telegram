@@ -59,6 +59,7 @@ supabase/.env
 CLAUDE.md
 scripts/gen_docs.py
 scripts/gen_ops_guide.py
+scripts/gen_test_guide.py
 
 # Internal spec docs — kept local for now; may become docs/README later
 *.docx
