@@ -184,6 +184,25 @@ async def list_internal_users(
     return [InternalUser.from_record(row) for row in rows]
 
 
+async def update_slack_user_id(
+    conn: asyncpg.Connection,
+    internal_id: UUID,
+    slack_user_id: str,
+) -> InternalUser | None:
+    """Set slack_user_id after successful /register OTP verification (migration 0015)."""
+    row = await conn.fetchrow(
+        """
+        UPDATE internal_users
+        SET slack_user_id = $2
+        WHERE id = $1
+        RETURNING *
+        """,
+        internal_id,
+        slack_user_id,
+    )
+    return InternalUser.from_record(row) if row is not None else None
+
+
 async def list_admin_users(conn: asyncpg.Connection) -> list[InternalUser]:
     """Return all enabled admins (for onboarding DM notifications, CLAUDE.md 7.2).
 

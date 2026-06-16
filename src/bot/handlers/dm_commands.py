@@ -147,7 +147,9 @@ _COVER_HELP_TEXT = (
 # face plus /set_hours — framed as a scheduling convenience, it reveals nothing
 # about monitoring, but lets a manager record the work hours the SLA track needs.
 _COVER_HELP_INTERNAL = (
-    _COVER_HELP_TEXT + "\n/set_hours — set your working hours and timezone"
+    _COVER_HELP_TEXT
+    + "\n/set_hours — set your working hours and timezone"
+    + "\n/register — link your Slack account for notifications"
 )
 
 _HELP_COMMON = (

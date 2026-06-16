@@ -28,7 +28,9 @@ _UNTIL = datetime(2026, 6, 9, tzinfo=UTC)
 
 
 def _mgr(tg_username: str = "test_mgr", aff_id: str | None = None) -> dict[str, Any]:
-    return {"id": uuid4(), "full_name": "Test Manager", "tg_username": tg_username, "aff_id": aff_id}
+    return {
+        "id": uuid4(), "full_name": "Test Manager", "tg_username": tg_username, "aff_id": aff_id
+    }
 
 
 def _event_row(

@@ -58,6 +58,23 @@ def reset_slack_client() -> None:
     _client = None
 
 
+async def send_dm_to_user(slack_user_id: str, text: str) -> None:
+    """Open a DM with a Slack user and post a message (used by /register OTP flow).
+
+    Raises :class:`SlackDeliveryError` on any API or transport failure so the
+    caller can surface a friendly error in Telegram.
+    """
+    client = get_slack_client()
+    try:
+        resp = await client.conversations_open(users=[slack_user_id])
+        channel_id: str = resp["channel"]["id"]
+        await client.chat_postMessage(channel=channel_id, text=text)
+    except SlackApiError as exc:
+        raise SlackDeliveryError(str(exc.response.get("error", exc))) from exc
+    except Exception as exc:
+        raise SlackDeliveryError(str(exc)) from exc
+
+
 async def post_alert(
     *,
     channel: str,

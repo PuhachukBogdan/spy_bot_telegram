@@ -74,6 +74,8 @@ class InternalUser(_ORMModel):
     work_hours_start: time | None = None
     work_hours_end: time | None = None
     work_timezone: str = "UTC"
+    # Migration 0015: Slack identity linked via /register OTP flow.
+    slack_user_id: str | None = None
     created_at: datetime
 
     @property
