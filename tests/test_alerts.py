@@ -205,7 +205,6 @@ def patched_dispatch(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(dispatch_mod, "set_slack_message_ts", fake_set)
     monkeypatch.setattr(dispatch_mod, "handle_failed_alert", fake_failed)
     monkeypatch.setattr(dispatch_mod.settings, "SLACK_CHANNEL_ALERTS", "#alerts")
-    monkeypatch.setattr(dispatch_mod.settings, "SLACK_CHANNEL_CRITICAL", "#critical")
     return rec
 
 
@@ -220,14 +219,14 @@ async def test_high_alert_posts_to_alerts_channel_and_writes_ts(
     assert patched_dispatch["failures"] == []
 
 
-async def test_critical_alert_pings_and_mirrors_to_main(
+async def test_critical_alert_pings_and_posts_to_alerts(
     patched_dispatch: dict[str, Any],
 ) -> None:
     patched_dispatch["mention_prefix"] = "<@U1> "
     event = _event(level="critical", score=90)
     await dispatch_mod.dispatch_alerts(FakeBot(), _chat("c"), "Acme", [event])  # type: ignore[arg-type]
     channels = [p["channel"] for p in patched_dispatch["posts"]]
-    assert channels == ["#critical", "#alerts"]  # primary then mirror
+    assert channels == ["#alerts"]
     assert patched_dispatch["ts_writes"] == [(event.id, "1700000000.000100")]
 
 

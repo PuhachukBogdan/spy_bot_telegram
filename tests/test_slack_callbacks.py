@@ -247,21 +247,15 @@ async def test_handle_malformed_body_is_noop() -> None:
 def test_channel_for_critical(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "src.alerts.slack_callbacks.settings",
-        MagicMock(
-            SLACK_CHANNEL_CRITICAL="C_CRITICAL",
-            SLACK_CHANNEL_ALERTS="C_ALERTS",
-        ),
+        MagicMock(SLACK_CHANNEL_ALERTS="C_ALERTS"),
     )
-    assert _channel_for_level("critical") == "C_CRITICAL"
+    assert _channel_for_level("critical") == "C_ALERTS"
 
 
 def test_channel_for_high(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "src.alerts.slack_callbacks.settings",
-        MagicMock(
-            SLACK_CHANNEL_CRITICAL="C_CRITICAL",
-            SLACK_CHANNEL_ALERTS="C_ALERTS",
-        ),
+        MagicMock(SLACK_CHANNEL_ALERTS="C_ALERTS"),
     )
     assert _channel_for_level("high") == "C_ALERTS"
 

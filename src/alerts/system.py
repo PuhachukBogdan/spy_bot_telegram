@@ -3,7 +3,7 @@
 Currently: daily LLM budget exceeded → circuit breaker tripped.
 
 Delivery:
-  1. Slack post to SLACK_CHANNEL_SYSTEM (falls back to SLACK_CHANNEL_ALERTS).
+  1. Slack post to SLACK_CHANNEL_ALERTS.
   2. Telegram DM to every enabled admin.
 
 Both are best-effort: a delivery failure is logged and swallowed so a monitoring
@@ -48,7 +48,7 @@ async def send_budget_exceeded_alert(
 async def _post_to_slack(
     spend_label: str, limit_label: str, reset_sql: str
 ) -> None:
-    channel = settings.SLACK_CHANNEL_SYSTEM or settings.SLACK_CHANNEL_ALERTS
+    channel = settings.SLACK_CHANNEL_ALERTS
     text = (
         f":rotating_light: *Daily LLM budget exceeded* — "
         f"spent {spend_label} / limit {limit_label}. "

@@ -54,24 +54,12 @@ async def _dispatch_one(
     blocks, text = build_alert_blocks(
         event, chat, partner_name, mention_prefix=mention_prefix
     )
-    primary_channel = (
-        settings.SLACK_CHANNEL_CRITICAL
-        if is_critical
-        else settings.SLACK_CHANNEL_ALERTS
-    )
+    primary_channel = settings.SLACK_CHANNEL_ALERTS
 
     try:
         ts = await post_alert(
             channel=primary_channel, text=text, blocks=blocks, thread_ts=thread_ts
         )
-        # Critical mirrors into the main alerts channel too (fresh, no thread).
-        if is_critical and settings.SLACK_CHANNEL_ALERTS != primary_channel:
-            try:
-                await post_alert(
-                    channel=settings.SLACK_CHANNEL_ALERTS, text=text, blocks=blocks
-                )
-            except SlackDeliveryError as exc:
-                log.warning("alert.mirror_failed", risk_event_id=short_id, error=str(exc))
     except SlackDeliveryError as exc:
         log.error("alert.delivery_failed", risk_event_id=short_id, error=str(exc))
         await handle_failed_alert(bot, event, primary_channel, str(exc))

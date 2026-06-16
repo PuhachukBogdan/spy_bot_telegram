@@ -78,10 +78,7 @@ class Settings(BaseSettings):
     SLACK_BOT_TOKEN: SecretStr
     SLACK_SIGNING_SECRET: SecretStr
     SLACK_CHANNEL_ALERTS: str
-    SLACK_CHANNEL_CRITICAL: str
-    SLACK_CHANNEL_WEEKLY: str
-    SLACK_CHANNEL_MONTHLY: str
-    SLACK_CHANNEL_SYSTEM: str | None = None
+    SLACK_CHANNEL_REPORTS: str
 
     # === n8n system webhook ===
     N8N_SYSTEM_WEBHOOK_URL: str | None = None

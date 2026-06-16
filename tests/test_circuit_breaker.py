@@ -203,7 +203,7 @@ async def test_budget_gate_error_returns_false() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_budget_alert_posts_to_slack_channel_system() -> None:
+async def test_send_budget_alert_posts_to_alerts_channel() -> None:
     from src.alerts.system import send_budget_exceeded_alert
 
     bot = FakeBot()
@@ -218,42 +218,12 @@ async def test_send_budget_alert_posts_to_slack_channel_system() -> None:
         patch("src.alerts.system.notify_admins", new_callable=AsyncMock),
         patch("src.alerts.system.settings") as mock_settings,
     ):
-        mock_settings.SLACK_CHANNEL_SYSTEM = "C_SYSTEM"
         mock_settings.SLACK_CHANNEL_ALERTS = "C_ALERTS"
         mock_conn = AsyncMock()
         db_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
         db_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         await send_budget_exceeded_alert(bot, Decimal("31.23"), Decimal("30"))  # type: ignore[arg-type]
-
-    slack_mock.assert_awaited_once()
-    call_kwargs = slack_mock.call_args[1]
-    assert call_kwargs["channel"] == "C_SYSTEM"
-
-
-@pytest.mark.asyncio
-async def test_send_budget_alert_falls_back_to_alerts_channel() -> None:
-    from src.alerts.system import send_budget_exceeded_alert
-
-    bot = FakeBot()
-    slack_mock = AsyncMock()
-    slack_client = MagicMock()
-    slack_client.chat_postMessage = slack_mock
-
-    with (
-        patch("src.alerts.system.get_slack_client", return_value=slack_client),
-        patch("src.alerts.system.acquire_connection") as db_ctx,
-        patch("src.alerts.system.list_admin_users", new_callable=AsyncMock, return_value=[]),
-        patch("src.alerts.system.notify_admins", new_callable=AsyncMock),
-        patch("src.alerts.system.settings") as mock_settings,
-    ):
-        mock_settings.SLACK_CHANNEL_SYSTEM = None
-        mock_settings.SLACK_CHANNEL_ALERTS = "C_ALERTS"
-        mock_conn = AsyncMock()
-        db_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
-        db_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
-
-        await send_budget_exceeded_alert(bot, Decimal("30.01"), Decimal("30"))  # type: ignore[arg-type]
 
     slack_mock.assert_awaited_once()
     assert slack_mock.call_args[1]["channel"] == "C_ALERTS"
@@ -274,7 +244,6 @@ async def test_send_budget_alert_slack_failure_does_not_raise() -> None:
         patch("src.alerts.system.notify_admins", new_callable=AsyncMock),
         patch("src.alerts.system.settings") as mock_settings,
     ):
-        mock_settings.SLACK_CHANNEL_SYSTEM = "C_SYSTEM"
         mock_settings.SLACK_CHANNEL_ALERTS = "C_ALERTS"
         mock_conn = AsyncMock()
         db_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
@@ -299,7 +268,6 @@ async def test_send_budget_alert_tg_failure_does_not_raise() -> None:
         patch("src.alerts.system.notify_admins", new_callable=AsyncMock),
         patch("src.alerts.system.settings") as mock_settings,
     ):
-        mock_settings.SLACK_CHANNEL_SYSTEM = "C_SYSTEM"
         mock_settings.SLACK_CHANNEL_ALERTS = "C_ALERTS"
         mock_conn = AsyncMock()
         db_ctx.return_value.__aenter__ = AsyncMock(return_value=mock_conn)

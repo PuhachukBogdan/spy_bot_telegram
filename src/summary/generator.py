@@ -100,11 +100,7 @@ async def _post_slack_link(
     report_url: str,
 ) -> None:
     label = "Weekly" if period_type == "weekly" else "Monthly"
-    channel = (
-        settings.SLACK_CHANNEL_WEEKLY
-        if period_type == "weekly"
-        else settings.SLACK_CHANNEL_MONTHLY
-    )
+    channel = settings.SLACK_CHANNEL_REPORTS
     since_str = since.strftime("%d %b %Y")
     until_str = until.strftime("%d %b %Y")
     noun = "event" if event_count == 1 else "events"

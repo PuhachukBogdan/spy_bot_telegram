@@ -208,6 +208,4 @@ async def _update_slack_message(
 
 
 def _channel_for_level(risk_level: str) -> str:
-    if risk_level == "critical":
-        return settings.SLACK_CHANNEL_CRITICAL
     return settings.SLACK_CHANNEL_ALERTS
