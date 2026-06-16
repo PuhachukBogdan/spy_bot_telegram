@@ -94,6 +94,8 @@ async def save_summary(
     period_end: datetime,
     rendered_html: str,
     event_count: int,
+    share_token: str,
+    expires_at: datetime,
 ) -> UUID:
     """Insert a new summary row and return its UUID."""
     row = await conn.fetchrow(
@@ -101,9 +103,9 @@ async def save_summary(
         INSERT INTO summaries (
             period_type, period_start, period_end,
             structured_content, rendered_html,
-            delivery_status
+            delivery_status, share_token, expires_at
         )
-        VALUES ($1, $2, $3, $4::jsonb, $5, 'pending')
+        VALUES ($1, $2, $3, $4::jsonb, $5, 'pending', $6, $7)
         RETURNING id
         """,
         period_type,
@@ -111,9 +113,30 @@ async def save_summary(
         period_end,
         json.dumps({"event_count": event_count}),
         rendered_html,
+        share_token,
+        expires_at,
     )
     assert row is not None
     return UUID(str(row["id"]))
+
+
+async def get_html_by_share_token(
+    conn: asyncpg.Connection,
+    share_token: str,
+) -> str | None:
+    """Return rendered HTML for a valid, non-expired share token, or None."""
+    row = await conn.fetchrow(
+        """
+        SELECT rendered_html
+        FROM summaries
+        WHERE share_token = $1
+          AND (expires_at IS NULL OR expires_at > now())
+        """,
+        share_token,
+    )
+    if row is None or row["rendered_html"] is None:
+        return None
+    return str(row["rendered_html"])
 
 
 async def mark_summary_delivered(

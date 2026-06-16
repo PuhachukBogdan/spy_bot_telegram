@@ -11,6 +11,7 @@ Flow:
 
 from __future__ import annotations
 
+import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -37,6 +38,7 @@ async def generate_report(*, period_type: Literal["weekly", "monthly"]) -> str:
     """
     until = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     since = until - timedelta(days=7 if period_type == "weekly" else 30)
+    expires_at = until + timedelta(days=7 if period_type == "weekly" else 30)
 
     async with acquire_connection() as conn:
         managers = await list_active_managers(conn)
@@ -52,6 +54,7 @@ async def generate_report(*, period_type: Literal["weekly", "monthly"]) -> str:
         event_rows=event_rows,
     )
 
+    share_token = secrets.token_hex(32)
     async with acquire_connection() as conn:
         summary_id = await save_summary(
             conn,
@@ -60,9 +63,11 @@ async def generate_report(*, period_type: Literal["weekly", "monthly"]) -> str:
             period_end=until,
             rendered_html=html,
             event_count=len(event_rows),
+            share_token=share_token,
+            expires_at=expires_at,
         )
 
-    report_url = _report_url(period_type, since)
+    report_url = _report_url(share_token)
     try:
         await _post_slack_link(period_type, since, until, len(event_rows), report_url)
     except Exception as exc:
@@ -82,11 +87,9 @@ async def generate_report(*, period_type: Literal["weekly", "monthly"]) -> str:
     return report_url
 
 
-def _report_url(period_type: str, since: datetime) -> str:
-    token = settings.SUMMARY_ACCESS_TOKEN.get_secret_value()
+def _report_url(share_token: str) -> str:
     base = settings.SERVER_BASE_URL.rstrip("/")
-    date_str = since.strftime("%Y-%m-%d")
-    return f"{base}/reports/{period_type}/{date_str}?token={token}"
+    return f"{base}/r/{share_token}"
 
 
 async def _post_slack_link(

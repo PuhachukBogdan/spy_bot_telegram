@@ -27,8 +27,8 @@ _SINCE = datetime(2026, 6, 2, tzinfo=UTC)
 _UNTIL = datetime(2026, 6, 9, tzinfo=UTC)
 
 
-def _mgr(full_name: str = "Test Manager") -> dict[str, Any]:
-    return {"id": uuid4(), "full_name": full_name}
+def _mgr(tg_username: str = "test_mgr", aff_id: str | None = None) -> dict[str, Any]:
+    return {"id": uuid4(), "full_name": "Test Manager", "tg_username": tg_username, "aff_id": aff_id}
 
 
 def _event_row(
@@ -108,7 +108,7 @@ def test_monthly_report_title() -> None:
 
 
 def test_manager_with_no_events_shows_clean() -> None:
-    mgr = _mgr("Ivan Petrov")
+    mgr = _mgr(tg_username="ivan_petrov")
     html = build_report_html(
         period_type="weekly",
         since=_SINCE,
@@ -117,7 +117,7 @@ def test_manager_with_no_events_shows_clean() -> None:
         heatmap_rows=[],
         event_rows=[],
     )
-    assert "Ivan Petrov" in html
+    assert "@ivan_petrov" in html
     assert "чисто" in html
     assert "no-events" in html
 
@@ -306,7 +306,7 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     mgr_id = uuid4()
 
     async def fake_managers(conn: Any) -> list[dict[str, Any]]:
-        return [{"id": mgr_id, "full_name": "Test Mgr"}]
+        return [{"id": mgr_id, "full_name": "Test Mgr", "tg_username": "test_mgr", "aff_id": None}]
 
     async def fake_heatmap(conn: Any, since: Any, until: Any) -> list[dict[str, Any]]:
         return []
@@ -315,7 +315,8 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         return []
 
     async def fake_save(conn: Any, *, period_type: Any, period_start: Any,
-                        period_end: Any, rendered_html: Any, event_count: Any) -> Any:
+                        period_end: Any, rendered_html: Any, event_count: Any,
+                        share_token: Any, expires_at: Any) -> Any:
         rec["saved_html"] = rendered_html
         return uuid4()
 
@@ -342,12 +343,9 @@ async def test_generate_report_saves_html_and_returns_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(gen_mod.settings, "SERVER_BASE_URL", "https://bot.example.com")
-    monkeypatch.setattr(
-        gen_mod.settings.SUMMARY_ACCESS_TOKEN, "get_secret_value", lambda: "tok123"
-    )
     url = await gen_mod.generate_report(period_type="weekly")
-    assert url.startswith("https://bot.example.com/reports/weekly/")
-    assert "tok123" in url
+    assert url.startswith("https://bot.example.com/r/")
+    assert len(url.split("/r/")[1]) == 64  # 32-byte hex token
     assert patched_generator["saved_html"] is not None
     assert "Weekly Risk Report" in patched_generator["saved_html"]
     assert len(patched_generator["delivered"]) == 1
@@ -358,11 +356,8 @@ async def test_generate_report_monthly_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(gen_mod.settings, "SERVER_BASE_URL", "https://example.com")
-    monkeypatch.setattr(
-        gen_mod.settings.SUMMARY_ACCESS_TOKEN, "get_secret_value", lambda: "abc"
-    )
     url = await gen_mod.generate_report(period_type="monthly")
-    assert "/reports/monthly/" in url
+    assert url.startswith("https://example.com/r/")
 
 
 async def test_generate_report_slack_failure_does_not_raise(

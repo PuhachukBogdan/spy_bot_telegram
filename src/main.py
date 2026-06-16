@@ -12,7 +12,6 @@ import contextlib
 import hmac
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
 from typing import Literal
 
 from aiogram.types import Update
@@ -27,7 +26,7 @@ from src.alerts.slack_callbacks import handle_slack_action, verify_slack_signatu
 from src.bot.instance import bot, dp  # noqa: E402  (after setup_logging on purpose)
 from src.config import settings  # noqa: E402
 from src.db.client import acquire_connection, close_pool, get_pool  # noqa: E402
-from src.db.queries.summaries import get_rendered_html  # noqa: E402
+from src.db.queries.summaries import get_html_by_share_token  # noqa: E402
 from src.pipeline.tier1 import pattern_cache  # noqa: E402
 from src.pipeline.workers import (  # noqa: E402
     abandoned_chat_cleanup_loop,
@@ -211,27 +210,15 @@ async def summary_generate(
     return _json({"ok": True, "url": url})
 
 
-@app.get("/reports/{period_type}/{date}")
-async def get_report(
-    period_type: str,
-    date: str,
-    token: str = "",
-) -> Response:
-    """Serve a pre-rendered HTML report.
+@app.get("/r/{share_token}")
+async def get_report(share_token: str) -> Response:
+    """Serve a pre-rendered HTML report by its capability token.
 
-    URL shape: GET /reports/weekly/2026-06-02?token=SECRET
-    Returns 401 on bad token, 400 on bad date, 404 if no report exists yet,
-    200 text/html otherwise.
+    URL shape: GET /r/<64-char-hex>
+    Returns 404 for unknown or expired tokens (no 401 — the token IS the auth).
     """
-    expected = settings.SUMMARY_ACCESS_TOKEN.get_secret_value()
-    if not token or not hmac.compare_digest(token, expected):
-        return Response(status_code=401)
-    try:
-        period_start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=UTC)
-    except ValueError:
-        return Response(status_code=400)
     async with acquire_connection() as conn:
-        html = await get_rendered_html(conn, period_type, period_start)
+        html = await get_html_by_share_token(conn, share_token)
     if html is None:
         return Response(status_code=404)
     return Response(content=html, media_type="text/html")
