@@ -106,6 +106,14 @@ async def save_summary(
             delivery_status, share_token, expires_at
         )
         VALUES ($1, $2, $3, $4::jsonb, $5, 'pending', $6, $7)
+        ON CONFLICT (period_type, period_start) DO UPDATE SET
+            period_end         = EXCLUDED.period_end,
+            structured_content = EXCLUDED.structured_content,
+            rendered_html      = EXCLUDED.rendered_html,
+            share_token        = EXCLUDED.share_token,
+            expires_at         = EXCLUDED.expires_at,
+            delivery_status    = 'pending',
+            delivered_at       = NULL
         RETURNING id
         """,
         period_type,
