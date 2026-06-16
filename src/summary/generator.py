@@ -107,35 +107,53 @@ async def _post_slack_link(
     )
     since_str = since.strftime("%d %b %Y")
     until_str = until.strftime("%d %b %Y")
+    noun = "event" if event_count == 1 else "events"
 
-    text = f":bar_chart: *{label} Risk Report* ({since_str}–{until_str}) — {event_count} events"
+    fallback = (
+        f"{label} Risk Report ({since_str} – {until_str}) is now available. "
+        f"{event_count} risk {noun} recorded."
+    )
     blocks: list[dict[str, Any]] = [
+        {"type": "divider"},
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f":bar_chart: *{label} Risk Report*\n"
-                    f"{since_str}–{until_str}\n"
-                    f"{event_count} risk event{'s' if event_count != 1 else ''}"
+                    f":bar_chart:  *{label} Partner Risk Report*\n"
+                    f"*Period:* {since_str} – {until_str}\n"
+                    f"*Risk events recorded:* {event_count}"
                 ),
             },
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": (
+                        "Access is restricted to recipients of this link. "
+                        "Do not forward outside the team."
+                    ),
+                }
+            ],
         },
         {
             "type": "actions",
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "Open Report"},
+                    "text": {"type": "plain_text", "text": "View Report"},
                     "url": report_url,
                     "action_id": "open_report",
+                    "style": "primary",
                 }
             ],
         },
     ]
     try:
         client = get_slack_client()
-        await client.chat_postMessage(channel=channel, text=text, blocks=blocks)
+        await client.chat_postMessage(channel=channel, text=fallback, blocks=blocks)
         log.info("summary.slack_posted", channel=channel, period_type=period_type)
     except Exception as exc:
         log.warning("summary.slack_post_failed", error=str(exc), channel=channel)
