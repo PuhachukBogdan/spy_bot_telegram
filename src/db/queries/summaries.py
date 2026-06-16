@@ -14,7 +14,7 @@ async def list_active_managers(conn: asyncpg.Connection) -> list[dict[str, Any]]
     """All enabled managers ordered by name, including those with zero events."""
     rows = await conn.fetch(
         """
-        SELECT id, full_name
+        SELECT id, full_name, aff_id, tg_username
         FROM internal_users
         WHERE role = 'manager' AND enabled = true
         ORDER BY full_name

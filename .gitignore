@@ -64,6 +64,10 @@ scripts/gen_test_guide.py
 # Internal spec docs — kept local for now; may become docs/README later
 *.docx
 
+# Sample / generated test artefacts — local only
+tests/gen_sample_report.py
+tests/sample_*.html
+
 # Local working files: red-flag dictionary prompt + the GPT output we paste back
 red_flag_dictionary*.txt
 red_flag_dictionary*.json

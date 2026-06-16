@@ -45,6 +45,20 @@ def _risk_type_label(risk_type: str) -> str:
     return _RISK_TYPE_LABELS.get(risk_type, risk_type.replace("_", " ").title())
 
 
+def _manager_label(mgr: dict[str, Any]) -> str:
+    """Format manager display name: "{aff_id} | @{tg_username}" or either alone.
+
+    tg_username is stored without @; we add it here.
+    """
+    aff = (mgr.get("aff_id") or "").strip()
+    tg = (mgr.get("tg_username") or "").strip().lstrip("@")
+    if aff and tg:
+        return f"{aff} | @{tg}"
+    if aff:
+        return aff
+    return f"@{tg}"
+
+
 # ---------------------------------------------------------------------------
 # Builder data structures (passed directly into the Jinja2 template context)
 # ---------------------------------------------------------------------------
@@ -286,7 +300,7 @@ def build_report_html(
         manager_list.append(
             ManagerData(
                 id=mid_str,
-                name=str(mgr["full_name"]),
+                name=_manager_label(mgr),
                 events=evs,
                 heatmap=heatmap_index.get(mid, {}),
                 total=len(evs),
