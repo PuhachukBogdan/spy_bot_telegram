@@ -1,0 +1,18 @@
+app = "partner-bot"
+primary_region = "fra"
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # IMPORTANT: must be false — background workers (analysis, file, whisper) run
+  # continuously between requests. If Fly stops the machine they die silently.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1

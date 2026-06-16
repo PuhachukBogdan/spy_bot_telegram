@@ -64,6 +64,10 @@ scripts/gen_test_guide.py
 # Internal spec docs — kept local for now; may become docs/README later
 *.docx
 
+# Ops workspace — Claude's deployment runbook, scripts, local notes (no secrets,
+# but intentionally local-only; fly.toml in root IS committed).
+ops/
+
 # Sample / generated test artefacts — local only
 tests/gen_sample_report.py
 tests/sample_*.html
