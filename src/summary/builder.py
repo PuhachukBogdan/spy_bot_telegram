@@ -97,142 +97,289 @@ _TEMPLATE = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <title>{{ title }}</title>
 <style>
-*{box-sizing:border-box}
-body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:24px 40px 60px;color:#1f2937;line-height:1.5}
-h1{color:#111827;border-bottom:2px solid #e5e7eb;padding-bottom:12px;margin-bottom:6px}
-h2{color:#374151;margin-top:0}
-.meta{color:#6b7280;font-size:.9em;margin-bottom:28px}
+/* ── Reset ───────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 
-/* TOC */
-.toc{background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:14px 22px;margin-bottom:32px;display:inline-block;min-width:280px}
-.toc ul{margin:6px 0 0;padding-left:20px;list-style:disc}
-.toc li{margin:3px 0}
-.toc a{color:#2563eb;text-decoration:none}
-.toc a:hover{text-decoration:underline}
-.crit-count{color:#dc2626;font-weight:600}
-.clean{color:#16a34a}
+/* ── Tokens ──────────────────────────────────────── */
+:root{
+  --bg:        #09090b;
+  --surface:   #18181b;
+  --surface-2: #27272a;
+  --border:    #3f3f46;
+  --border-dim:#27272a;
+  --text-1:    #fafafa;
+  --text-2:    #a1a1aa;
+  --text-3:    #71717a;
 
-/* Heatmap */
-.heatmap-wrap{overflow-x:auto;margin-bottom:44px}
-.heatmap{border-collapse:collapse;font-size:.82em;white-space:nowrap}
-.heatmap th{background:#f3f4f6;padding:7px 10px;border:1px solid #e5e7eb;text-align:center;font-weight:600}
-.heatmap th.mgr-col{text-align:left;min-width:140px}
-.heatmap td{padding:6px 10px;border:1px solid #e5e7eb;text-align:center}
-.heatmap td.mgr-cell{text-align:left;font-weight:500}
-.heatmap td.mgr-cell a{color:#1f2937;text-decoration:none}
-.heatmap td.mgr-cell a:hover{color:#2563eb}
-.heatmap td.total-cell{font-weight:700;background:#f9fafb}
-.cell-hot{background:#fef2f2;color:#b91c1c;font-weight:700}
-.cell-warm{background:#fffbeb;color:#92400e;font-weight:600}
-.cell-zero{color:#d1d5db}
+  --c-crit-fg:#fb7185; --c-crit-bg:#1f0812; --c-crit-bd:#9f1239;
+  --c-high-fg:#fbbf24; --c-high-bg:#1c1007; --c-high-bd:#92400e;
+  --c-med-fg: #94a3b8; --c-med-bg: #0f172a; --c-med-bd: #334155;
+  --c-low-fg: #52525b; --c-low-bg: #09090b; --c-low-bd: #27272a;
+}
 
-/* Manager sections */
-.mgr-section{margin-top:52px;padding-top:20px;border-top:2px solid #e5e7eb}
-.mgr-header{display:flex;align-items:baseline;gap:12px;margin-bottom:14px}
-.mgr-header h2{margin:0}
-.event-count{color:#6b7280;font-size:.9em}
+/* ── Base ────────────────────────────────────────── */
+html{scroll-behavior:smooth}
+body{
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+  background:var(--bg);color:var(--text-1);
+  font-size:14px;line-height:1.6;
+  -webkit-font-smoothing:antialiased;
+}
 
-/* Event cards */
-.event{border-left:4px solid #e5e7eb;padding:10px 16px;margin:10px 0;border-radius:0 6px 6px 0}
-.event.critical{border-left-color:#dc2626;background:#fef2f2}
-.event.high{border-left-color:#d97706;background:#fffbeb}
-.event.medium{border-left-color:#9ca3af;background:#f9fafb}
-.event.low{border-left-color:#e5e7eb}
-.event-header{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
-.badge{font-size:.72em;font-weight:700;padding:2px 8px;border-radius:4px;text-transform:uppercase;letter-spacing:.05em}
-.badge.critical{background:#dc2626;color:#fff}
-.badge.high{background:#d97706;color:#fff}
-.badge.medium{background:#9ca3af;color:#fff}
-.badge.low{background:#d1d5db;color:#6b7280}
-.partner{font-weight:600}
-.risk-type{color:#4b5563;font-size:.9em}
-.score{color:#9ca3af;font-size:.85em}
-.date{color:#9ca3af;font-size:.8em;margin-left:auto}
-.phrase{margin-top:6px;padding:3px 10px;background:rgba(0,0,0,.04);border-radius:4px;font-style:italic;color:#374151;font-size:.9em}
-.explanation{margin-top:4px;color:#4b5563;font-size:.88em}
-.no-events{color:#9ca3af;font-style:italic;padding:6px 0}
-.back-top{display:inline-block;margin-top:10px;color:#2563eb;font-size:.85em;text-decoration:none}
-.back-top:hover{text-decoration:underline}
+/* ── Header ──────────────────────────────────────── */
+.page-header{
+  padding:28px 48px 22px;
+  border-bottom:1px solid var(--border-dim);
+}
+.page-header h1{font-size:20px;font-weight:600;margin-bottom:3px}
+.page-header .meta{color:var(--text-3);font-size:12px}
+.page-header .meta strong{color:var(--text-2);font-weight:500}
+
+/* ── Layout ──────────────────────────────────────── */
+.layout{
+  display:grid;
+  grid-template-columns:220px 1fr;
+  align-items:start;
+}
+
+/* ── Sidebar ─────────────────────────────────────── */
+.sidebar{
+  position:sticky;top:0;height:100vh;
+  overflow-y:auto;
+  border-right:1px solid var(--border-dim);
+  padding:24px 12px;
+}
+.sidebar-label{
+  display:block;
+  font-size:10px;font-weight:600;color:var(--text-3);
+  text-transform:uppercase;letter-spacing:.09em;
+  padding:0 8px;margin-bottom:10px;
+}
+.sb-item{
+  display:flex;align-items:center;gap:8px;
+  padding:6px 8px;border-radius:6px;
+  text-decoration:none;color:var(--text-2);
+  font-size:12.5px;
+  transition:background .1s,color .1s;
+  margin-bottom:1px;
+}
+.sb-item:hover{background:var(--surface-2);color:var(--text-1)}
+.sb-item .sb-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sb-crit{
+  flex-shrink:0;font-size:10px;font-weight:700;
+  color:var(--c-crit-fg);background:var(--c-crit-bg);
+  border:1px solid var(--c-crit-bd);
+  border-radius:999px;padding:0 7px;line-height:18px;
+}
+.sb-count{flex-shrink:0;font-size:11px;color:var(--text-3)}
+.sb-clean{flex-shrink:0;font-size:13px;color:#4ade80}
+
+/* ── Main ────────────────────────────────────────── */
+.main{padding:36px 48px;min-width:0}
+
+/* ── Section label ───────────────────────────────── */
+.section-label{
+  font-size:10px;font-weight:600;color:var(--text-3);
+  text-transform:uppercase;letter-spacing:.09em;
+  margin-bottom:14px;
+}
+
+/* ── Heatmap ─────────────────────────────────────── */
+.heatmap-wrap{overflow-x:auto;margin-bottom:52px}
+.heatmap{border-collapse:collapse;font-size:12px;white-space:nowrap}
+.heatmap th{
+  padding:7px 12px;text-align:center;
+  font-weight:500;color:var(--text-3);font-size:11px;
+  border-bottom:1px solid var(--border-dim);
+}
+.heatmap th.mgr-col{text-align:left;min-width:160px}
+.heatmap td{
+  padding:7px 14px;text-align:center;
+  border-bottom:1px solid var(--border-dim);
+  font-size:12px;font-weight:500;
+}
+.heatmap td.mgr-cell{text-align:left}
+.heatmap td.mgr-cell a{color:var(--text-1);text-decoration:none;font-weight:500}
+.heatmap td.mgr-cell a:hover{color:#818cf8}
+.heatmap td.total-cell{
+  font-weight:700;color:var(--text-1);
+  border-left:1px solid var(--border-dim);
+}
+.cell-zero{color:var(--text-3)}
+.cell-warm{color:#ca8a04;background:#1c1a07}
+.cell-hot {color:#f87171;background:#1f0812;font-weight:700}
+
+/* ── Manager section ─────────────────────────────── */
+.mgr-section{margin-bottom:52px}
+.mgr-header{
+  display:flex;align-items:center;flex-wrap:wrap;
+  gap:10px;margin-bottom:18px;
+  padding-bottom:14px;border-bottom:1px solid var(--border-dim);
+}
+.mgr-header h2{font-size:17px;font-weight:600;color:var(--text-1)}
+.pill{
+  font-size:11px;font-weight:500;
+  border:1px solid var(--border-dim);border-radius:999px;
+  padding:2px 10px;color:var(--text-3);
+}
+.pill.crit{
+  color:var(--c-crit-fg);background:var(--c-crit-bg);
+  border-color:var(--c-crit-bd);
+}
+
+/* ── Event cards ─────────────────────────────────── */
+.event{
+  background:var(--surface);border:1px solid var(--border-dim);
+  border-radius:10px;padding:14px 18px;margin:8px 0;
+  transition:border-color .15s;
+}
+.event:hover{border-color:var(--border)}
+.event.critical{
+  border-color:var(--c-crit-bd);
+  background:linear-gradient(135deg,var(--c-crit-bg) 0%,var(--surface) 55%);
+}
+.event.high{
+  border-color:var(--c-high-bd);
+  background:linear-gradient(135deg,var(--c-high-bg) 0%,var(--surface) 55%);
+}
+.event.medium{border-color:var(--c-med-bd)}
+.event.low{opacity:.65}
+
+/* ── Badges ──────────────────────────────────────── */
+.event-header{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.badge{
+  display:inline-flex;align-items:center;
+  padding:2px 9px;border-radius:999px;
+  font-size:10px;font-weight:700;
+  text-transform:uppercase;letter-spacing:.07em;
+  border:1px solid;
+}
+.badge.critical{color:var(--c-crit-fg);background:var(--c-crit-bg);border-color:var(--c-crit-bd)}
+.badge.high    {color:var(--c-high-fg);background:var(--c-high-bg);border-color:var(--c-high-bd)}
+.badge.medium  {color:var(--c-med-fg); background:var(--c-med-bg); border-color:var(--c-med-bd)}
+.badge.low     {color:var(--c-low-fg); background:var(--c-low-bg); border-color:var(--c-low-bd)}
+
+.ev-partner{font-weight:600;color:var(--text-1);font-size:14px}
+.ev-type   {color:var(--text-2);font-size:13px}
+.ev-score  {color:var(--text-3);font-size:12px}
+.ev-date   {color:var(--text-3);font-size:12px;margin-left:auto}
+
+.ev-phrase{
+  margin-top:10px;padding:8px 12px;
+  background:rgba(255,255,255,.04);border-radius:6px;
+  font-style:italic;color:var(--text-2);font-size:13px;
+  border-left:2px solid var(--border);
+}
+.ev-expl{
+  margin-top:8px;color:var(--text-2);
+  font-size:13px;line-height:1.65;
+}
+
+/* ── Empty state ─────────────────────────────────── */
+.no-events{
+  color:var(--text-3);font-style:italic;font-size:13px;
+  padding:14px 4px;
+}
+.no-events::before{content:'✓  ';color:#4ade80;font-style:normal;font-weight:600}
+
+/* ── Back to top ─────────────────────────────────── */
+.back-top{
+  display:inline-flex;align-items:center;gap:5px;
+  margin-top:16px;color:var(--text-3);font-size:12px;
+  text-decoration:none;transition:color .1s;
+}
+.back-top:hover{color:var(--text-2)}
 </style>
 </head>
 <body>
 <a id="top"></a>
-<h1>{{ title }}</h1>
-<p class="meta">Период: <strong>{{ period_label }}</strong>&nbsp;&nbsp;·&nbsp;&nbsp;Сгенерировано: {{ generated_at }}</p>
 
-<nav class="toc">
-  <strong>Менеджеры</strong>
-  <ul>
+<header class="page-header">
+  <h1>{{ title }}</h1>
+  <p class="meta">Period: <strong>{{ period_label }}</strong>&nbsp;&nbsp;·&nbsp;&nbsp;Generated: {{ generated_at }}</p>
+</header>
+
+<div class="layout">
+
+<aside class="sidebar">
+  <span class="sidebar-label">Managers</span>
   {% for m in managers %}
-    <li>
-      <a href="#mgr-{{ m.id }}">{{ m.name }}</a>
-      {% if m.total > 0 %}
-        — {{ m.total }} событий
-        {% if m.critical_count %}, <span class="crit-count">{{ m.critical_count }} критич.{% if m.critical_count == 1 %}{% else %}{% endif %}</span>{% endif %}
-      {% else %}
-        — <span class="clean">чисто</span>
-      {% endif %}
-    </li>
+  <a class="sb-item" href="#mgr-{{ m.id }}">
+    <span class="sb-name">{{ m.name }}</span>
+    {% if m.total == 0 %}
+      <span class="sb-clean">✓</span>
+    {% else %}
+      {% if m.critical_count %}<span class="sb-crit">{{ m.critical_count }}!</span>{% endif %}
+      <span class="sb-count">{{ m.total }}</span>
+    {% endif %}
+  </a>
   {% endfor %}
-  </ul>
-</nav>
+</aside>
 
-<h2>Тепловая карта рисков</h2>
-<div class="heatmap-wrap">
-<table class="heatmap">
-  <thead>
-    <tr>
-      <th class="mgr-col">Менеджер</th>
-      {% for _, label in categories %}<th>{{ label }}</th>{% endfor %}
-      <th>Итого</th>
-    </tr>
-  </thead>
-  <tbody>
-  {% for m in managers %}
-    <tr>
-      <td class="mgr-cell"><a href="#mgr-{{ m.id }}">{{ m.name }}</a></td>
-      {% for key, _ in categories %}
-        {% set cnt = m.heatmap.get(key, 0) %}
-        <td class="{{ 'cell-hot' if cnt >= 3 else ('cell-warm' if cnt >= 1 else 'cell-zero') }}">
-          {{- cnt if cnt else '·' -}}
-        </td>
-      {% endfor %}
-      <td class="total-cell">{{ m.total }}</td>
-    </tr>
-  {% endfor %}
-  </tbody>
-</table>
-</div>
+<main class="main">
 
-{% for m in managers %}
-<section class="mgr-section" id="mgr-{{ m.id }}">
-  <div class="mgr-header">
-    <h2>{{ m.name }}</h2>
-    <span class="event-count">{{ m.total }} событий за период</span>
-  </div>
-  {% if m.events %}
-    {% for ev in m.events %}
-    <div class="event {{ ev.risk_level }}">
-      <div class="event-header">
-        <span class="badge {{ ev.risk_level }}">{{ ev.risk_level }}</span>
-        <span class="partner">{{ ev.partner_name }}</span>
-        <span class="risk-type">— {{ ev.risk_type_label }}</span>
-        <span class="score">({{ ev.final_score }}/100)</span>
-        <span class="date">{{ ev.date_str }}</span>
-      </div>
-      {% if ev.detected_phrase %}<div class="phrase">"{{ ev.detected_phrase }}"</div>{% endif %}
-      {% if ev.llm_explanation %}<div class="explanation">{{ ev.llm_explanation }}</div>{% endif %}
-    </div>
+  <p class="section-label">Risk Heatmap</p>
+  <div class="heatmap-wrap">
+  <table class="heatmap">
+    <thead>
+      <tr>
+        <th class="mgr-col">Manager</th>
+        {% for _, label in categories %}<th>{{ label }}</th>{% endfor %}
+        <th>Total</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for m in managers %}
+      <tr>
+        <td class="mgr-cell"><a href="#mgr-{{ m.id }}">{{ m.name }}</a></td>
+        {% for key, _ in categories %}
+          {% set cnt = m.heatmap.get(key, 0) %}
+          <td class="{{ 'cell-hot' if cnt >= 3 else ('cell-warm' if cnt >= 1 else 'cell-zero') }}">
+            {{- cnt if cnt else '·' -}}
+          </td>
+        {% endfor %}
+        <td class="total-cell">{{ m.total }}</td>
+      </tr>
     {% endfor %}
-  {% else %}
-    <p class="no-events">Нет риск-событий за период — чистое портфолио.</p>
-  {% endif %}
-  <a class="back-top" href="#top">↑ Наверх</a>
-</section>
-{% endfor %}
+    </tbody>
+  </table>
+  </div>
 
+  {% for m in managers %}
+  <section class="mgr-section" id="mgr-{{ m.id }}">
+    <div class="mgr-header">
+      <h2>{{ m.name }}</h2>
+      <span class="pill">{{ m.total }} event{{ 's' if m.total != 1 else '' }}</span>
+      {% if m.critical_count %}<span class="pill crit">{{ m.critical_count }} critical</span>{% endif %}
+    </div>
+    {% if m.events %}
+      {% for ev in m.events %}
+      <div class="event {{ ev.risk_level }}">
+        <div class="event-header">
+          <span class="badge {{ ev.risk_level }}">{{ ev.risk_level }}</span>
+          <span class="ev-partner">{{ ev.partner_name }}</span>
+          <span class="ev-type">— {{ ev.risk_type_label }}</span>
+          <span class="ev-score">{{ ev.final_score }}/100</span>
+          <span class="ev-date">{{ ev.date_str }}</span>
+        </div>
+        {% if ev.detected_phrase %}<div class="ev-phrase">"{{ ev.detected_phrase }}"</div>{% endif %}
+        {% if ev.llm_explanation %}<div class="ev-expl">{{ ev.llm_explanation }}</div>{% endif %}
+      </div>
+      {% endfor %}
+    {% else %}
+      <p class="no-events">No risk events in this period — clean portfolio.</p>
+    {% endif %}
+    <a class="back-top" href="#top">↑ Back to top</a>
+  </section>
+  {% endfor %}
+
+</main>
+</div>
 </body>
 </html>
 """

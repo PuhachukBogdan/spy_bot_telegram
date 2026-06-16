@@ -118,7 +118,7 @@ def test_manager_with_no_events_shows_clean() -> None:
         event_rows=[],
     )
     assert "@ivan_petrov" in html
-    assert "чисто" in html
+    assert "sb-clean" in html   # green checkmark in sidebar
     assert "no-events" in html
 
 
@@ -198,7 +198,7 @@ def test_toc_shows_critical_count() -> None:
         heatmap_rows=[_heatmap_row(mgr["id"], cnt=2)],
         event_rows=rows,
     )
-    assert "crit-count" in html
+    assert "sb-crit" in html   # critical pill in sidebar
     assert "Bob" in html
 
 
