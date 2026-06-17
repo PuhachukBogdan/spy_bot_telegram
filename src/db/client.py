@@ -58,6 +58,35 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
         )
 
 
+def _parse_dsn(dsn: str) -> dict[str, object]:
+    """Parse a PostgreSQL DSN into keyword args for asyncpg.create_pool.
+
+    Uses rfind('@') as the user:password / host boundary so passwords that
+    contain literal '@' characters are handled correctly (plain urlparse splits
+    at the first '@' and produces a broken host/port).
+    """
+    _scheme, rest = dsn.split("://", 1)
+    at = rest.rfind("@")
+    userinfo, hostinfo = rest[:at], rest[at + 1 :]
+
+    colon = userinfo.find(":")
+    user = userinfo[:colon]
+    password = userinfo[colon + 1 :]
+
+    if "/" in hostinfo:
+        hostport, database = hostinfo.split("/", 1)
+    else:
+        hostport, database = hostinfo, "postgres"
+
+    if ":" in hostport:
+        host, port_str = hostport.rsplit(":", 1)
+        port = int(port_str)
+    else:
+        host, port = hostport, 5432
+
+    return {"host": host, "port": port, "user": user, "password": password, "database": database}
+
+
 async def get_pool() -> asyncpg.Pool:
     """Return the process-wide pool, creating it on first call (double-checked)."""
     global _pool
@@ -70,7 +99,7 @@ async def get_pool() -> asyncpg.Pool:
                     max_size=_POOL_MAX_SIZE,
                 )
                 _pool = await asyncpg.create_pool(
-                    dsn=settings.SUPABASE_DB_URL.get_secret_value(),
+                    **_parse_dsn(settings.SUPABASE_DB_URL.get_secret_value()),
                     min_size=_POOL_MIN_SIZE,
                     max_size=_POOL_MAX_SIZE,
                     init=_init_connection,
