@@ -36,9 +36,13 @@ async def generate_report(*, period_type: Literal["weekly", "monthly"]) -> str:
 
     Returns the public URL of the generated report.
     """
-    until = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    since = until - timedelta(days=7 if period_type == "weekly" else 30)
-    expires_at = until + timedelta(days=7 if period_type == "weekly" else 30)
+    # Rolling window ending at generation time, so a report triggered mid-day
+    # includes everything up to "now" (a midnight-aligned `until` would drop the
+    # current day's events entirely — exactly the empty-report bug seen in pilot).
+    span = timedelta(days=7 if period_type == "weekly" else 30)
+    until = datetime.now(UTC)
+    since = until - span
+    expires_at = until + span
 
     async with acquire_connection() as conn:
         managers = await list_active_managers(conn)
