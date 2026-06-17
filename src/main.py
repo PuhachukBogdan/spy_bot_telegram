@@ -119,12 +119,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-        try:
-            await bot.delete_webhook(drop_pending_updates=False)
-            log.info("shutdown.webhook.deleted")
-        except Exception as exc:
-            log.error("shutdown.webhook.failed", error=str(exc))
-
+        # Do NOT delete_webhook on shutdown: Railway rolling deploys start the
+        # new container before stopping the old one, so delete_webhook from the
+        # dying container would wipe the URL the new container just registered.
+        # The new container re-registers on startup; Telegram queues any updates
+        # delivered during the brief gap (drop_pending_updates=False on set_webhook).
         await bot.session.close()
         await close_pool()
 
