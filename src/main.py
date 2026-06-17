@@ -33,6 +33,7 @@ from src.pipeline.workers import (  # noqa: E402
     analysis_worker_loop,
     file_analysis_worker_loop,
     pattern_reload_loop,
+    stale_task_reaper_loop,
     whisper_worker_loop,
 )
 from src.summary.generator import generate_report  # noqa: E402
@@ -102,6 +103,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     file_task = asyncio.create_task(
         file_analysis_worker_loop(bot), name="file_analysis_worker"
     )
+    reaper_task = asyncio.create_task(
+        stale_task_reaper_loop(), name="stale_task_reaper"
+    )
     log.info("startup.whisper.worker", enabled=settings.WHISPER_ENABLED)
     log.info("startup.file_analysis.worker", enabled=settings.FILE_ANALYSIS_ENABLED)
 
@@ -109,7 +113,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         # --- shutdown ---
-        for task in (cleanup_task, pattern_task, whisper_task, analysis_task, file_task):
+        bg_tasks = (cleanup_task, pattern_task, whisper_task, analysis_task, file_task, reaper_task)
+        for task in bg_tasks:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task

@@ -28,7 +28,7 @@ from src.db.queries.chats import (
     mark_chat_abandoned,
 )
 from src.db.queries.cost import get_today, is_circuit_open, trip_circuit_breaker
-from src.db.queries.queue import claim_tasks
+from src.db.queries.queue import claim_tasks, recover_stale_tasks
 from src.pipeline.batch_processor import process_analysis_task
 from src.pipeline.file_processor import process_file_task
 from src.pipeline.tier1 import pattern_cache
@@ -254,6 +254,44 @@ async def file_analysis_worker_loop(
             raise
         except Exception as exc:
             log.error("worker.file_analysis.error", error=str(exc))
+        await asyncio.sleep(interval)
+
+
+async def stale_task_reaper_loop(
+    interval_seconds: int | None = None,
+) -> None:
+    """Reset tasks orphaned in ``in_progress`` due to worker crashes / restarts.
+
+    Runs every ``STALE_TASK_REAPER_INTERVAL_SECONDS``. Any task that has been
+    ``in_progress`` for longer than ``STALE_TASK_TIMEOUT_SECONDS`` is either
+    reset to ``pending`` (retry budget remaining) or permanently ``failed``
+    (attempts exhausted). Logs a warning whenever tasks are recovered so ops
+    can correlate with deploy events.
+    """
+    interval = interval_seconds or settings.STALE_TASK_REAPER_INTERVAL_SECONDS
+    log.info("worker.stale_reaper.start", interval_s=interval)
+    while True:
+        try:
+            stale_before = datetime.now(UTC) - timedelta(
+                seconds=settings.STALE_TASK_TIMEOUT_SECONDS
+            )
+            async with acquire_connection() as conn:
+                recovered = await recover_stale_tasks(
+                    conn,
+                    stale_before=stale_before,
+                    max_attempts=settings.ANALYSIS_MAX_ATTEMPTS,
+                )
+            if recovered:
+                log.warning(
+                    "worker.stale_reaper.recovered",
+                    count=recovered,
+                    timeout_s=settings.STALE_TASK_TIMEOUT_SECONDS,
+                )
+        except asyncio.CancelledError:
+            log.info("worker.stale_reaper.stop")
+            raise
+        except Exception as exc:
+            log.error("worker.stale_reaper.error", error=str(exc))
         await asyncio.sleep(interval)
 
 

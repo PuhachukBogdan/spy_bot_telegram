@@ -183,3 +183,37 @@ async def retry_task(
         error,
         run_at,
     )
+
+
+async def recover_stale_tasks(
+    conn: asyncpg.Connection,
+    stale_before: datetime,
+    max_attempts: int,
+) -> int:
+    """Reset or permanently fail tasks orphaned in ``in_progress``.
+
+    A task gets stuck ``in_progress`` when the worker process is killed mid-run
+    (service restart, OOM, deploy). Without recovery it stays orphaned forever.
+
+    Tasks whose ``last_attempt_at`` is older than ``stale_before`` are either
+    reset to ``pending`` (if they still have retry budget left) or marked
+    ``failed`` (attempts exhausted). Returns the number of rows touched.
+    """
+    result = await conn.execute(
+        """
+        UPDATE processing_queue
+        SET status = CASE
+                WHEN attempts >= $2 THEN 'failed'
+                ELSE 'pending'
+            END,
+            error = CASE
+                WHEN attempts >= $2 THEN 'abandoned: stale after max attempts'
+                ELSE 'recovered: stale in_progress reset by reaper'
+            END
+        WHERE status = 'in_progress'
+          AND last_attempt_at < $1
+        """,
+        stale_before,
+        max_attempts,
+    )
+    return int(result.split()[-1]) if result else 0

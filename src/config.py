@@ -134,6 +134,12 @@ class Settings(BaseSettings):
     ANALYSIS_MIN_BATCH_MESSAGES: int = 5
     ANALYSIS_MAX_WAIT_SECONDS: int = 3600
 
+    # === Stale task reaper ===
+    # Tasks stuck in_progress longer than this are orphaned (worker crashed mid-run).
+    # The reaper resets them to pending (or failed if attempts exhausted).
+    STALE_TASK_TIMEOUT_SECONDS: int = 600   # 10 minutes
+    STALE_TASK_REAPER_INTERVAL_SECONDS: int = 300  # run every 5 minutes
+
     # === SLA (operational_sla track — time-based, no LLM) ===
     # A partner message with no internal reply for this many WORK minutes (counted
     # against the owning manager's work hours, migration 0008) raises an
