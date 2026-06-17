@@ -98,8 +98,11 @@ async def get_pool() -> asyncpg.Pool:
                     min_size=_POOL_MIN_SIZE,
                     max_size=_POOL_MAX_SIZE,
                 )
+                dsn_kwargs = _parse_dsn(settings.SUPABASE_DB_URL.get_secret_value())
+                if settings.SUPABASE_DB_PASSWORD is not None:
+                    dsn_kwargs["password"] = settings.SUPABASE_DB_PASSWORD.get_secret_value()
                 _pool = await asyncpg.create_pool(
-                    **_parse_dsn(settings.SUPABASE_DB_URL.get_secret_value()),
+                    **dsn_kwargs,
                     min_size=_POOL_MIN_SIZE,
                     max_size=_POOL_MAX_SIZE,
                     init=_init_connection,

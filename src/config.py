@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     # Contains DB credentials → kept secret even though not in the explicit
     # secret list; asyncpg consumers must call .get_secret_value().
     SUPABASE_DB_URL: SecretStr
+    # Optional override for the DB password parsed from SUPABASE_DB_URL.
+    # Set this when the password contains characters (e.g. +) that URL
+    # encoding in SUPABASE_DB_URL would mangle. Takes precedence over the
+    # password component of SUPABASE_DB_URL when present.
+    SUPABASE_DB_PASSWORD: SecretStr | None = None
     SUPABASE_STORAGE_BUCKET: str = "llm-audit"
 
     # === LLM (OpenRouter) ===
