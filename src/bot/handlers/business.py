@@ -115,7 +115,7 @@ async def on_business_connection(update: BusinessConnection, bot: Bot) -> None:
             return
 
         internal = await find_internal_user_by_telegram_id(conn, owner_user_id)
-        if internal is not None and internal.role == "admin":
+        if internal is not None:
             status, approved_by, approved_at = "active", internal.id, datetime.now(UTC)
         else:
             status, approved_by, approved_at = "pending", None, None
@@ -244,22 +244,28 @@ async def on_business_message(message: Message, bot: Bot) -> None:
                         partner_id=str(contact.partner_id),
                     )
             else:
+                # Registered internal user as connection owner → auto-activate any peer.
+                auto_activate = grant.internal_user_id is not None
                 created = await create_business_chat(
                     conn,
                     telegram_chat_id=peer_user_id,
                     business_connection_id=bc_id,
                     business_peer_user_id=peer_user_id,
                     partner_id=None,
-                    status="pending",
+                    status="active" if auto_activate else "pending",
                     chat_name=_peer_label(message),
-                    authorized_by=None,
+                    authorized_by=grant.internal_user_id if auto_activate else None,
                 )
                 # Only DM the owner on the FIRST message (create returns the row);
-                # later messages find the pending unit and create returns None.
+                # later messages find the existing unit and create returns None.
                 if created is not None:
                     await insert_audit_log(
                         conn,
-                        action="business_chat_pending",
+                        action=(
+                            "business_chat_auto_linked"
+                            if auto_activate
+                            else "business_chat_pending"
+                        ),
                         actor_internal_id=grant.internal_user_id,
                         target_entity="chat",
                         target_id=created.id,
@@ -271,8 +277,19 @@ async def on_business_message(message: Message, bot: Bot) -> None:
                         else None
                     )
                     if owner is not None:
-                        pending_dm = (owner, _link_prompt(bc_id, peer_user_id, message))
-                log.info("business.contact_unknown", peer_user_id=peer_user_id, bc_id=bc_id)
+                        prompt_fn = (
+                            _auto_linked_prompt if auto_activate else _link_prompt
+                        )
+                        pending_dm = (owner, prompt_fn(bc_id, peer_user_id, message))
+                    if auto_activate:
+                        unit_to_ingest = created
+                log.info(
+                    "business.contact_auto_linked"
+                    if auto_activate
+                    else "business.contact_unknown",
+                    peer_user_id=peer_user_id,
+                    bc_id=bc_id,
+                )
 
     # Outbound work AFTER releasing the connection (ingest opens its own).
     if pending_dm is not None:
@@ -449,6 +466,20 @@ def _link_prompt(bc_id: str, peer_user_id: int, message: Message) -> str:
         "🔗 <b>New business contact</b>\n\n"
         f"From <b>{label}</b> ({handle}), user_id <code>{peer_user_id}</code>.\n"
         "Link to a partner:\n"
+        f'<code>/link_business_chat {html_escape(bc_id)} {peer_user_id} '
+        '"Partner Name"</code>'
+    )
+
+
+def _auto_linked_prompt(bc_id: str, peer_user_id: int, message: Message) -> str:
+    """Owner DM when a new business contact is auto-linked (owner is a registered user)."""
+    chat = message.chat
+    handle = f"@{html_escape(chat.username)}" if chat.username else "—"
+    label = html_escape(_peer_label(message) or "unknown")
+    return (
+        "✅ <b>New business contact — monitoring started</b>\n\n"
+        f"<b>{label}</b> ({handle}), user_id <code>{peer_user_id}</code>.\n"
+        "To bind to a partner:\n"
         f'<code>/link_business_chat {html_escape(bc_id)} {peer_user_id} '
         '"Partner Name"</code>'
     )

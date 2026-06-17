@@ -114,20 +114,18 @@ async def test_connection_admin_auto_active(deps, bot, mk) -> None:
     assert bot.sent == []  # auto-active grants do NOT pester admins
 
 
-async def test_connection_internal_nonadmin_pending_notifies_admins(deps, bot, mk) -> None:
+async def test_connection_internal_manager_auto_active(deps, bot, mk) -> None:
+    # Any registered internal user (not just admin) now auto-activates.
     manager = mk.user(role="manager", tg_id=500)
-    admin = mk.user(role="admin", tg_id=999, accounts=[999])
     deps.find_user.return_value = manager
-    deps.bc_create.return_value = mk.grant(status="pending", internal_user_id=manager.id)
-    deps.list_admins.return_value = [admin]
+    deps.bc_create.return_value = mk.grant(status="active", internal_user_id=manager.id)
 
     await biz.on_business_connection(mk.bc_update_obj("BC2", 500, True), bot)
 
     row = deps.bc_create.call_args.args[1]
-    assert row.status == "pending"
-    assert row.approved_by is None
-    assert 999 in bot.chat_ids
-    assert "/approve_business BC2" in bot.texts
+    assert row.status == "active"
+    assert row.approved_by == manager.id
+    assert bot.sent == []  # no admin notification needed
 
 
 async def test_connection_external_owner_pending_notifies_admins(deps, bot, mk) -> None:
@@ -195,20 +193,35 @@ async def test_message_known_contact_auto_links_and_ingests(deps, bot, mk) -> No
     assert bot.sent == []  # known contact: no owner prompt
 
 
-async def test_message_unknown_contact_parks_pending_and_dms_owner(deps, bot, mk) -> None:
+async def test_message_unknown_contact_registered_owner_auto_links(deps, bot, mk) -> None:
+    # Registered owner → unknown peer auto-activates, ingest starts immediately.
     owner = mk.user(role="manager", tg_id=500, accounts=[500])
     deps.bc_get.return_value = mk.grant(status="active", internal_user_id=owner.id)
     deps.get_unit.return_value = None
     deps.pc_get.return_value = None
-    deps.create_chat.return_value = mk.chat(status="pending")
+    deps.create_chat.return_value = mk.chat(status="active")
     deps.get_user_by_id.return_value = owner
 
     await biz.on_business_message(mk.biz_message("BC1", 888), bot)
 
-    assert deps.create_chat.call_args.kwargs["status"] == "pending"
-    deps.ingest.assert_not_awaited()  # nothing stored until linked
+    assert deps.create_chat.call_args.kwargs["status"] == "active"
+    deps.ingest.assert_awaited_once()  # monitoring starts immediately
     assert 500 in bot.chat_ids
-    assert "/link_business_chat BC1 888" in bot.texts
+    assert "monitoring started" in bot.texts.lower()
+
+
+async def test_message_unknown_contact_no_owner_parks_pending(deps, bot, mk) -> None:
+    # No internal_user_id on grant (external owner) → pending as before.
+    deps.bc_get.return_value = mk.grant(status="active", internal_user_id=None)
+    deps.get_unit.return_value = None
+    deps.pc_get.return_value = None
+    deps.create_chat.return_value = mk.chat(status="pending")
+    deps.get_user_by_id.return_value = None
+
+    await biz.on_business_message(mk.biz_message("BC1", 888), bot)
+
+    assert deps.create_chat.call_args.kwargs["status"] == "pending"
+    deps.ingest.assert_not_awaited()
 
 
 async def test_message_active_business_unit_ingests_without_recreating(deps, bot, mk) -> None:
