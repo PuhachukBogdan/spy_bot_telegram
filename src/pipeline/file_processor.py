@@ -264,7 +264,29 @@ async def _persist(
     file_name: str,
     result: LlmFileResult,
 ) -> list[RiskEvent]:
-    """Write audit row, cost, and one risk_events row per finding. One transaction."""
+    """Write audit row, cost, and ONE risk_events row for all findings. One transaction.
+
+    All findings from a single file are collapsed into one risk event: the highest
+    score drives the final_score; all explanations are concatenated so reviewers
+    see the full picture in one Slack alert.
+    """
+    findings = result.analysis.findings
+    # Sort highest-score first so the lead finding represents the worst signal.
+    findings_sorted = sorted(findings, key=lambda f: f.score, reverse=True)
+    lead = findings_sorted[0]
+
+    rs = score_finding(
+        rule_base_score=0,
+        llm_score=lead.score,
+        llm_confidence=lead.confidence,
+    )
+
+    # Combine all finding explanations into one readable block.
+    explanation_lines = [
+        f"[{f.category}] {f.explanation}" for f in findings_sorted
+    ]
+    combined_explanation = "\n".join(explanation_lines)
+
     alertable: list[RiskEvent] = []
 
     async with acquire_connection() as conn, conn.transaction():
@@ -284,33 +306,27 @@ async def _persist(
         if result.cost_usd is not None:
             await record_llm_cost(conn, result.cost_usd)
 
-        for finding in result.analysis.findings:
-            rs = score_finding(
-                rule_base_score=0,
-                llm_score=finding.score,
-                llm_confidence=finding.confidence,
-            )
-            event = await save_risk_event(
-                conn,
-                risk_type="data_leak",
-                risk_level=rs.risk_level,
-                base_score=0,
-                final_score=rs.final_score,
-                message_id=message.id,
-                partner_id=chat.partner_id,
-                chat_id=chat.id,
-                sender_id=message.sender_id,
-                triggered_patterns=None,
-                llm_confidence=finding.confidence,
-                llm_multiplier=rs.llm_multiplier,
-                llm_verdict=rs.llm_verdict,
-                llm_explanation=f"[{finding.category}] {finding.explanation}",
-                disagreement=False,
-                detected_phrase=finding.excerpt[:200],
-                context_message_ids=None,
-            )
-            if should_alert(rs.risk_level):
-                alertable.append(event)
+        event = await save_risk_event(
+            conn,
+            risk_type="data_leak",
+            risk_level=rs.risk_level,
+            base_score=0,
+            final_score=rs.final_score,
+            message_id=message.id,
+            partner_id=chat.partner_id,
+            chat_id=chat.id,
+            sender_id=message.sender_id,
+            triggered_patterns=None,
+            llm_confidence=lead.confidence,
+            llm_multiplier=rs.llm_multiplier,
+            llm_verdict=rs.llm_verdict,
+            llm_explanation=combined_explanation,
+            disagreement=False,
+            detected_phrase=lead.excerpt[:200],
+            context_message_ids=None,
+        )
+        if should_alert(rs.risk_level):
+            alertable.append(event)
 
     return alertable
 
