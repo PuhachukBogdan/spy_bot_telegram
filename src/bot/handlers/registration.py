@@ -1,11 +1,16 @@
 """/register — Slack identity linking via OTP. Phase 17.
 
-Any internal user (admin / manager / viewer) can link their Slack account.
+Open to any Telegram user — no prior internal_users record required.
 The flow is a two-step in-DM conversation:
 
   1. /register           → bot asks for Slack user ID
   2. user sends ID       → bot sends OTP to Slack; awaits code in Telegram
-  3. user sends OTP      → bot stores slack_user_id; done
+  3. user sends OTP      → if user already in internal_users: update slack_user_id;
+                           if not: create manager record, then set slack_user_id
+
+Security gate: Slack's conversations.open rejects IDs from outside the
+workspace (users_not_found error), so only people in our Slack can complete
+the flow. No role check needed.
 
 State lives in two module-level dicts (in-memory, TTL = 10 min). Lost on
 restart, which is acceptable: the whole handshake takes under a minute in
@@ -23,7 +28,6 @@ import time
 from dataclasses import dataclass, field
 from html import escape as html_escape
 from typing import Any
-from uuid import UUID
 
 from aiogram import F, Router
 from aiogram.enums import ChatType
@@ -31,11 +35,14 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from src.alerts.slack import SlackDeliveryError, send_dm_to_user
-from src.bot.middleware.roles import require_role
 from src.db.client import acquire_connection
 from src.db.models import InternalUser
 from src.db.queries.audit import insert_audit_log
-from src.db.queries.etc import update_slack_user_id
+from src.db.queries.etc import (
+    create_internal_user,
+    find_internal_user_by_telegram_id,
+    update_slack_user_id,
+)
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -51,7 +58,7 @@ _SLACK_ID_RE = re.compile(r"^[UW][A-Z0-9]{8,12}$")
 
 @dataclass
 class _PendingReg:
-    internal_user_id: UUID
+    tg_full_name: str
     slack_user_id: str
     code: str
     expires_at: float = field(default_factory=lambda: time.monotonic() + _TTL_SECONDS)
@@ -60,8 +67,8 @@ class _PendingReg:
         return time.monotonic() > self.expires_at
 
 
-# tg_user_id → internal UUID (step 1: waiting for Slack ID input)
-_awaiting_slack_id: dict[int, UUID] = {}
+# tg_user_id → tg display name (step 1: waiting for Slack ID input)
+_awaiting_slack_id: dict[int, str] = {}
 # tg_user_id → full pending state (step 2: OTP sent, waiting for code)
 _pending: dict[int, _PendingReg] = {}
 
@@ -72,17 +79,20 @@ def _cleanup(tg_user_id: int) -> None:
 
 
 @router.message(Command("register"))
-@require_role("admin", "manager", "viewer")
-async def cmd_register(message: Message, actor: InternalUser, **kwargs: Any) -> None:
-    """Start (or restart) the Slack account linking flow (any internal user)."""
+async def cmd_register(message: Message, **kwargs: Any) -> None:
+    """Start (or restart) the Slack account linking flow (open to any Telegram user)."""
     user_id = message.from_user.id if message.from_user else None
     if user_id is None:
         return
 
     _cleanup(user_id)
-    _awaiting_slack_id[user_id] = actor.id
+    tg_full_name = (message.from_user.full_name or "Unknown") if message.from_user else "Unknown"
+    _awaiting_slack_id[user_id] = tg_full_name
 
-    already = " (replacing the current link)" if actor.slack_user_id else ""
+    async with acquire_connection() as conn:
+        existing = await find_internal_user_by_telegram_id(conn, user_id)
+    already = " (replacing the current link)" if existing and existing.slack_user_id else ""
+
     await message.answer(
         f"<b>Link your Slack account{already}</b>\n\n"
         "Send me your Slack member ID to receive notifications.\n\n"
@@ -132,8 +142,8 @@ async def _step_receive_slack_id(message: Message, user_id: int, text: str) -> N
         )
         return
 
-    internal_id = _awaiting_slack_id.get(user_id)
-    if internal_id is None:
+    tg_full_name = _awaiting_slack_id.get(user_id)
+    if tg_full_name is None:
         return
 
     code = secrets.token_hex(3).upper()  # 6 hex chars — easy to copy/type
@@ -155,7 +165,7 @@ async def _step_receive_slack_id(message: Message, user_id: int, text: str) -> N
 
     _awaiting_slack_id.pop(user_id, None)
     _pending[user_id] = _PendingReg(
-        internal_user_id=internal_id,
+        tg_full_name=tg_full_name,
         slack_user_id=slack_id,
         code=code,
     )
@@ -185,9 +195,22 @@ async def _step_receive_code(message: Message, user_id: int, text: str) -> None:
 
     async with acquire_connection() as conn:
         async with conn.transaction():
-            updated = await update_slack_user_id(
-                conn, pending.internal_user_id, pending.slack_user_id
+            existing: InternalUser | None = await find_internal_user_by_telegram_id(
+                conn, user_id
             )
+            if existing is None:
+                existing = await create_internal_user(
+                    conn,
+                    full_name=pending.tg_full_name,
+                    telegram_id=user_id,
+                    role="manager",
+                )
+                log.info(
+                    "registration.auto_created_manager",
+                    tg_user_id=user_id,
+                    full_name=pending.tg_full_name,
+                )
+            updated = await update_slack_user_id(conn, existing.id, pending.slack_user_id)
             if updated is None:
                 await message.answer("Something went wrong. Please try again.")
                 _cleanup(user_id)
@@ -196,9 +219,9 @@ async def _step_receive_code(message: Message, user_id: int, text: str) -> None:
                 conn,
                 action="register_slack",
                 actor_user_id=user_id,
-                actor_internal_id=pending.internal_user_id,
+                actor_internal_id=existing.id,
                 target_entity="internal_user",
-                target_id=pending.internal_user_id,
+                target_id=existing.id,
                 payload={"slack_user_id": pending.slack_user_id},
             )
 
@@ -206,7 +229,7 @@ async def _step_receive_code(message: Message, user_id: int, text: str) -> None:
     log.info(
         "registration.complete",
         tg_user_id=user_id,
-        internal_id=str(pending.internal_user_id),
+        internal_id=str(existing.id),
         slack_id=pending.slack_user_id,
     )
     await message.answer(
