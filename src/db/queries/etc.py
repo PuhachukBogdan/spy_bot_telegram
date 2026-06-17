@@ -184,6 +184,17 @@ async def list_internal_users(
     return [InternalUser.from_record(row) for row in rows]
 
 
+async def find_internal_user_by_aff_id(
+    conn: asyncpg.Connection, aff_id: str
+) -> InternalUser | None:
+    """Return an enabled manager by their affiliate id (parsed from chat title)."""
+    row = await conn.fetchrow(
+        "SELECT * FROM internal_users WHERE aff_id = $1 AND enabled = true LIMIT 1",
+        aff_id,
+    )
+    return InternalUser.from_record(row) if row is not None else None
+
+
 async def update_slack_user_id(
     conn: asyncpg.Connection,
     internal_id: UUID,

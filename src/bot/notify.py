@@ -67,23 +67,32 @@ def format_pending_notice(chat: Chat) -> str:
     )
 
 
-def format_auto_active_notice(chat: Chat, adder: InternalUser) -> str:
+def format_auto_active_notice(
+    chat: Chat, adder: InternalUser, *, partner_name: str | None = None
+) -> str:
     """Admin FYI DM: a trusted internal user connected a chat (now auto-active).
 
     Sent when a known internal user adds the bot to a group — no approval is
     needed (we trust the verified user, not each chat), so this is an oversight
-    notice, not an action request. It nudges the admin to attach a partner and
-    points at the panel. The adder themselves is *not* DM'd (cover posture).
+    notice, not an action request. When ``partner_name`` is given the partner was
+    auto-bound from the chat title; otherwise the admin is nudged to do it manually.
+    The adder themselves is *not* DM'd (cover posture).
     """
     name = html_escape(chat.chat_name) if chat.chat_name else "<i>(untitled)</i>"
+    if partner_name:
+        partner_line = f"Partner <b>{html_escape(partner_name)}</b> auto-bound from chat title."
+    else:
+        partner_line = (
+            "Monitoring is live. Bind a partner:\n"
+            f'<code>/bind_partner {chat.telegram_chat_id} "Partner Name"</code>'
+        )
     return (
         "✅ <b>New chat auto-activated</b>\n\n"
         f"<b>Chat:</b> {name}\n"
         f"<b>Chat id:</b> <code>{chat.telegram_chat_id}</code>\n"
         f"<b>Connected by:</b> {html_escape(adder.full_name)} "
         f"(role={html_escape(adder.role)})\n\n"
-        "Monitoring is live. Bind a partner:\n"
-        f'<code>/bind_partner {chat.telegram_chat_id} "Partner Name"</code>\n'
+        f"{partner_line}\n"
         "Review all connections: /admin"
     )
 

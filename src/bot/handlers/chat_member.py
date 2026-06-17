@@ -22,6 +22,8 @@ that would reveal the monitoring layer to a manager (cover posture).
 
 from __future__ import annotations
 
+import re
+
 from aiogram import Bot, Router
 from aiogram.enums import ChatType
 from aiogram.filters import JOIN_TRANSITION, LEAVE_TRANSITION, ChatMemberUpdatedFilter
@@ -30,13 +32,35 @@ from aiogram.types import ChatMemberUpdated
 from src.bot.notify import format_auto_active_notice, notify_admins, notify_admins_pending
 from src.db.client import acquire_connection
 from src.db.queries.audit import insert_audit_log
-from src.db.queries.chats import create_active_chat, create_pending_chat
-from src.db.queries.etc import find_internal_user_by_telegram_id, list_admin_users
+from src.db.queries.chats import bind_partner_to_chat, create_active_chat, create_pending_chat
+from src.db.queries.etc import (
+    find_internal_user_by_aff_id,
+    find_internal_user_by_telegram_id,
+    list_admin_users,
+)
+from src.db.queries.partners import get_or_create_partner_with_owner
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
 
 router = Router(name="onboarding")
+
+# Chat title format: "{aff_id} | {partner_name} | Beton[.]Win"
+# aff_id belongs to the manager (internal_users.aff_id); partner_name is the external client.
+_TITLE_RE = re.compile(
+    r"^\s*(\S+)\s*\|\s*(.+?)\s*\|\s*beton\.?win\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_chat_title(title: str | None) -> tuple[str, str] | None:
+    """Parse '{aff_id} | {partner_name} | Beton[.]Win' → (aff_id, partner_name) or None."""
+    if not title:
+        return None
+    m = _TITLE_RE.match(title)
+    if not m:
+        return None
+    return m.group(1), m.group(2).strip()
 
 # Chat types where onboarding applies. Channels and private chats are ignored:
 # the bot only monitors partner *group* chats.
@@ -75,6 +99,7 @@ async def on_bot_added(event: ChatMemberUpdated, bot: Bot) -> None:
             if actor_id is not None
             else None
         )
+        partner_name: str | None = None
         if adder is not None:
             created = await create_active_chat(
                 conn,
@@ -96,6 +121,27 @@ async def on_bot_added(event: ChatMemberUpdated, bot: Bot) -> None:
                 target_id=created.id,
                 payload={"telegram_chat_id": chat.id, "role": adder.role},
             )
+            parsed = _parse_chat_title(chat.title)
+            if parsed:
+                aff_id, pname = parsed
+                owner = await find_internal_user_by_aff_id(conn, aff_id)
+                partner = await get_or_create_partner_with_owner(
+                    conn, pname, owner.id if owner else None
+                )
+                await bind_partner_to_chat(
+                    conn,
+                    telegram_chat_id=chat.id,
+                    thread_id=None,
+                    partner_id=partner.id,
+                )
+                partner_name = pname
+                log.info(
+                    "onboarding.partner_auto_bound",
+                    chat_id=chat.id,
+                    partner=pname,
+                    aff_id=aff_id,
+                    manager=owner.full_name if owner else None,
+                )
         else:
             created = await create_pending_chat(
                 conn,
@@ -118,7 +164,8 @@ async def on_bot_added(event: ChatMemberUpdated, bot: Bot) -> None:
             role=adder.role,
         )
         # FYI to admins; the adder is intentionally not notified (cover posture).
-        await notify_admins(bot, admins, format_auto_active_notice(created, adder))
+        notice = format_auto_active_notice(created, adder, partner_name=partner_name)
+        await notify_admins(bot, admins, notice)
     else:
         log.info(
             "onboarding.pending_created",

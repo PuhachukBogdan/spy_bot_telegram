@@ -117,3 +117,30 @@ async def get_or_create_partner(conn: asyncpg.Connection, name: str) -> Partner:
         row = await conn.fetchrow("SELECT * FROM partners WHERE name = $1", name)
     assert row is not None  # either the INSERT or the SELECT returns the row
     return Partner.from_record(row)
+
+
+async def get_or_create_partner_with_owner(
+    conn: asyncpg.Connection,
+    name: str,
+    owner_manager_id: UUID | None,
+) -> Partner:
+    """Like :func:`get_or_create_partner` but stamps ``owner_manager_id`` on creation.
+
+    Used by the auto-onboarding path that parses the chat title to discover the
+    owning manager. On a name collision the existing row is returned as-is (its
+    owner is not overwritten — an admin may have set it deliberately).
+    """
+    row = await conn.fetchrow(
+        """
+        INSERT INTO partners (name, owner_manager_id)
+        VALUES ($1, $2)
+        ON CONFLICT (name) DO NOTHING
+        RETURNING *
+        """,
+        name,
+        owner_manager_id,
+    )
+    if row is None:
+        row = await conn.fetchrow("SELECT * FROM partners WHERE name = $1", name)
+    assert row is not None
+    return Partner.from_record(row)
