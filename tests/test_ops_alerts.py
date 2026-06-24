@@ -14,8 +14,10 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
+import httpx
 import pytest
 from aiogram.exceptions import TelegramAPIError
+from tenacity import RetryError
 
 from src.pipeline.ops_alerts import holidays_worker as hw
 from src.pipeline.ops_alerts import incidents_worker as iw
@@ -23,6 +25,7 @@ from src.pipeline.ops_alerts import tg_sender
 from src.pipeline.ops_alerts.feed_parser import (
     Incident,
     extract_latest_status,
+    fetch_incidents,
     parse_incidents,
 )
 from src.pipeline.ops_alerts.holidays_calendar import (
@@ -429,3 +432,130 @@ async def test_holiday_dedup_when_already_claimed(hw_patch: dict[str, Any]) -> N
     fired = await hw.run_holidays_tick(OpsFakeBot())  # type: ignore[arg-type]
     assert fired is False
     assert hw_patch["broadcast"] == 0
+
+
+# ---------------------------------------------------------------------------
+# fetch_incidents — HTTP layer (redirect, retry, parse round-trip)
+# ---------------------------------------------------------------------------
+
+_SAMPLE_RSS = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>D24</title>
+  <item>
+    <title>Chile - Webpay - Timeouts</title>
+    <link>https://status.d24.com/incidents/abc123</link>
+    <description>&#10;In progress - 12:00</description>
+  </item>
+</channel></rss>"""
+
+
+async def test_fetch_incidents_parses_valid_rss(monkeypatch: pytest.MonkeyPatch) -> None:
+    """fetch_incidents: valid RSS XML is fetched and parsed into Incident records."""
+
+    class _Resp:
+        text: str = _SAMPLE_RSS
+
+        def raise_for_status(self) -> None:
+            pass
+
+    class _Client:
+        def __init__(self, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            pass
+
+        async def get(self, url: str) -> _Resp:
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    result = await fetch_incidents("http://fake", retries=1, retry_delay_seconds=0)
+    assert len(result) == 1
+    assert result[0].incident_id == "abc123"
+    assert result[0].country == "Chile"
+    assert result[0].provider == "Webpay"
+
+
+async def test_fetch_incidents_sets_follow_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AsyncClient must be constructed with follow_redirects=True (fixes 302 redirect)."""
+    captured: dict[str, Any] = {}
+
+    class _Resp:
+        text: str = "<rss><channel/></rss>"
+
+        def raise_for_status(self) -> None:
+            pass
+
+    class _Client:
+        def __init__(self, **kw: Any) -> None:
+            captured.update(kw)
+
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            pass
+
+        async def get(self, url: str) -> _Resp:
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    await fetch_incidents("http://fake", retries=1, retry_delay_seconds=0)
+    assert captured.get("follow_redirects") is True
+
+
+async def test_fetch_incidents_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """fetch_incidents: retries after a transient failure, succeeds on the second attempt."""
+    call_count = 0
+
+    class _Resp:
+        text: str = _SAMPLE_RSS
+
+        def raise_for_status(self) -> None:
+            pass
+
+    class _Client:
+        def __init__(self, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            pass
+
+        async def get(self, url: str) -> _Resp:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise OSError("transient network error")
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    result = await fetch_incidents("http://fake", retries=3, retry_delay_seconds=0)
+    assert call_count == 2
+    assert len(result) == 1
+
+
+async def test_fetch_incidents_raises_on_retry_exhaustion(monkeypatch: pytest.MonkeyPatch) -> None:
+    """fetch_incidents: raises RetryError when every retry attempt fails."""
+
+    class _Client:
+        def __init__(self, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, *a: Any) -> None:
+            pass
+
+        async def get(self, url: str) -> Any:
+            raise OSError("always fails")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    with pytest.raises(RetryError):
+        await fetch_incidents("http://fake", retries=2, retry_delay_seconds=0)
