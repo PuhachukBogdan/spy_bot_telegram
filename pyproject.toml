@@ -12,6 +12,7 @@ dependencies = [
     "aiogram>=3.7,<4.0",
     # Web server (webhook + Slack callbacks + healthcheck)
     "fastapi>=0.111",
+    "python-multipart>=0.0.9",
     "uvicorn[standard]>=0.30",
     # Database
     "asyncpg>=0.29",
