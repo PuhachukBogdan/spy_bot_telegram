@@ -45,8 +45,8 @@ def _patch_register_db(existing: Any = None) -> Any:
     """Patch acquire_connection + find_internal_user_by_telegram_id for cmd_register."""
     fake_conn = AsyncMock()
 
-    from contextlib import asynccontextmanager
     from collections.abc import AsyncIterator
+    from contextlib import asynccontextmanager
 
     @asynccontextmanager
     async def _fake_acquire() -> AsyncIterator[Any]:

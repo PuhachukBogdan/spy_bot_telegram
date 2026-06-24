@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import html as _html
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -26,7 +27,11 @@ from src.alerts.slack_callbacks import handle_slack_action, verify_slack_signatu
 from src.bot.instance import bot, dp  # noqa: E402  (after setup_logging on purpose)
 from src.config import settings  # noqa: E402
 from src.db.client import acquire_connection, close_pool, get_pool  # noqa: E402
-from src.db.queries.summaries import get_html_by_share_token  # noqa: E402
+from src.db.queries.summaries import (  # noqa: E402
+    get_dashboard_by_token,
+    get_latest_summary_html,
+    get_summary_by_share_token,
+)
 from src.pipeline.tier1 import pattern_cache  # noqa: E402
 from src.pipeline.workers import (  # noqa: E402
     abandoned_chat_cleanup_loop,
@@ -34,8 +39,10 @@ from src.pipeline.workers import (  # noqa: E402
     file_analysis_worker_loop,
     pattern_reload_loop,
     stale_task_reaper_loop,
+    summary_scheduler_loop,
     whisper_worker_loop,
 )
+from src.summary.builder import build_dashboard_html  # noqa: E402
 from src.summary.generator import generate_report  # noqa: E402
 
 log = get_logger(__name__)
@@ -106,14 +113,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     reaper_task = asyncio.create_task(
         stale_task_reaper_loop(), name="stale_task_reaper"
     )
+    summary_task = asyncio.create_task(
+        summary_scheduler_loop(), name="summary_scheduler"
+    )
     log.info("startup.whisper.worker", enabled=settings.WHISPER_ENABLED)
     log.info("startup.file_analysis.worker", enabled=settings.FILE_ANALYSIS_ENABLED)
+    log.info("startup.summary_scheduler.worker")
 
     try:
         yield
     finally:
         # --- shutdown ---
-        bg_tasks = (cleanup_task, pattern_task, whisper_task, analysis_task, file_task, reaper_task)
+        bg_tasks = (
+            cleanup_task, pattern_task, whisper_task, analysis_task,
+            file_task, reaper_task, summary_task,
+        )
         for task in bg_tasks:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -203,29 +217,118 @@ async def summary_generate(
 ) -> Response:
     """Trigger HTML report generation for the given period.
 
-    Called by n8n cron: POST /summary/generate?period=weekly&token=SECRET
-    Returns JSON {ok, url} on success; 401 on bad token.
+    Manual trigger: POST /summary/generate?period=weekly&token=SECRET. The
+    scheduled (weekly/monthly) runs are fired in-process by
+    ``workers.summary_scheduler_loop`` — this endpoint is for on-demand reports.
+    Returns JSON {ok, url, event_count, slack_delivered, slack_error} on success;
+    401 on bad token.
     """
     expected = settings.SUMMARY_ACCESS_TOKEN.get_secret_value()
     if not token or not hmac.compare_digest(token, expected):
         log.warning("summary_generate.bad_token", remote=request.client)
         return Response(status_code=401)
-    url = await generate_report(period_type=period)
-    return _json({"ok": True, "url": url})
+    result = await generate_report(period_type=period)
+    return _json(
+        {
+            "ok": True,
+            "url": result.url,
+            "event_count": result.event_count,
+            "slack_delivered": result.slack_delivered,
+            "slack_error": result.slack_error,
+            "dashboard_password": result.dashboard_password,
+        }
+    )
+
+
+def _pw_form(*, title: str, action: str, error: bool = False) -> str:
+    """Minimal password gate page. All values are HTML-escaped."""
+    t = _html.escape(title)
+    a = _html.escape(action)
+    err = '<p class="err">Incorrect password. Try again.</p>' if error else ""
+    return (
+        "<!DOCTYPE html>"
+        '<html lang="en"><head><meta charset="utf-8">'
+        f"<title>{t}</title>"
+        "<style>"
+        "body{font-family:system-ui,sans-serif;background:#f4f5f7;"
+        "display:flex;align-items:center;justify-content:center;height:100vh;margin:0}"
+        ".card{background:#fff;border-radius:12px;padding:36px 40px;width:340px;"
+        "box-shadow:0 1px 3px rgba(0,0,0,.1)}"
+        "h1{font-size:18px;font-weight:700;margin-bottom:6px;color:#0f172a}"
+        "p.sub{color:#94a3b8;font-size:13px;margin-bottom:22px}"
+        "input[type=password]{width:100%;padding:10px 14px;border:1px solid #e2e8f0;"
+        "border-radius:8px;font-size:14px;outline:none;box-sizing:border-box}"
+        "input[type=password]:focus{border-color:#4f46e5}"
+        "button{margin-top:12px;width:100%;padding:10px;background:#4f46e5;"
+        "color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer}"
+        "button:hover{background:#4338ca}"
+        ".err{color:#b91c1c;font-size:12.5px;margin-top:10px}"
+        "</style></head><body>"
+        f'<div class="card"><h1>{t}</h1>'
+        '<p class="sub">Enter the access password from Slack.</p>'
+        f'<form method="get" action="{a}">'
+        '<input type="password" name="pw" placeholder="Password" autofocus autocomplete="off">'
+        "<button type=\"submit\">Open Report</button>"
+        f"{err}"
+        "</form></div></body></html>"
+    )
 
 
 @app.get("/r/{share_token}")
-async def get_report(share_token: str) -> Response:
+async def get_report(share_token: str, pw: str = "") -> Response:
     """Serve a pre-rendered HTML report by its capability token.
 
-    URL shape: GET /r/<64-char-hex>
-    Returns 404 for unknown or expired tokens (no 401 — the token IS the auth).
+    URL shape: GET /r/<64-char-hex>?pw=<password>
+    Returns 404 for unknown or expired tokens. Reports with an access_password
+    require the correct ?pw= value; older reports without a password are served
+    directly (backward-compatible).
     """
     async with acquire_connection() as conn:
-        html = await get_html_by_share_token(conn, share_token)
-    if html is None:
+        row = await get_summary_by_share_token(conn, share_token)
+    if row is None:
         return Response(status_code=404)
-    return Response(content=html, media_type="text/html")
+    access_pw: str | None = row.get("access_password")
+    if access_pw:
+        if not pw or not hmac.compare_digest(pw, access_pw):
+            return Response(
+                content=_pw_form(
+                    title="Risk Report",
+                    action=f"/r/{share_token}",
+                    error=bool(pw),
+                ),
+                media_type="text/html",
+            )
+    return Response(content=row["rendered_html"], media_type="text/html")
+
+
+@app.get("/dashboard/{share_token}")
+async def get_dashboard(share_token: str, pw: str = "") -> Response:
+    """Serve the tabbed dashboard with the latest weekly and monthly reports.
+
+    URL shape: GET /dashboard/<64-char-hex>?pw=<password>
+    Returns 404 for unknown or expired tokens. Always requires the access
+    password set when the dashboard was created.
+    """
+    async with acquire_connection() as conn:
+        dash = await get_dashboard_by_token(conn, share_token)
+    if dash is None:
+        return Response(status_code=404)
+    if not pw or not hmac.compare_digest(pw, str(dash["access_password"])):
+        return Response(
+            content=_pw_form(
+                title="Risk Reports Dashboard",
+                action=f"/dashboard/{share_token}",
+                error=bool(pw),
+            ),
+            media_type="text/html",
+        )
+    async with acquire_connection() as conn:
+        weekly_html = await get_latest_summary_html(conn, "weekly")
+        monthly_html = await get_latest_summary_html(conn, "monthly")
+    dashboard_html = build_dashboard_html(
+        weekly_html=weekly_html, monthly_html=monthly_html
+    )
+    return Response(content=dashboard_html, media_type="text/html")
 
 
 def _json(payload: dict[str, object], status_code: int = 200) -> Response:

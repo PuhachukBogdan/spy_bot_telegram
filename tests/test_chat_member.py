@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from src.bot.handlers.chat_member import _parse_chat_title
 
 

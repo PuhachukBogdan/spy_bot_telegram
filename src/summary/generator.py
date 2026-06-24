@@ -1,17 +1,20 @@
 """Orchestrator for generating and delivering HTML summary reports. Phase 16.
 
-Called by POST /summary/generate (triggered by n8n cron or manually).
+Invoked by the in-process scheduler (``workers.summary_scheduler_loop``) on the
+weekly/monthly cadence, or on demand via POST /summary/generate.
 Flow:
   1. Query DB: managers, heatmap, events for the period.
   2. Build HTML via builder.build_report_html().
-  3. Save rendered HTML to summaries table.
-  4. Post a Slack link to the appropriate channel.
-  5. Stamp delivery_status=delivered.
+  3. Save rendered HTML to summaries table (with access_password).
+  4. Create a dashboard row (share_token + password).
+  5. Post dashboard URL + password to Slack.
+  6. Stamp delivery_status=delivered.
 """
 
 from __future__ import annotations
 
 import secrets
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -19,6 +22,7 @@ from src.alerts.slack import get_slack_client
 from src.config import settings
 from src.db.client import acquire_connection
 from src.db.queries.summaries import (
+    create_dashboard,
     list_active_managers,
     list_events_for_report,
     mark_summary_delivered,
@@ -30,15 +34,39 @@ from src.utils.logging import get_logger
 
 log = get_logger(__name__)
 
+_PASSWD_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
-async def generate_report(*, period_type: Literal["weekly", "monthly"]) -> str:
+
+def _gen_password() -> str:
+    """8-char password from an unambiguous uppercase+digit alphabet."""
+    return "".join(secrets.choice(_PASSWD_CHARS) for _ in range(8))
+
+
+@dataclass
+class ReportResult:
+    """Outcome of one report generation, returned to the API caller.
+
+    ``slack_delivered`` distinguishes "report saved but Slack post failed"
+    (the silent-failure case that hid the missing-channel bug in pilot) from
+    full success — surfaced in the /summary/generate JSON response.
+    ``dashboard_password`` is the access password for the dashboard URL.
+    """
+
+    url: str
+    event_count: int
+    slack_delivered: bool
+    slack_error: str | None = None
+    dashboard_password: str | None = field(default=None)
+
+
+async def generate_report(
+    *, period_type: Literal["weekly", "monthly"]
+) -> ReportResult:
     """Build, persist, and announce one summary report.
 
-    Returns the public URL of the generated report.
+    Returns a :class:`ReportResult` describing the dashboard URL, access
+    password, and whether the Slack announcement actually went out.
     """
-    # Rolling window ending at generation time, so a report triggered mid-day
-    # includes everything up to "now" (a midnight-aligned `until` would drop the
-    # current day's events entirely — exactly the empty-report bug seen in pilot).
     span = timedelta(days=7 if period_type == "weekly" else 30)
     until = datetime.now(UTC)
     since = until - span
@@ -58,6 +86,7 @@ async def generate_report(*, period_type: Literal["weekly", "monthly"]) -> str:
         event_rows=event_rows,
     )
 
+    report_pw = _gen_password()
     share_token = secrets.token_hex(32)
     async with acquire_connection() as conn:
         summary_id = await save_summary(
@@ -69,13 +98,35 @@ async def generate_report(*, period_type: Literal["weekly", "monthly"]) -> str:
             event_count=len(event_rows),
             share_token=share_token,
             expires_at=expires_at,
+            access_password=report_pw,
         )
 
-    report_url = _report_url(share_token)
+    dash_pw = _gen_password()
+    dash_token = secrets.token_hex(32)
+    dash_expires = until + timedelta(days=30)
+    async with acquire_connection() as conn:
+        await create_dashboard(
+            conn,
+            share_token=dash_token,
+            access_password=dash_pw,
+            expires_at=dash_expires,
+        )
+
+    dashboard_url = _dashboard_url(dash_token)
+    slack_delivered = True
+    slack_error: str | None = None
     try:
-        await _post_slack_link(period_type, since, until, len(event_rows), report_url)
+        await _post_slack_link(
+            period_type, since, until, len(event_rows), dashboard_url, dash_pw
+        )
     except Exception as exc:
-        log.warning("summary.post_link_failed", error=str(exc))
+        slack_delivered = False
+        slack_error = str(exc)
+        log.warning(
+            "summary.post_link_failed",
+            error=slack_error,
+            channel=settings.SLACK_CHANNEL_REPORTS,
+        )
 
     async with acquire_connection() as conn:
         await mark_summary_delivered(conn, summary_id)
@@ -86,14 +137,21 @@ async def generate_report(*, period_type: Literal["weekly", "monthly"]) -> str:
         since=since.isoformat(),
         until=until.isoformat(),
         event_count=len(event_rows),
-        url=report_url,
+        dashboard_url=dashboard_url,
+        slack_delivered=slack_delivered,
     )
-    return report_url
+    return ReportResult(
+        url=dashboard_url,
+        event_count=len(event_rows),
+        slack_delivered=slack_delivered,
+        slack_error=slack_error,
+        dashboard_password=dash_pw,
+    )
 
 
-def _report_url(share_token: str) -> str:
+def _dashboard_url(dash_token: str) -> str:
     base = settings.SERVER_BASE_URL.rstrip("/")
-    return f"{base}/r/{share_token}"
+    return f"{base}/dashboard/{dash_token}"
 
 
 async def _post_slack_link(
@@ -101,7 +159,8 @@ async def _post_slack_link(
     since: datetime,
     until: datetime,
     event_count: int,
-    report_url: str,
+    dashboard_url: str,
+    password: str,
 ) -> None:
     label = "Weekly" if period_type == "weekly" else "Monthly"
     channel = settings.SLACK_CHANNEL_REPORTS
@@ -111,7 +170,7 @@ async def _post_slack_link(
 
     fallback = (
         f"{label} Risk Report ({since_str} – {until_str}) is now available. "
-        f"{event_count} risk {noun} recorded."
+        f"{event_count} risk {noun} recorded. Password: {password}"
     )
     blocks: list[dict[str, Any]] = [
         {"type": "divider"},
@@ -127,15 +186,19 @@ async def _post_slack_link(
             },
         },
         {
-            "type": "context",
-            "elements": [
+            "type": "section",
+            "fields": [
+                {
+                    "type": "mrkdwn",
+                    "text": f":key: *Access password:*\n`{password}`",
+                },
                 {
                     "type": "mrkdwn",
                     "text": (
-                        "Access is restricted to recipients of this link. "
-                        "Do not forward outside the team."
+                        ":lock: *Access restricted* — do not forward "
+                        "this message outside the team."
                     ),
-                }
+                },
             ],
         },
         {
@@ -143,17 +206,14 @@ async def _post_slack_link(
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "View Report"},
-                    "url": report_url,
-                    "action_id": "open_report",
+                    "text": {"type": "plain_text", "text": "Open Dashboard"},
+                    "url": dashboard_url,
+                    "action_id": "open_dashboard",
                     "style": "primary",
                 }
             ],
         },
     ]
-    try:
-        client = get_slack_client()
-        await client.chat_postMessage(channel=channel, text=fallback, blocks=blocks)
-        log.info("summary.slack_posted", channel=channel, period_type=period_type)
-    except Exception as exc:
-        log.warning("summary.slack_post_failed", error=str(exc), channel=channel)
+    client = get_slack_client()
+    await client.chat_postMessage(channel=channel, text=fallback, blocks=blocks)
+    log.info("summary.slack_posted", channel=channel, period_type=period_type)

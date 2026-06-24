@@ -29,10 +29,12 @@ from src.db.queries.chats import (
 )
 from src.db.queries.cost import get_today, is_circuit_open, trip_circuit_breaker
 from src.db.queries.queue import claim_tasks, recover_stale_tasks
+from src.db.queries.summaries import summary_exists_since
 from src.pipeline.batch_processor import process_analysis_task
 from src.pipeline.file_processor import process_file_task
 from src.pipeline.tier1 import pattern_cache
 from src.pipeline.transcription import process_whisper_task
+from src.summary.generator import generate_report
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -41,6 +43,21 @@ log = get_logger(__name__)
 _CLEANUP_INTERVAL_SECONDS = 3600
 # How often the Tier-1 dictionary is hot-reloaded (CLAUDE.md Phase 6: ~5 min).
 _PATTERN_RELOAD_INTERVAL_SECONDS = 300
+
+# --- Summary scheduler (replaces the old n8n cron) --------------------------
+# How often the scheduler wakes to check whether a report is due (15 min). The
+# DB dedup makes the exact tick granularity irrelevant — a report fires within
+# one interval of its scheduled instant.
+_SUMMARY_SCHEDULER_INTERVAL_SECONDS = 900
+# Catch-up window: fire a due slot only if its scheduled instant is at most this
+# old. Covers a short outage spanning the slot, without blasting a stale report
+# on a fresh deploy days later.
+_SUMMARY_CATCHUP_WINDOW_SECONDS = 21600  # 6h
+# Weekly: Monday 08:00 UTC (n8n cron "0 8 * * 1").
+_WEEKLY_DOW = 0  # Monday (datetime.weekday(): Monday == 0)
+_WEEKLY_HOUR = 8
+# Monthly: 1st of month 08:00 UTC (n8n cron "0 8 1 * *").
+_MONTHLY_HOUR = 8
 
 
 async def run_abandoned_chat_sweep(bot: Bot) -> int:
@@ -316,4 +333,82 @@ async def pattern_reload_loop(
             raise
         except Exception as exc:  # never let one bad reload kill the loop
             log.error("worker.pattern_reload.error", error=str(exc))
+        await asyncio.sleep(interval_seconds)
+
+
+def _last_weekly_occurrence(now: datetime) -> datetime:
+    """Most recent Monday 08:00 UTC at or before ``now``."""
+    occ = now.replace(hour=_WEEKLY_HOUR, minute=0, second=0, microsecond=0)
+    occ -= timedelta(days=(now.weekday() - _WEEKLY_DOW) % 7)
+    if occ > now:  # earlier today than 08:00 on this week's Monday → last week
+        occ -= timedelta(days=7)
+    return occ
+
+
+def _last_monthly_occurrence(now: datetime) -> datetime:
+    """Most recent 1st-of-month 08:00 UTC at or before ``now``."""
+    occ = now.replace(day=1, hour=_MONTHLY_HOUR, minute=0, second=0, microsecond=0)
+    if occ > now:  # before the 1st @ 08:00 → step into previous month
+        occ = (occ - timedelta(days=1)).replace(
+            day=1, hour=_MONTHLY_HOUR, minute=0, second=0, microsecond=0
+        )
+    return occ
+
+
+async def run_summary_scheduler_tick() -> list[str]:
+    """One scheduler pass: fire any due, not-yet-generated report.
+
+    Returns the period types fired this tick (for tests/observability). A slot
+    fires only if its scheduled instant is within the catch-up window AND no
+    summary of that type was generated since that instant (restart-safe dedup).
+    """
+    now = datetime.now(UTC)
+    schedule = (
+        ("weekly", _last_weekly_occurrence(now)),
+        ("monthly", _last_monthly_occurrence(now)),
+    )
+    fired: list[str] = []
+    for period_type, occ in schedule:
+        if (now - occ).total_seconds() > _SUMMARY_CATCHUP_WINDOW_SECONDS:
+            continue  # missed slot too old — wait for the next occurrence
+        async with acquire_connection() as conn:
+            if await summary_exists_since(conn, period_type, occ):
+                continue  # already handled this slot
+        log.info(
+            "worker.summary_scheduler.fire",
+            period_type=period_type,
+            scheduled_for=occ.isoformat(),
+        )
+        result = await generate_report(period_type=period_type)  # type: ignore[arg-type]
+        fired.append(period_type)
+        log.info(
+            "worker.summary_scheduler.done",
+            period_type=period_type,
+            url=result.url,
+            event_count=result.event_count,
+            slack_delivered=result.slack_delivered,
+        )
+    return fired
+
+
+async def summary_scheduler_loop(
+    interval_seconds: int = _SUMMARY_SCHEDULER_INTERVAL_SECONDS,
+) -> None:
+    """Fire weekly/monthly summary reports on schedule — replaces the n8n cron.
+
+    Weekly: Monday 08:00 UTC. Monthly: 1st of month 08:00 UTC. Checks every
+    ``interval_seconds``; the per-slot DB dedup (``summary_exists_since``) makes
+    firing idempotent across restarts and overlapping ticks. Per-iteration errors
+    are logged and swallowed so one bad run doesn't kill the loop; cancellation
+    propagates.
+    """
+    log.info("worker.summary_scheduler.start", interval_s=interval_seconds)
+    while True:
+        try:
+            await run_summary_scheduler_tick()
+        except asyncio.CancelledError:
+            log.info("worker.summary_scheduler.stop")
+            raise
+        except Exception as exc:  # never let one bad tick kill the loop
+            log.error("worker.summary_scheduler.error", error=str(exc))
         await asyncio.sleep(interval_seconds)

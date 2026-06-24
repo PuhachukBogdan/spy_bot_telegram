@@ -15,6 +15,7 @@ import pytest
 from src.summary import generator as gen_mod
 from src.summary.builder import (
     RISK_CATEGORIES,
+    _manager_label,
     _risk_type_label,
     build_report_html,
 )
@@ -70,6 +71,35 @@ def test_known_risk_type_label() -> None:
 
 def test_unknown_risk_type_falls_back_to_title() -> None:
     assert _risk_type_label("some_new_type") == "Some New Type"
+
+
+# ---------------------------------------------------------------------------
+# _manager_label — never renders a bare "@" (pilot bug)
+# ---------------------------------------------------------------------------
+
+
+def test_manager_label_aff_and_username() -> None:
+    assert _manager_label({"aff_id": "78516", "tg_username": "anna_k"}) == "78516 | @anna_k"
+
+
+def test_manager_label_username_only() -> None:
+    assert _manager_label({"aff_id": None, "tg_username": "elena_m"}) == "@elena_m"
+
+
+def test_manager_label_aff_only() -> None:
+    assert _manager_label({"aff_id": "91203", "tg_username": None}) == "91203"
+
+
+def test_manager_label_falls_back_to_full_name() -> None:
+    # Neither aff_id nor tg_username — must NOT render bare "@".
+    label = _manager_label(
+        {"aff_id": None, "tg_username": None, "full_name": "Игорь Петров"}
+    )
+    assert label == "Игорь Петров"
+
+
+def test_manager_label_last_resort_placeholder() -> None:
+    assert _manager_label({}) == "Unassigned"
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +333,7 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "saved_html": None,
         "delivered": [],
         "slack_posts": [],
+        "dashboard_pw": None,
     }
 
     mgr_id = uuid4()
@@ -318,7 +349,8 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     async def fake_save(conn: Any, *, period_type: Any, period_start: Any,
                         period_end: Any, rendered_html: Any, event_count: Any,
-                        share_token: Any, expires_at: Any) -> Any:
+                        share_token: Any, expires_at: Any,
+                        access_password: Any) -> Any:
         rec["saved_html"] = rendered_html
         return uuid4()
 
@@ -326,8 +358,15 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         rec["delivered"].append(summary_id)
 
     async def fake_post(period_type: Any, since: Any, until: Any,
-                        event_count: Any, report_url: Any) -> None:
-        rec["slack_posts"].append(report_url)
+                        event_count: Any, dashboard_url: Any,
+                        password: Any) -> None:
+        rec["slack_posts"].append(dashboard_url)
+
+    async def fake_create_dashboard(
+        conn: Any, *, share_token: Any, access_password: Any, expires_at: Any
+    ) -> Any:
+        rec["dashboard_pw"] = access_password
+        return uuid4()
 
     monkeypatch.setattr(gen_mod, "list_active_managers", fake_managers)
     monkeypatch.setattr(gen_mod, "risk_heatmap", fake_heatmap)
@@ -335,6 +374,7 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(gen_mod, "save_summary", fake_save)
     monkeypatch.setattr(gen_mod, "mark_summary_delivered", fake_deliver)
     monkeypatch.setattr(gen_mod, "_post_slack_link", fake_post)
+    monkeypatch.setattr(gen_mod, "create_dashboard", fake_create_dashboard)
     monkeypatch.setattr(gen_mod, "acquire_connection", lambda: _NullConn())
 
     return rec
@@ -345,12 +385,17 @@ async def test_generate_report_saves_html_and_returns_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(gen_mod.settings, "SERVER_BASE_URL", "https://bot.example.com")
-    url = await gen_mod.generate_report(period_type="weekly")
-    assert url.startswith("https://bot.example.com/r/")
-    assert len(url.split("/r/")[1]) == 64  # 32-byte hex token
+    result = await gen_mod.generate_report(period_type="weekly")
+    assert result.url.startswith("https://bot.example.com/dashboard/")
+    assert len(result.url.split("/dashboard/")[1]) == 64  # 32-byte hex token
+    assert result.slack_delivered is True
+    assert result.slack_error is None
     assert patched_generator["saved_html"] is not None
     assert "Weekly Risk Report" in patched_generator["saved_html"]
     assert len(patched_generator["delivered"]) == 1
+    # password is surfaced
+    assert result.dashboard_password is not None
+    assert len(result.dashboard_password) == 8
 
 
 async def test_generate_report_monthly_url(
@@ -358,8 +403,8 @@ async def test_generate_report_monthly_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(gen_mod.settings, "SERVER_BASE_URL", "https://example.com")
-    url = await gen_mod.generate_report(period_type="monthly")
-    assert url.startswith("https://example.com/r/")
+    result = await gen_mod.generate_report(period_type="monthly")
+    assert result.url.startswith("https://example.com/dashboard/")
 
 
 async def test_generate_report_slack_failure_does_not_raise(
@@ -374,6 +419,66 @@ async def test_generate_report_slack_failure_does_not_raise(
     monkeypatch.setattr(
         gen_mod.settings.SUMMARY_ACCESS_TOKEN, "get_secret_value", lambda: "abc"
     )
-    # Should not raise despite Slack failure
-    url = await gen_mod.generate_report(period_type="weekly")
-    assert url  # still returns URL
+    # Should not raise despite Slack failure — but must report it.
+    result = await gen_mod.generate_report(period_type="weekly")
+    assert result.url  # still returns URL
+    assert result.slack_delivered is False
+    assert result.slack_error == "Slack down"
+    # Report is still persisted and marked delivered even when Slack is down.
+    assert len(patched_generator["delivered"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# _gen_password
+# ---------------------------------------------------------------------------
+
+
+def test_gen_password_format() -> None:
+    from src.summary.generator import _gen_password
+
+    pw = _gen_password()
+    assert len(pw) == 8
+    assert pw == pw.upper()
+    for ch in pw:
+        assert ch not in "01ILO"
+
+
+# ---------------------------------------------------------------------------
+# build_dashboard_html
+# ---------------------------------------------------------------------------
+
+
+def test_build_dashboard_html_shows_both_tabs() -> None:
+    from src.summary.builder import build_dashboard_html
+
+    weekly = build_report_html(
+        period_type="weekly",
+        since=_SINCE,
+        until=_UNTIL,
+        managers=[],
+        heatmap_rows=[],
+        event_rows=[],
+    )
+    monthly = build_report_html(
+        period_type="monthly",
+        since=_SINCE,
+        until=_UNTIL,
+        managers=[],
+        heatmap_rows=[],
+        event_rows=[],
+    )
+    html = build_dashboard_html(weekly_html=weekly, monthly_html=monthly)
+    assert "tab-btn" in html
+    assert "Weekly" in html
+    assert "Monthly" in html
+    assert "panel-weekly" in html
+    assert "panel-monthly" in html
+
+
+def test_build_dashboard_html_handles_missing_reports() -> None:
+    from src.summary.builder import build_dashboard_html
+
+    html = build_dashboard_html(weekly_html=None, monthly_html=None)
+    assert "tab-empty" in html
+    assert "Weekly" in html
+    assert "Monthly" in html

@@ -96,22 +96,24 @@ async def save_summary(
     event_count: int,
     share_token: str,
     expires_at: datetime,
+    access_password: str,
 ) -> UUID:
-    """Insert a new summary row and return its UUID."""
+    """Insert or upsert a summary row and return its UUID."""
     row = await conn.fetchrow(
         """
         INSERT INTO summaries (
             period_type, period_start, period_end,
             structured_content, rendered_html,
-            delivery_status, share_token, expires_at
+            delivery_status, share_token, expires_at, access_password
         )
-        VALUES ($1, $2, $3, $4::jsonb, $5, 'pending', $6, $7)
+        VALUES ($1, $2, $3, $4::jsonb, $5, 'pending', $6, $7, $8)
         ON CONFLICT (period_type, period_start) DO UPDATE SET
             period_end         = EXCLUDED.period_end,
             structured_content = EXCLUDED.structured_content,
             rendered_html      = EXCLUDED.rendered_html,
             share_token        = EXCLUDED.share_token,
             expires_at         = EXCLUDED.expires_at,
+            access_password    = EXCLUDED.access_password,
             delivery_status    = 'pending',
             delivered_at       = NULL
         RETURNING id
@@ -123,28 +125,29 @@ async def save_summary(
         rendered_html,
         share_token,
         expires_at,
+        access_password,
     )
     assert row is not None
     return UUID(str(row["id"]))
 
 
-async def get_html_by_share_token(
+async def get_summary_by_share_token(
     conn: asyncpg.Connection,
     share_token: str,
-) -> str | None:
-    """Return rendered HTML for a valid, non-expired share token, or None."""
+) -> dict[str, Any] | None:
+    """Return rendered_html and access_password for a valid, non-expired token."""
     row = await conn.fetchrow(
         """
-        SELECT rendered_html
+        SELECT rendered_html, access_password
         FROM summaries
         WHERE share_token = $1
           AND (expires_at IS NULL OR expires_at > now())
         """,
         share_token,
     )
-    if row is None or row["rendered_html"] is None:
+    if row is None:
         return None
-    return str(row["rendered_html"])
+    return dict(row)
 
 
 async def mark_summary_delivered(
@@ -160,6 +163,31 @@ async def mark_summary_delivered(
         """,
         summary_id,
     )
+
+
+async def summary_exists_since(
+    conn: asyncpg.Connection,
+    period_type: str,
+    since: datetime,
+) -> bool:
+    """True if a summary of this period_type was generated at/after ``since``.
+
+    Used by the in-process scheduler (workers.summary_scheduler_loop) to make
+    firing idempotent across restarts: a row created after the scheduled instant
+    means that slot was already handled, so the loop must not re-generate or
+    re-post it. Keyed on ``created_at`` (not ``period_start``, which the rolling
+    window varies per run).
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT 1 FROM summaries
+        WHERE period_type = $1 AND created_at >= $2
+        LIMIT 1
+        """,
+        period_type,
+        since,
+    )
+    return row is not None
 
 
 async def get_rendered_html(
@@ -182,3 +210,65 @@ async def get_rendered_html(
     if row is None or row["rendered_html"] is None:
         return None
     return str(row["rendered_html"])
+
+
+async def get_latest_summary_html(
+    conn: asyncpg.Connection,
+    period_type: str,
+) -> str | None:
+    """Return rendered_html from the most recent non-expired summary of this type."""
+    row = await conn.fetchrow(
+        """
+        SELECT rendered_html
+        FROM summaries
+        WHERE period_type = $1
+          AND (expires_at IS NULL OR expires_at > now())
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        period_type,
+    )
+    if row is None or row["rendered_html"] is None:
+        return None
+    return str(row["rendered_html"])
+
+
+async def create_dashboard(
+    conn: asyncpg.Connection,
+    *,
+    share_token: str,
+    access_password: str,
+    expires_at: datetime,
+) -> UUID:
+    """Insert a new dashboard row and return its UUID."""
+    row = await conn.fetchrow(
+        """
+        INSERT INTO dashboards (share_token, access_password, expires_at)
+        VALUES ($1, $2, $3)
+        RETURNING id
+        """,
+        share_token,
+        access_password,
+        expires_at,
+    )
+    assert row is not None
+    return UUID(str(row["id"]))
+
+
+async def get_dashboard_by_token(
+    conn: asyncpg.Connection,
+    share_token: str,
+) -> dict[str, Any] | None:
+    """Return dashboard row for a valid, non-expired token, or None."""
+    row = await conn.fetchrow(
+        """
+        SELECT id, share_token, access_password, expires_at
+        FROM dashboards
+        WHERE share_token = $1
+          AND (expires_at IS NULL OR expires_at > now())
+        """,
+        share_token,
+    )
+    if row is None:
+        return None
+    return dict(row)

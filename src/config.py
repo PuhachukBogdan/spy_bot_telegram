@@ -9,7 +9,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -30,7 +30,9 @@ class Settings(BaseSettings):
     # === Telegram ===
     TELEGRAM_BOT_TOKEN: SecretStr
     TELEGRAM_WEBHOOK_SECRET: SecretStr
-    TELEGRAM_WEBHOOK_URL: str
+    # Auto-derived from SERVER_BASE_URL if not explicitly set.
+    # DevOps only needs SERVER_BASE_URL; do NOT also set TELEGRAM_WEBHOOK_URL.
+    TELEGRAM_WEBHOOK_URL: str = ""
     TELEGRAM_MANAGEMENT_CHAT_ID: int | None = None
 
     # === Supabase ===
@@ -84,9 +86,6 @@ class Settings(BaseSettings):
     SLACK_SIGNING_SECRET: SecretStr
     SLACK_CHANNEL_ALERTS: str
     SLACK_CHANNEL_REPORTS: str
-
-    # === n8n system webhook ===
-    N8N_SYSTEM_WEBHOOK_URL: str | None = None
 
     # === Cost limits (Decimal — money is never float, CLAUDE.md section 9) ===
     DAILY_LLM_BUDGET_USD: Decimal = Decimal("30")
@@ -158,6 +157,14 @@ class Settings(BaseSettings):
     BOT_DM_LANGUAGE: str = "en"
     ENVIRONMENT: Literal["production", "staging", "dev"] = "production"
     LOG_LEVEL: str = "INFO"
+
+    @model_validator(mode="after")
+    def _derive_webhook_url(self) -> Settings:
+        if not self.TELEGRAM_WEBHOOK_URL:
+            self.TELEGRAM_WEBHOOK_URL = (
+                f"{self.SERVER_BASE_URL.rstrip('/')}/webhook"
+            )
+        return self
 
 
 # Singleton — import this everywhere. (The pydantic-settings mypy plugin knows

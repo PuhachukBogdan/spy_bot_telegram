@@ -21,12 +21,13 @@ Alerts (real-time Slack dispatch) are unaffected — Phase 11 format stays as-is
 
 ## Delivery
 
-- Format: `.html` file posted to Slack (SLACK_CHANNEL_WEEKLY / SLACK_CHANNEL_MONTHLY)
-- Trigger: n8n cron (weekly Monday 08:00; monthly 1st of month 08:00) — see ../n8n-workflows/
+- Format: capability-URL link posted to Slack (SLACK_CHANNEL_REPORTS)
+- Trigger: in-process scheduler `workers.summary_scheduler_loop` (weekly Monday 08:00 UTC; monthly 1st of month 08:00 UTC). On-demand via POST /summary/generate.
 - LLM narrative (optional per-manager paragraph): model = LLM_MODEL_SUMMARY (claude-sonnet)
 
 ## This module (src/summary/)
 
 - `filter.py` — noise filter: strips low-signal events before the summary builder
-- Summary HTML builder lives in n8n (Phase 16) or a future `src/summary/builder.py`
+- `builder.py` — Jinja2 HTML render (light theme), `_manager_label`, RISK_CATEGORIES
+- `generator.py` — orchestrator: DB queries → build → save (upsert) → Slack link
 - `summaries` and `summaries_skipped` DB tables already exist (migration 0001)

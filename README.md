@@ -25,7 +25,7 @@ Full project context and the phased development plan live in [`CLAUDE.md`](./CLA
 | Transcription | OpenAI Audio API (Whisper-1) |
 | Slack | `slack_sdk` (Block Kit + Events API) |
 | Queue | Postgres-as-queue (`FOR UPDATE SKIP LOCKED`) |
-| Orchestration (summaries) | n8n |
+| Orchestration (summaries) | in-process asyncio scheduler (`workers.summary_scheduler_loop`) |
 | Deploy | Docker + docker-compose, Caddy reverse proxy |
 
 ---
@@ -39,7 +39,6 @@ src/            application code (bot, db, pipeline, llm, alerts, cost, utils)
 supabase/       SQL migrations (17 tables)
 prompts/        fallback LLM prompts (DB-backed at runtime)
 tests/          unit + integration tests
-n8n-workflows/  exported n8n workflows (weekly/monthly summary, system alerts)
 ```
 
 ---
