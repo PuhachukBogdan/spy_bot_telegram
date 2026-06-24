@@ -426,8 +426,48 @@ h1,h2,.section-label,.stat-num,.heatmap td.total-cell{
 </html>
 """
 
+# Shared mobile/responsive rules, appended into every template's <style> block.
+# Injecting once (rather than duplicating in each literal) keeps the breakpoint
+# behaviour identical across the standalone report and the dashboard.
+_RESPONSIVE_CSS = """
+/* ── Responsive (phones / small tablets) ─────────── */
+@media (max-width:768px){
+  body{font-size:13.5px}
+  .page-header{padding:18px 16px 0}
+  .page-header h1{font-size:20px}
+  .page-header .meta{font-size:12px;margin-bottom:16px}
+  .stat-strip{border-top:none}
+  .stat-cell{padding:10px 16px 12px}
+  .stat-cell:first-child{padding-left:0}
+  .stat-num{font-size:18px}
+  /* The manager jump-nav collapses on small screens; the heatmap (with its own
+     manager links) and the header stat-strip carry navigation + overview. */
+  .layout{grid-template-columns:1fr}
+  .sidebar{display:none}
+  .main{padding:22px 14px}
+  .section-label{margin-bottom:10px}
+  /* Wide heatmap scrolls horizontally with iOS momentum instead of squashing. */
+  .heatmap-wrap{margin-bottom:34px;-webkit-overflow-scrolling:touch}
+  .mgr-section{margin-bottom:34px}
+  .mgr-header h2{font-size:16px}
+  .event{padding:13px 14px}
+  .event-header{gap:7px}
+  .ev-partner{font-size:13.5px}
+  .ev-date{margin-left:0}
+  .dash-tabs{padding:0 10px}
+  .tab-btn{padding:13px 14px;font-size:12.5px}
+  .tab-empty{padding:48px 18px}
+}
+"""
+
+
+def _with_responsive(tpl: str) -> str:
+    """Append the shared responsive rules just before the template's </style>."""
+    return tpl.replace("</style>", _RESPONSIVE_CSS + "</style>", 1)
+
+
 _env = Environment(autoescape=True)
-_template = _env.from_string(_TEMPLATE)
+_template = _env.from_string(_with_responsive(_TEMPLATE))
 
 
 # ---------------------------------------------------------------------------
@@ -829,7 +869,7 @@ function showTab(name) {
 </html>
 """
 
-_dash_template = _env.from_string(_DASHBOARD_TEMPLATE)
+_dash_template = _env.from_string(_with_responsive(_DASHBOARD_TEMPLATE))
 
 
 def build_dashboard_html(
