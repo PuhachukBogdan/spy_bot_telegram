@@ -16,7 +16,8 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 from aiogram.types import Update
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Form, Request, Response
+from fastapi.responses import RedirectResponse
 
 # Logging must be configured before anything else logs.
 from src.utils.logging import get_logger, setup_logging
@@ -46,6 +47,16 @@ from src.summary.builder import build_dashboard_html  # noqa: E402
 from src.summary.generator import generate_report  # noqa: E402
 
 log = get_logger(__name__)
+
+# Auth cookie lifetime — keeps the browser session alive across F5 reloads
+# without re-prompting, but a fresh tab (no cookie) always requires the password.
+_COOKIE_MAX_AGE = 86400  # 24 h
+
+
+def _auth_cookie(prefix: str, token: str) -> str:
+    """Stable cookie name scoped to this specific token."""
+    return f"{prefix}_{token[:16]}"
+
 
 # Header Telegram sends with each webhook call, echoing the secret we registered.
 _SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
@@ -266,7 +277,7 @@ def _pw_form(*, title: str, action: str, error: bool = False) -> str:
         "</style></head><body>"
         f'<div class="card"><h1>{t}</h1>'
         '<p class="sub">Enter the access password from Slack.</p>'
-        f'<form method="get" action="{a}">'
+        f'<form method="post" action="{a}">'
         '<input type="password" name="pw" placeholder="Password" autofocus autocomplete="off">'
         "<button type=\"submit\">Open Report</button>"
         f"{err}"
@@ -275,13 +286,12 @@ def _pw_form(*, title: str, action: str, error: bool = False) -> str:
 
 
 @app.get("/r/{share_token}")
-async def get_report(share_token: str, pw: str = "") -> Response:
+async def get_report(share_token: str, request: Request) -> Response:
     """Serve a pre-rendered HTML report by its capability token.
 
-    URL shape: GET /r/<64-char-hex>?pw=<password>
-    Returns 404 for unknown or expired tokens. Reports with an access_password
-    require the correct ?pw= value; older reports without a password are served
-    directly (backward-compatible).
+    Password-gated: POST /r/{token} verifies the password and sets an auth
+    cookie; subsequent GET requests in the same browser session bypass the form.
+    A fresh tab (no cookie) always shows the password prompt.
     """
     async with acquire_connection() as conn:
         row = await get_summary_by_share_token(conn, share_token)
@@ -289,36 +299,60 @@ async def get_report(share_token: str, pw: str = "") -> Response:
         return Response(status_code=404)
     access_pw: str | None = row.get("access_password")
     if access_pw:
-        if not pw or not hmac.compare_digest(pw, access_pw):
+        cookie = _auth_cookie("r", share_token)
+        if request.cookies.get(cookie) != "1":
             return Response(
-                content=_pw_form(
-                    title="Risk Report",
-                    action=f"/r/{share_token}",
-                    error=bool(pw),
-                ),
+                content=_pw_form(title="Risk Report", action=f"/r/{share_token}"),
                 media_type="text/html",
             )
     return Response(content=row["rendered_html"], media_type="text/html")
 
 
+@app.post("/r/{share_token}")
+async def post_report_auth(
+    share_token: str, pw: str = Form("")
+) -> Response:
+    """Verify report password; on success set auth cookie and redirect to GET."""
+    async with acquire_connection() as conn:
+        row = await get_summary_by_share_token(conn, share_token)
+    if row is None:
+        return Response(status_code=404)
+    access_pw: str | None = row.get("access_password")
+    if not access_pw or not pw or not hmac.compare_digest(pw, access_pw):
+        return Response(
+            content=_pw_form(title="Risk Report", action=f"/r/{share_token}", error=True),
+            media_type="text/html",
+        )
+    redirect = RedirectResponse(url=f"/r/{share_token}", status_code=303)
+    redirect.set_cookie(
+        key=_auth_cookie("r", share_token),
+        value="1",
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=_COOKIE_MAX_AGE,
+    )
+    return redirect
+
+
 @app.get("/dashboard/{share_token}")
-async def get_dashboard(share_token: str, pw: str = "") -> Response:
+async def get_dashboard(share_token: str, request: Request) -> Response:
     """Serve the tabbed dashboard with the latest weekly and monthly reports.
 
-    URL shape: GET /dashboard/<64-char-hex>?pw=<password>
-    Returns 404 for unknown or expired tokens. Always requires the access
-    password set when the dashboard was created.
+    Password-gated: POST /dashboard/{token} verifies the password and sets an
+    auth cookie; subsequent GET requests in the same browser session bypass the
+    form. A fresh tab (no cookie) always shows the password prompt.
     """
     async with acquire_connection() as conn:
         dash = await get_dashboard_by_token(conn, share_token)
     if dash is None:
         return Response(status_code=404)
-    if not pw or not hmac.compare_digest(pw, str(dash["access_password"])):
+    cookie = _auth_cookie("d", share_token)
+    if request.cookies.get(cookie) != "1":
         return Response(
             content=_pw_form(
                 title="Risk Reports Dashboard",
                 action=f"/dashboard/{share_token}",
-                error=bool(pw),
             ),
             media_type="text/html",
         )
@@ -329,6 +363,36 @@ async def get_dashboard(share_token: str, pw: str = "") -> Response:
         weekly_html=weekly_html, monthly_html=monthly_html
     )
     return Response(content=dashboard_html, media_type="text/html")
+
+
+@app.post("/dashboard/{share_token}")
+async def post_dashboard_auth(
+    share_token: str, pw: str = Form("")
+) -> Response:
+    """Verify dashboard password; on success set auth cookie and redirect to GET."""
+    async with acquire_connection() as conn:
+        dash = await get_dashboard_by_token(conn, share_token)
+    if dash is None:
+        return Response(status_code=404)
+    if not pw or not hmac.compare_digest(pw, str(dash["access_password"])):
+        return Response(
+            content=_pw_form(
+                title="Risk Reports Dashboard",
+                action=f"/dashboard/{share_token}",
+                error=True,
+            ),
+            media_type="text/html",
+        )
+    redirect = RedirectResponse(url=f"/dashboard/{share_token}", status_code=303)
+    redirect.set_cookie(
+        key=_auth_cookie("d", share_token),
+        value="1",
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=_COOKIE_MAX_AGE,
+    )
+    return redirect
 
 
 def _json(payload: dict[str, object], status_code: int = 200) -> Response:
