@@ -148,7 +148,7 @@ async def fetch_incidents(
 
     @retry(stop=stop_after_attempt(retries), wait=wait_fixed(retry_delay_seconds))
     async def _get() -> str:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
             resp = await client.get(url)
             resp.raise_for_status()
             return resp.text
