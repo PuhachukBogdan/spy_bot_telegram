@@ -203,13 +203,35 @@ def test_find_tomorrow_holiday_year_boundary() -> None:
 def test_templates_escape_html() -> None:
     inc = Incident(
         incident_id="i1", country="Chile", provider="Webpay",
-        issue="<b>x</b>", link="https://x/i1", details="a & b <script>",
+        issue="<b>x</b>", link="https://x/i1", details="a & b <script>alert(1)</script>",
         status="In progress", iso_date=None,
     )
     new = format_new_incident(inc, detected_at="now")
     upd = format_update(inc, updated_at="now")
-    assert "<script>" not in new and "&lt;script&gt;" in new
+    # The issue field is escaped — never rendered as live HTML.
+    assert "<b>x</b>" not in new and "&lt;b&gt;x&lt;/b&gt;" in new
+    # details HTML is STRIPPED (not escaped-and-shown): no raw tag survives, but
+    # the surrounding text is preserved with its ampersand re-escaped.
+    assert "<script>" not in new and "<script>" not in upd
+    assert "&lt;script&gt;" not in upd  # tag stripped, not rendered as text
     assert "&amp; b" in upd
+
+
+def test_incident_templates_do_not_leak_source() -> None:
+    """The feed's status-page URL / incident id must never reach a partner group."""
+    inc = Incident(
+        incident_id="kcl0h1z62jjs", country="Chile", provider="Santander",
+        issue="Decrease in Conversion Rates",
+        link="https://status.d24.com/incidents/kcl0h1z62jjs",
+        details='<p>Resolved - see <a href="https://status.d24.com/x">status</a></p>',
+        status="Resolved", iso_date=None,
+    )
+    new = format_new_incident(inc, detected_at="now")
+    upd = format_update(inc, updated_at="now")
+    for out in (new, upd):
+        assert "d24" not in out.lower()        # no source-provider name
+        assert "http" not in out.lower()       # no link rendered at all
+        assert inc.incident_id not in out      # no internal incident id
 
 
 def test_format_update_resolved_header() -> None:
