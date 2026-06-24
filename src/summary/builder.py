@@ -466,8 +466,8 @@ _RESPONSIVE_CSS = """
   .event-header{gap:7px}
   .ev-partner{font-size:13.5px}
   .ev-date{margin-left:0}
-  .dash-tabs{padding:0 10px}
-  .tab-btn{padding:13px 14px;font-size:12.5px}
+  .dash-tabs{padding:0 12px;height:48px}
+  .tab-btn{padding:7px 14px;font-size:12.5px}
   .tab-empty{padding:48px 18px}
 }
 """
@@ -644,24 +644,25 @@ h1,h2,.section-label,.stat-num,.heatmap td.total-cell{
 /* ── Accent bar ──────────────────────────────────── */
 .accent-bar{height:3px;background:var(--accent)}
 
-/* ── Tab bar ─────────────────────────────────────── */
+/* ── Tab bar (segmented control) ─────────────────── */
 .dash-tabs{
-  display:flex;gap:0;
+  display:flex;align-items:center;gap:6px;
+  height:52px;
   background:var(--surface);
   border-bottom:1px solid var(--border);
   padding:0 36px;
   position:sticky;top:0;z-index:100;
 }
 .tab-btn{
-  padding:14px 20px;
-  font-size:13px;font-weight:600;color:var(--text-3);
+  padding:7px 18px;
+  font-size:13px;font-weight:600;color:var(--text-2);
   border:none;background:none;cursor:pointer;
-  border-bottom:3px solid transparent;
-  transition:color .15s,border-color .15s;
+  border-radius:8px;
+  transition:background .15s,color .15s;
   font-family:'Inter',sans-serif;
 }
-.tab-btn:hover{color:var(--text-1)}
-.tab-btn.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tab-btn:hover{background:var(--surface-2);color:var(--text-1)}
+.tab-btn.active{color:var(--accent);background:var(--accent-dim)}
 
 /* ── Tab panels ──────────────────────────────────── */
 .tab-panel{display:none}
@@ -702,7 +703,7 @@ h1,h2,.section-label,.stat-num,.heatmap td.total-cell{
 
 /* ── Sidebar ─────────────────────────────────────── */
 .sidebar{
-  position:sticky;top:47px;height:calc(100vh - 47px);
+  position:sticky;top:52px;height:calc(100vh - 52px);
   overflow-y:auto;background:var(--surface);
   border-right:1px solid var(--border);
   padding:24px 14px;
@@ -857,8 +858,8 @@ h1,h2,.section-label,.stat-num,.heatmap td.total-cell{
 <body>
 <div class="accent-bar"></div>
 <div class="dash-tabs">
-  <button class="tab-btn active" data-tab="weekly" onclick="showTab('weekly')">7️⃣ Weekly</button>
-  <button class="tab-btn" data-tab="monthly" onclick="showTab('monthly')">3️⃣0️⃣ Monthly</button>
+  <button class="tab-btn active" data-tab="weekly" onclick="showTab('weekly')">Weekly</button>
+  <button class="tab-btn" data-tab="monthly" onclick="showTab('monthly')">Monthly</button>
 </div>
 
 <div id="panel-weekly" class="tab-panel active">
