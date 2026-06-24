@@ -440,10 +440,22 @@ _RESPONSIVE_CSS = """
   .stat-cell{padding:10px 16px 12px}
   .stat-cell:first-child{padding-left:0}
   .stat-num{font-size:18px}
-  /* The manager jump-nav collapses on small screens; the heatmap (with its own
-     manager links) and the header stat-strip carry navigation + overview. */
+  /* The manager jump-nav becomes a horizontal scrolling chip ribbon. */
   .layout{grid-template-columns:1fr}
-  .sidebar{display:none}
+  .sidebar{
+    position:static;height:auto;
+    border-right:none;border-bottom:1px solid var(--border);
+    padding:12px 14px;
+    display:flex;flex-direction:row;align-items:center;gap:8px;
+    overflow-x:auto;-webkit-overflow-scrolling:touch;
+  }
+  .sidebar-label{flex:0 0 auto;margin:0 4px 0 0;padding:0}
+  .sb-item{
+    flex:0 0 auto;margin-bottom:0;
+    background:var(--surface-2);border:1px solid var(--border);
+    border-radius:999px;padding:6px 12px;
+  }
+  .sb-item .sb-name{flex:0 1 auto;max-width:150px}
   .main{padding:22px 14px}
   .section-label{margin-bottom:10px}
   /* Wide heatmap scrolls horizontally with iOS momentum instead of squashing. */
@@ -845,8 +857,8 @@ h1,h2,.section-label,.stat-num,.heatmap td.total-cell{
 <body>
 <div class="accent-bar"></div>
 <div class="dash-tabs">
-  <button class="tab-btn active" data-tab="weekly" onclick="showTab('weekly')">📊 Weekly</button>
-  <button class="tab-btn" data-tab="monthly" onclick="showTab('monthly')">📅 Monthly</button>
+  <button class="tab-btn active" data-tab="weekly" onclick="showTab('weekly')">7️⃣ Weekly</button>
+  <button class="tab-btn" data-tab="monthly" onclick="showTab('monthly')">3️⃣0️⃣ Monthly</button>
 </div>
 
 <div id="panel-weekly" class="tab-panel active">
