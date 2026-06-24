@@ -553,6 +553,25 @@ async def list_stale_pending_chats(
     return [Chat.from_record(row) for row in rows]
 
 
+async def list_active_group_chats(conn: asyncpg.Connection) -> list[Chat]:
+    """Active *group* units — the broadcast target for ops-alerts.
+
+    Returns only ``unit_type='group'`` rows with ``status='active'``: forum
+    topics and Business private chats are intentionally excluded (ops alerts go
+    to real partner groups only). Callers send to ``telegram_chat_id`` and record
+    the message under ``id``.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT *
+        FROM chats
+        WHERE status = 'active' AND unit_type = 'group'
+        ORDER BY created_at ASC
+        """
+    )
+    return [Chat.from_record(row) for row in rows]
+
+
 async def mark_chat_abandoned(
     conn: asyncpg.Connection, telegram_chat_id: int, thread_id: int | None
 ) -> Chat | None:

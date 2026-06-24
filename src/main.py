@@ -33,6 +33,7 @@ from src.db.queries.summaries import (  # noqa: E402
     get_latest_summary_html,
     get_summary_by_share_token,
 )
+from src.pipeline.ops_alerts.scheduler import start_ops_alerts, stop_ops_alerts  # noqa: E402
 from src.pipeline.tier1 import pattern_cache  # noqa: E402
 from src.pipeline.workers import (  # noqa: E402
     abandoned_chat_cleanup_loop,
@@ -127,9 +128,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     summary_task = asyncio.create_task(
         summary_scheduler_loop(), name="summary_scheduler"
     )
+    ops_alerts_tasks = start_ops_alerts(bot)
     log.info("startup.whisper.worker", enabled=settings.WHISPER_ENABLED)
     log.info("startup.file_analysis.worker", enabled=settings.FILE_ANALYSIS_ENABLED)
     log.info("startup.summary_scheduler.worker")
+    log.info("startup.ops_alerts.worker", enabled=settings.OPS_ALERTS_ENABLED)
 
     try:
         yield
@@ -143,6 +146,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        await stop_ops_alerts(ops_alerts_tasks)
 
         # Do NOT delete_webhook on shutdown: Railway rolling deploys start the
         # new container before stopping the old one, so delete_webhook from the

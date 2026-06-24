@@ -41,6 +41,8 @@ dependencies = [
     "openpyxl>=3.1",
     # HTML report templating (Phase 16)
     "jinja2>=3.1",
+    # RSS parsing for the ops-alerts payment-incident monitor
+    "feedparser>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -92,4 +94,8 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["docx", "docx.*", "openpyxl", "openpyxl.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["feedparser", "feedparser.*"]
 ignore_missing_imports = true

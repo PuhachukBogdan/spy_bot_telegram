@@ -153,6 +153,23 @@ class Settings(BaseSettings):
     # Public base URL of this server, used to build the report link posted to Slack.
     SERVER_BASE_URL: str = "http://localhost:8080"
 
+    # === Ops Alerts (payment-provider incidents + Argentina holidays) ===
+    # Master kill-switch: when false neither ops-alerts worker runs.
+    OPS_ALERTS_ENABLED: bool = False
+    # External RSS feed with payment-provider statuses. Sensitive — set at deploy,
+    # never hardcoded. Empty disables the incidents branch even if OPS_ALERTS_ENABLED.
+    OPS_FEED_URL: SecretStr | None = None
+    OPS_INCIDENTS_POLL_INTERVAL_SECONDS: int = 600
+    OPS_FEED_HTTP_RETRIES: int = 3
+    OPS_FEED_HTTP_RETRY_DELAY_SECONDS: int = 5
+    # Argentina holiday reminder: checked daily at this local hour/timezone.
+    OPS_HOLIDAYS_TIMEZONE: str = "Europe/Madrid"
+    OPS_HOLIDAYS_CRON_HOUR: int = 13
+    # How often the holiday loop wakes to check whether today's slot is due.
+    OPS_HOLIDAYS_POLL_INTERVAL_SECONDS: int = 900
+    # Max parallel group sends, to stay under Telegram's ~30 chats/sec limit.
+    OPS_BROADCAST_SEMAPHORE: int = 20
+
     # === Bot ===
     BOT_DM_LANGUAGE: str = "en"
     ENVIRONMENT: Literal["production", "staging", "dev"] = "production"
