@@ -103,6 +103,28 @@ async def post_alert(
     return str(ts)
 
 
+async def update_alert(
+    *,
+    channel: str,
+    ts: str,
+    text: str,
+    blocks: list[dict[str, Any]],
+) -> None:
+    """Edit an already-posted alert in place (case escalation).
+
+    Re-renders the card on the existing message ``ts`` so an open case stays one
+    card instead of spawning a second alert. Any failure raises
+    :class:`SlackDeliveryError`, like :func:`post_alert`.
+    """
+    client = get_slack_client()
+    try:
+        await client.chat_update(channel=channel, ts=ts, text=text, blocks=blocks)
+    except SlackApiError as exc:
+        raise SlackDeliveryError(str(exc.response.get("error", exc))) from exc
+    except Exception as exc:  # transport / connection error after the SDK's retries
+        raise SlackDeliveryError(str(exc)) from exc
+
+
 def _risk_type_label(risk_type: str) -> str:
     """``private_channel`` -> ``Private Channel`` for the human-facing card."""
     return risk_type.replace("_", " ").title()
@@ -115,12 +137,16 @@ def build_alert_blocks(
     *,
     mention_prefix: str = "",
     include_actions: bool = True,
+    case_note: str | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Render one risk event into (Block Kit blocks, fallback text).
 
     ``mention_prefix`` (e.g. ``"<@U123> "``) is prepended for critical pings.
     ``include_actions=False`` omits the review buttons — used when updating an
     already-reviewed message so the buttons cannot be clicked a second time.
+    ``case_note`` (e.g. ``"Case: 3 signals · latest: …"``) is shown when an open
+    case's card is being updated in place, so the card reads as a developing case
+    rather than a single moment.
     """
     badge = _LEVEL_BADGE.get(event.risk_level, event.risk_level.upper())
     partner = partner_name or "—"  # —
@@ -140,6 +166,12 @@ def build_alert_blocks(
     )
     blocks: list[dict[str, Any]] = [
         {"type": "section", "text": {"type": "mrkdwn", "text": header}},
+    ]
+    if case_note:
+        blocks.append(
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"🔁 {case_note}"}]}
+        )
+    blocks += [
         {
             "type": "section",
             "fields": [

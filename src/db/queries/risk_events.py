@@ -194,6 +194,30 @@ async def find_recent_alert_ts(
     return str(ts) if ts is not None else None
 
 
+async def list_case_events(
+    conn: asyncpg.Connection, *, chat_id: UUID, risk_type: str, since: datetime
+) -> list[RiskEvent]:
+    """Full risk_events rows of one open case: (chat, risk_type) since ``since``.
+
+    Drives the case-update card (the risk-case window): all the findings that share
+    one case, oldest first, so the dispatcher can render the most-severe one and
+    count how many signals the case now spans. Returns full rows (not the overview
+    projection) because the card builder needs the LLM verdict/explanation.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT *
+        FROM risk_events
+        WHERE chat_id = $1 AND risk_type = $2 AND created_at >= $3
+        ORDER BY created_at ASC
+        """,
+        chat_id,
+        risk_type,
+        since,
+    )
+    return [RiskEvent.from_record(row) for row in rows]
+
+
 async def update_status(
     conn: asyncpg.Connection,
     risk_event_id: UUID,

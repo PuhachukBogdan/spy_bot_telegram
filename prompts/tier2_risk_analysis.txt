@@ -21,6 +21,23 @@ CRITICAL INSTRUCTIONS
 - Put the ids of the surrounding messages that establish the risk in
   context_message_ids.
 
+CONSOLIDATION — ONE FINDING PER EPISODE (important)
+- A "risk episode" is one concern playing out across one or more messages: an
+  opening line, its follow-ups, and the agreement that confirms it. Report ONE
+  finding for the whole episode, NOT one finding per message.
+- Anchor the finding on the single KEY message (message_id) — the most
+  incriminating one, usually the message that first raises the risk. Put every
+  other message of the same episode (later confirmations, the "yes, let's do it")
+  in context_message_ids. Score and confidence reflect the whole episode.
+- Only split into separate findings when the messages are genuinely DIFFERENT
+  risks — a different risk_type, or a clearly unrelated, separate concern.
+- Example (report ONE finding, not two):
+    msg A: "Привет. А если попробуем обойти платёжку? Тебе такой вариант подходит?"
+    msg B: "Думаю, вполне себе."
+  → one hidden_payment finding: message_id = A (the key proposal),
+    context_message_ids = [B] (the agreement). Never one finding for A and another
+    for B — that is the same case and must not be reported twice.
+
 Use ONLY these values for risk_type:
   shadow_deal       - arranging business outside the official platform or terms
   private_channel   - moving the conversation to a private or off-record channel

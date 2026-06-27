@@ -92,7 +92,13 @@ class RiskLevel(StrEnum):
 
 
 class RiskFinding(BaseModel):
-    """One risk the LLM attributes to a flagged message (pipeline §7.6 output).
+    """One risk *episode* the LLM attributes to a single anchor message (§7.6 output).
+
+    A finding is ONE episode, not one message. When several messages form a single
+    risk episode (an opening line plus its follow-ups / the agreement that confirms
+    it), report ONE finding anchored on the key message and list the rest in
+    ``context_message_ids`` — do not emit a separate finding per message. This is
+    what keeps the alert layer from spamming one case as N alerts.
 
     ``score`` 0-100 and ``confidence`` 0-1 are both bounded so a malformed model
     response fails validation rather than poisoning downstream scoring. A benign-
@@ -102,7 +108,13 @@ class RiskFinding(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    message_id: str = Field(description="UUID of the flagged message this risk is for")
+    message_id: str = Field(
+        description=(
+            "UUID of the single KEY message that anchors this risk episode — the "
+            "most incriminating one (usually the message that first establishes the "
+            "risk). Report only ONE finding per episode; never one per message."
+        )
+    )
     risk_type: RiskType = Field(description="One of the 12 risk categories")
     score: int = Field(ge=0, le=100, description="Risk score 0-100")
     confidence: float = Field(ge=0.0, le=1.0, description="LLM confidence 0-1")
@@ -111,7 +123,10 @@ class RiskFinding(BaseModel):
     )
     context_message_ids: list[str] = Field(
         default_factory=list,
-        description="UUIDs of surrounding messages that establish the risk",
+        description=(
+            "UUIDs of the OTHER messages in this same episode — surrounding lines, "
+            "follow-ups, or the agreement that confirm the risk anchored above"
+        ),
     )
 
 

@@ -108,10 +108,15 @@ class Settings(BaseSettings):
     # Real-time alerts fire only at/above this level; lower levels are stored and
     # surface in the weekly/monthly summary instead. Locked: high + critical.
     ALERT_MIN_RISK_LEVEL: Literal["low", "medium", "high", "critical"] = "high"
-    # Alert cooldown (Phase 11): a repeat risk of the SAME type in the SAME chat
-    # within this window is threaded under the prior Slack alert instead of firing a
-    # fresh channel ping. Critical alerts and a never-seen risk type bypass it.
+    # Alert cooldown (Phase 11, legacy): superseded by RISK_CASE_WINDOW_MINUTES
+    # below. Kept for config compatibility; the dispatch path no longer reads it.
     ALERT_COOLDOWN_MINUTES: int = 60
+    # Risk-case window: a new alertable risk of the SAME type in the SAME chat
+    # within this window belongs to the SAME open "case" — its Slack card is updated
+    # in place (escalation) instead of posting a fresh top-level alert, so one case
+    # is one card no matter how many messages it spans. Applies to critical too. A
+    # risk type with no open case in the window opens a fresh card.
+    RISK_CASE_WINDOW_MINUTES: int = 30
 
     # === Tier-2 analysis worker (unified batch + priority lane, decision A) ===
     # One per-chat analyze_chat task; the worker polls this often for due tasks

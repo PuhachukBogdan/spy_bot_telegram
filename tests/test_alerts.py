@@ -16,7 +16,7 @@ import pytest
 
 from src.alerts import dispatch as dispatch_mod
 from src.alerts.critical import critical_mention_prefix
-from src.alerts.dedup import resolve_thread_ts
+from src.alerts.dedup import resolve_open_case_ts
 from src.alerts.slack import SlackDeliveryError, build_alert_blocks
 from src.db.models import Chat, RiskEvent
 from tests.conftest import FakeBot
@@ -88,7 +88,7 @@ def test_blocks_fallbacks_when_partner_and_name_missing() -> None:
     assert "chat -1001234567890" in str(blocks)
 
 
-# --- resolve_thread_ts (cooldown policy) -------------------------------------
+# --- resolve_open_case_ts (case policy) --------------------------------------
 
 
 class _FetchvalConn:
@@ -101,31 +101,28 @@ class _FetchvalConn:
         return self._value
 
 
-async def test_critical_bypasses_cooldown_without_querying() -> None:
-    conn = _FetchvalConn("1700.0001")
-    ts = await resolve_thread_ts(
-        conn,  # type: ignore[arg-type]
-        chat_id=uuid4(),
-        risk_type="private_channel",
-        is_critical=True,
-    )
-    assert ts is None
-    assert conn.calls == []  # critical never looks up a thread
-
-
-async def test_non_critical_threads_under_recent_alert() -> None:
+async def test_open_case_returns_recent_alert_ts() -> None:
     conn = _FetchvalConn("1700.0001")
     chat_id = uuid4()
-    ts = await resolve_thread_ts(
+    ts = await resolve_open_case_ts(
         conn,  # type: ignore[arg-type]
         chat_id=chat_id,
         risk_type="private_channel",
-        is_critical=False,
     )
     assert ts == "1700.0001"
-    # Queried with (chat_id, risk_type, since-cutoff).
+    # Queried with (chat_id, risk_type, since-cutoff) — critical included, no bypass.
     assert conn.calls[0][0] == chat_id
     assert conn.calls[0][1] == "private_channel"
+
+
+async def test_no_open_case_returns_none() -> None:
+    conn = _FetchvalConn(None)
+    ts = await resolve_open_case_ts(
+        conn,  # type: ignore[arg-type]
+        chat_id=uuid4(),
+        risk_type="private_channel",
+    )
+    assert ts is None
 
 
 # --- critical_mention_prefix -------------------------------------------------
@@ -174,24 +171,43 @@ class _NullAcquire:
 
 @pytest.fixture
 def patched_dispatch(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """Patch dispatch's collaborators; return recorders for assertions."""
-    rec: dict[str, Any] = {"posts": [], "ts_writes": [], "failures": []}
+    """Patch dispatch's collaborators; return recorders for assertions.
+
+    ``case_ts`` controls whether an open case exists (None → fresh card, a ts →
+    update in place). ``case_events`` is what ``list_case_events`` returns when a
+    case is updated. ``post_raises`` / ``update_raises`` simulate Slack failures.
+    """
+    rec: dict[str, Any] = {
+        "posts": [],
+        "updates": [],
+        "ts_writes": [],
+        "failures": [],
+        "case_events": [],
+    }
 
     monkeypatch.setattr(dispatch_mod, "acquire_connection", lambda: _NullAcquire())
 
     async def fake_resolve(conn: Any, **kw: Any) -> str | None:
-        return rec.get("thread_ts")
+        return rec.get("case_ts")
 
     async def fake_mentions(conn: Any) -> str:
         return rec.get("mention_prefix", "")
 
+    async def fake_list(conn: Any, **kw: Any) -> list[Any]:
+        return rec["case_events"]
+
     async def fake_post(
         *, channel: str, text: str, blocks: Any, thread_ts: str | None = None
     ) -> str:
-        rec["posts"].append({"channel": channel, "thread_ts": thread_ts})
+        rec["posts"].append({"channel": channel, "thread_ts": thread_ts, "text": text})
         if rec.get("post_raises"):
             raise SlackDeliveryError("channel_not_found")
         return "1700000000.000100"
+
+    async def fake_update(*, channel: str, ts: str, text: str, blocks: Any) -> None:
+        rec["updates"].append({"channel": channel, "ts": ts, "text": text})
+        if rec.get("update_raises"):
+            raise SlackDeliveryError("edit_failed")
 
     async def fake_set(conn: Any, rid: Any, ts: str) -> None:
         rec["ts_writes"].append((rid, ts))
@@ -199,52 +215,95 @@ def patched_dispatch(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     async def fake_failed(bot: Any, event: Any, channel: str, error: str) -> None:
         rec["failures"].append((event.id, channel, error))
 
-    monkeypatch.setattr(dispatch_mod, "resolve_thread_ts", fake_resolve)
+    monkeypatch.setattr(dispatch_mod, "resolve_open_case_ts", fake_resolve)
     monkeypatch.setattr(dispatch_mod, "critical_mention_prefix", fake_mentions)
+    monkeypatch.setattr(dispatch_mod, "list_case_events", fake_list)
     monkeypatch.setattr(dispatch_mod, "post_alert", fake_post)
+    monkeypatch.setattr(dispatch_mod, "update_alert", fake_update)
     monkeypatch.setattr(dispatch_mod, "set_slack_message_ts", fake_set)
     monkeypatch.setattr(dispatch_mod, "handle_failed_alert", fake_failed)
     monkeypatch.setattr(dispatch_mod.settings, "SLACK_CHANNEL_ALERTS", "#alerts")
     return rec
 
 
-async def test_high_alert_posts_to_alerts_channel_and_writes_ts(
+async def test_fresh_case_posts_top_level_and_writes_ts(
     patched_dispatch: dict[str, Any],
 ) -> None:
+    patched_dispatch["case_ts"] = None  # no open case
     event = _event(level="high")
     await dispatch_mod.dispatch_alerts(FakeBot(), _chat("c"), "Acme", [event])  # type: ignore[arg-type]
     assert len(patched_dispatch["posts"]) == 1
     assert patched_dispatch["posts"][0]["channel"] == "#alerts"
+    assert patched_dispatch["posts"][0]["thread_ts"] is None  # top-level
+    assert patched_dispatch["updates"] == []
     assert patched_dispatch["ts_writes"] == [(event.id, "1700000000.000100")]
     assert patched_dispatch["failures"] == []
 
 
-async def test_critical_alert_pings_and_posts_to_alerts(
+async def test_open_case_updates_card_in_place_no_new_post(
     patched_dispatch: dict[str, Any],
 ) -> None:
-    patched_dispatch["mention_prefix"] = "<@U1> "
-    event = _event(level="critical", score=90)
-    await dispatch_mod.dispatch_alerts(FakeBot(), _chat("c"), "Acme", [event])  # type: ignore[arg-type]
-    channels = [p["channel"] for p in patched_dispatch["posts"]]
-    assert channels == ["#alerts"]
-    assert patched_dispatch["ts_writes"] == [(event.id, "1700000000.000100")]
-
-
-async def test_threaded_repeat_passes_thread_ts(
-    patched_dispatch: dict[str, Any],
-) -> None:
-    patched_dispatch["thread_ts"] = "1699999999.000001"
+    patched_dispatch["case_ts"] = "1699999999.000001"
     event = _event(level="high")
+    patched_dispatch["case_events"] = [event]  # single-signal case, no escalation
     await dispatch_mod.dispatch_alerts(FakeBot(), _chat("c"), "Acme", [event])  # type: ignore[arg-type]
-    assert patched_dispatch["posts"][0]["thread_ts"] == "1699999999.000001"
+    assert len(patched_dispatch["updates"]) == 1
+    assert patched_dispatch["updates"][0]["ts"] == "1699999999.000001"
+    assert patched_dispatch["posts"] == []  # no second alert
+    # The finding joins the existing case card.
+    assert patched_dispatch["ts_writes"] == [(event.id, "1699999999.000001")]
 
 
-async def test_delivery_failure_records_and_skips_ts_write(
+async def test_case_escalation_into_critical_pings_in_thread(
     patched_dispatch: dict[str, Any],
 ) -> None:
+    patched_dispatch["case_ts"] = "1699999999.000001"
+    patched_dispatch["mention_prefix"] = "<@U1> "
+    prior = _event(level="high", score=72)
+    event = _event(level="critical", score=90)
+    patched_dispatch["case_events"] = [prior, event]  # case had no critical before
+    await dispatch_mod.dispatch_alerts(FakeBot(), _chat("c"), "Acme", [event])  # type: ignore[arg-type]
+    assert len(patched_dispatch["updates"]) == 1  # card edited in place
+    assert len(patched_dispatch["posts"]) == 1  # one threaded re-ping
+    ping = patched_dispatch["posts"][0]
+    assert ping["thread_ts"] == "1699999999.000001"
+    assert ping["text"].startswith("<@U1> ")
+    assert patched_dispatch["ts_writes"] == [(event.id, "1699999999.000001")]
+
+
+async def test_already_critical_case_does_not_reping(
+    patched_dispatch: dict[str, Any],
+) -> None:
+    patched_dispatch["case_ts"] = "1699999999.000001"
+    patched_dispatch["mention_prefix"] = "<@U1> "
+    prior = _event(level="critical", score=85)
+    event = _event(level="critical", score=90)
+    patched_dispatch["case_events"] = [prior, event]  # already critical → no new ping
+    await dispatch_mod.dispatch_alerts(FakeBot(), _chat("c"), "Acme", [event])  # type: ignore[arg-type]
+    assert len(patched_dispatch["updates"]) == 1
+    assert patched_dispatch["posts"] == []
+
+
+async def test_fresh_case_delivery_failure_records_and_skips_ts_write(
+    patched_dispatch: dict[str, Any],
+) -> None:
+    patched_dispatch["case_ts"] = None
     patched_dispatch["post_raises"] = True
     event = _event(level="high")
     await dispatch_mod.dispatch_alerts(FakeBot(), _chat("c"), "Acme", [event])  # type: ignore[arg-type]
     assert patched_dispatch["ts_writes"] == []  # never wrote a ts
     assert len(patched_dispatch["failures"]) == 1
     assert patched_dispatch["failures"][0][1] == "#alerts"
+
+
+async def test_case_update_failure_records_and_skips_ts_write(
+    patched_dispatch: dict[str, Any],
+) -> None:
+    patched_dispatch["case_ts"] = "1699999999.000001"
+    patched_dispatch["update_raises"] = True
+    event = _event(level="high")
+    patched_dispatch["case_events"] = [event]
+    await dispatch_mod.dispatch_alerts(FakeBot(), _chat("c"), "Acme", [event])  # type: ignore[arg-type]
+    assert len(patched_dispatch["updates"]) == 1  # attempted
+    assert patched_dispatch["ts_writes"] == []  # never wrote a ts
+    assert len(patched_dispatch["failures"]) == 1
