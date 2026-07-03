@@ -100,11 +100,16 @@ def _incident(incident_id: str = "INC1", status: str = "In progress") -> Inciden
 
 
 def test_extract_latest_status_in_progress() -> None:
-    assert extract_latest_status("\nIn progress - 12:00") == "In progress"
+    assert extract_latest_status("<p><strong>In progress</strong> - 12:00</p>") == "In progress"
 
 
 def test_extract_latest_status_resolved() -> None:
-    assert extract_latest_status("\nResolved - done") == "Resolved"
+    # Newest update is the first <strong> in the summary HTML; older ones follow.
+    summary = (
+        "<p><small>Jul 2, 20:46 UTC</small><br /> <strong>Resolved</strong> - done</p>"
+        "<p><small>Jul 2, 20:36 UTC</small><br /> <strong>Monitoring</strong> - watching</p>"
+    )
+    assert extract_latest_status(summary) == "Resolved"
 
 
 def test_extract_latest_status_unknown() -> None:
@@ -115,7 +120,7 @@ def test_parse_incidents_keeps_target_provider() -> None:
     entries = [{
         "title": "Chile - Webpay - Timeouts",
         "link": "https://x/incidents/abc",
-        "summary": "\nIn progress - 12:00",
+        "summary": "<p><strong>In progress</strong> - 12:00</p>",
     }]
     out = parse_incidents(entries)
     assert len(out) == 1

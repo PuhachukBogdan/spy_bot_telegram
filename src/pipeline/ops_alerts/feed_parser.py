@@ -42,7 +42,9 @@ TARGET_PROVIDERS: dict[str, list[str]] = {
     ],
 }
 
-_STATUS_RE = re.compile(r"\n([A-Za-z ]+)\s+-\s+")
+# The feed's <summary> is HTML; each update is `<strong>Status</strong> - text`,
+# newest first. The latest status is the first <strong> tag.
+_STATUS_RE = re.compile(r"<strong>\s*([A-Za-z ]+?)\s*</strong>")
 
 
 @dataclass(frozen=True)
@@ -62,7 +64,7 @@ class Incident:
 
 
 def extract_latest_status(text: str | None) -> str:
-    """Pull the most recent status line out of the feed contentSnippet."""
+    """Pull the most recent status out of the feed summary HTML."""
     m = _STATUS_RE.search(text or "")
     if m:
         s = m.group(1).strip().lower()
