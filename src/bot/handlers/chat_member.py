@@ -45,22 +45,38 @@ log = get_logger(__name__)
 
 router = Router(name="onboarding")
 
-# Chat title format: "{aff_id} | {partner_name} | Beton[.]Win"
-# aff_id belongs to the manager (internal_users.aff_id); partner_name is the external client.
-_TITLE_RE = re.compile(
-    r"^\s*(\S+)\s*\|\s*(.+?)\s*\|\s*beton\.?win\s*$",
-    re.IGNORECASE,
-)
+# Chat title format: pipe-separated, e.g. "{aff_id} | {partner_name} | Beton.Win".
+# The "Beton.Win" company token is the required partner-chat marker; it may sit in
+# any position and is discarded. The aff_id is the numeric token (any position),
+# maps to the owner manager (internal_users.aff_id), and is optional. Whatever
+# remains is the partner name.
+_BRAND_RE = re.compile(r"beton\.?win", re.IGNORECASE)
 
 
 def _parse_chat_title(title: str | None) -> tuple[str, str] | None:
-    """Parse '{aff_id} | {partner_name} | Beton[.]Win' → (aff_id, partner_name) or None."""
+    """Parse a partner-chat title → (aff_id, partner_name), or None.
+
+    Requires a "Beton.Win" token somewhere. The aff_id is the first purely-numeric
+    token in any position ("" if none); the company token is dropped; the rest is
+    the partner name. Returns None if there is no brand marker or no name left.
+    """
     if not title:
         return None
-    m = _TITLE_RE.match(title)
-    if not m:
+    parts = [p.strip() for p in title.split("|") if p.strip()]
+    if not any(_BRAND_RE.fullmatch(p) for p in parts):
         return None
-    return m.group(1), m.group(2).strip()
+    rest = [p for p in parts if not _BRAND_RE.fullmatch(p)]
+    aff_id = ""
+    name_parts: list[str] = []
+    for p in rest:
+        if not aff_id and p.isdigit():
+            aff_id = p
+        else:
+            name_parts.append(p)
+    name = " | ".join(name_parts).strip()
+    if not name:
+        return None
+    return aff_id, name
 
 # Chat types where onboarding applies. Channels and private chats are ignored:
 # the bot only monitors partner *group* chats.

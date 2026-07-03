@@ -28,6 +28,20 @@ def test_parse_partner_name_with_spaces() -> None:
     )
 
 
+def test_parse_affid_last() -> None:
+    # aff_id in the trailing position, company token in the middle.
+    assert _parse_chat_title("Montapartners | BetonWin | 66642") == ("66642", "Montapartners")
+
+
+def test_parse_affid_last_spaced_name() -> None:
+    assert _parse_chat_title("Space Partners | Betonwin | 59422") == ("59422", "Space Partners")
+
+
+def test_parse_no_numeric_affid() -> None:
+    # Brand present but no purely-numeric token → aff_id "", name is the remainder.
+    assert _parse_chat_title("Just A Partner | Beton.Win") == ("", "Just A Partner")
+
+
 def test_parse_no_brand_suffix() -> None:
     assert _parse_chat_title("12345 | PartnerName") is None
 
