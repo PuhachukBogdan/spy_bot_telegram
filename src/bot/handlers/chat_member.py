@@ -34,8 +34,8 @@ from src.db.client import acquire_connection
 from src.db.queries.audit import insert_audit_log
 from src.db.queries.chats import bind_partner_to_chat, create_active_chat, create_pending_chat
 from src.db.queries.etc import (
-    find_internal_user_by_aff_id,
     find_internal_user_by_telegram_id,
+    get_or_create_manager_by_aff_id,
     list_admin_users,
 )
 from src.db.queries.partners import get_or_create_partner_with_owner
@@ -140,7 +140,13 @@ async def on_bot_added(event: ChatMemberUpdated, bot: Bot) -> None:
             parsed = _parse_chat_title(chat.title)
             if parsed:
                 aff_id, pname = parsed
-                owner = await find_internal_user_by_aff_id(conn, aff_id)
+                # aff_id present → derive/attach the owning manager (stub row if
+                # not yet registered); "" → leave the partner unowned as before.
+                owner = (
+                    await get_or_create_manager_by_aff_id(conn, aff_id)
+                    if aff_id
+                    else None
+                )
                 partner = await get_or_create_partner_with_owner(
                     conn, pname, owner.id if owner else None
                 )

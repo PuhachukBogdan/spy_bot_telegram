@@ -195,6 +195,34 @@ async def find_internal_user_by_aff_id(
     return InternalUser.from_record(row) if row is not None else None
 
 
+async def get_or_create_manager_by_aff_id(
+    conn: asyncpg.Connection, aff_id: str
+) -> InternalUser:
+    """Return the manager owning ``aff_id``, creating a stub row if none exists.
+
+    Onboarding derives manager identity straight from the chat-title aff_id, so
+    partner ownership (and the manager-centric report) works before the manager
+    ever registers in the bot. The stub carries only ``aff_id`` + ``role='manager'``;
+    a later registration enriches the SAME row (matched on aff_id) with
+    ``tg_username`` + ``telegram_accounts`` — nothing is thrown away. ``full_name``
+    is a placeholder (the column is NOT NULL) and never renders while ``aff_id`` is
+    set (see :func:`src.summary.builder._manager_label`). Caller owns the txn.
+    """
+    existing = await find_internal_user_by_aff_id(conn, aff_id)
+    if existing is not None:
+        return existing
+    row = await conn.fetchrow(
+        """
+        INSERT INTO internal_users (full_name, role, aff_id, enabled)
+        VALUES ($1, 'manager', $2, true)
+        RETURNING *
+        """,
+        f"Manager {aff_id}",
+        aff_id,
+    )
+    return InternalUser.from_record(row)
+
+
 async def update_slack_user_id(
     conn: asyncpg.Connection,
     internal_id: UUID,

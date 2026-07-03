@@ -40,6 +40,8 @@ def _event_row(
     risk_type: str = "shadow_deal",
     partner_name: str = "Acme",
     score: int = 72,
+    author_name: str | None = "Иван Петров",
+    author_role: str | None = "internal",
 ) -> dict[str, Any]:
     return {
         "id": uuid4(),
@@ -50,6 +52,8 @@ def _event_row(
         "partner_name": partner_name,
         "detected_phrase": "между нами",
         "llm_explanation": "Off-the-books deal suspected.",
+        "author_name": author_name,
+        "author_role": author_role,
         "status": "open",
         "created_at": datetime(2026, 6, 5, 14, 32, tzinfo=UTC),
     }
@@ -203,6 +207,36 @@ def test_event_card_shows_partner_and_phrase() -> None:
     assert "Globex" in html
     assert "между нами" in html
     assert "Off-the-books deal suspected." in html
+
+
+def test_event_card_shows_author_and_role() -> None:
+    mgr = _mgr()
+    row = _event_row(mgr["id"], author_name="Иван Петров", author_role="internal")
+    html = build_report_html(
+        period_type="weekly",
+        since=_SINCE,
+        until=_UNTIL,
+        managers=[mgr],
+        heatmap_rows=[_heatmap_row(mgr["id"])],
+        event_rows=[row],
+    )
+    assert "Иван Петров" in html
+    assert '<div class="ev-author">' in html
+    assert "сотрудник" in html  # internal role localised
+
+
+def test_event_card_omits_author_block_when_unknown() -> None:
+    mgr = _mgr()
+    row = _event_row(mgr["id"], author_name=None, author_role=None)
+    html = build_report_html(
+        period_type="weekly",
+        since=_SINCE,
+        until=_UNTIL,
+        managers=[mgr],
+        heatmap_rows=[_heatmap_row(mgr["id"])],
+        event_rows=[row],
+    )
+    assert '<div class="ev-author">' not in html
 
 
 def test_event_risk_type_label_humanised() -> None:

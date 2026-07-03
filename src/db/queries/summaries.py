@@ -72,10 +72,13 @@ async def list_events_for_report(
             re.status,
             re.created_at,
             p.name AS partner_name,
-            u.id   AS manager_id
+            u.id   AS manager_id,
+            msg.sender_name AS author_name,
+            msg.sender_role AS author_role
         FROM risk_events re
         JOIN partners p ON p.id = re.partner_id
         JOIN internal_users u ON u.id = p.owner_manager_id
+        LEFT JOIN messages msg ON msg.id = re.message_id
         WHERE re.created_at >= $1 AND re.created_at < $2
           AND u.role = 'manager' AND u.enabled = true
         ORDER BY u.id, re.created_at

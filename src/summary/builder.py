@@ -80,6 +80,8 @@ class EventData:
     final_score: int
     detected_phrase: str | None
     llm_explanation: str | None
+    author: str | None
+    author_role: str | None
     status: str
     date_str: str
 
@@ -303,6 +305,16 @@ h1,h2,.section-label,.stat-num,.heatmap td.total-cell{
 .ev-score  {color:var(--text-3);font-size:12px;font-weight:600}
 .ev-date   {color:var(--text-3);font-size:12px;margin-left:auto}
 
+.ev-author{
+  margin-top:9px;color:var(--text-2);font-size:12.5px;font-weight:600;
+  display:flex;align-items:center;gap:7px;
+}
+.ev-role{
+  font-weight:600;font-size:11px;padding:1px 7px;border-radius:20px;
+  background:var(--surface-2);color:var(--text-3);
+}
+.ev-role.internal{background:rgba(99,102,241,.12);color:var(--c-high-ac)}
+
 .ev-phrase{
   margin-top:11px;padding:9px 13px;
   background:var(--surface-2);border-radius:7px;
@@ -409,6 +421,7 @@ h1,h2,.section-label,.stat-num,.heatmap td.total-cell{
           <span class="ev-score">{{ ev.final_score }}/100</span>
           <span class="ev-date">{{ ev.date_str }}</span>
         </div>
+        {% if ev.author %}<div class="ev-author">✍ {{ ev.author }}{% if ev.author_role %} <span class="ev-role {{ ev.author_role }}">{{ {'internal':'сотрудник','partner':'партнёр','anonymous_admin':'анон-админ'}.get(ev.author_role, ev.author_role) }}</span>{% endif %}</div>{% endif %}
         {% if ev.detected_phrase %}<div class="ev-phrase">"{{ ev.detected_phrase }}"</div>{% endif %}
         {% if ev.llm_explanation %}<div class="ev-expl">{{ ev.llm_explanation }}</div>{% endif %}
       </div>
@@ -527,6 +540,8 @@ def build_report_html(
             final_score=int(row["final_score"]),
             detected_phrase=str(row["detected_phrase"]) if row.get("detected_phrase") else None,
             llm_explanation=str(row["llm_explanation"]) if row.get("llm_explanation") else None,
+            author=str(row["author_name"]) if row.get("author_name") else None,
+            author_role=str(row["author_role"]) if row.get("author_role") else None,
             status=str(row.get("status") or ""),
             date_str=ts.strftime("%Y-%m-%d %H:%M"),
         )
@@ -826,6 +841,16 @@ h1,h2,.section-label,.stat-num,.heatmap td.total-cell{
 .ev-type   {color:var(--text-2);font-size:13px}
 .ev-score  {color:var(--text-3);font-size:12px;font-weight:600}
 .ev-date   {color:var(--text-3);font-size:12px;margin-left:auto}
+
+.ev-author{
+  margin-top:9px;color:var(--text-2);font-size:12.5px;font-weight:600;
+  display:flex;align-items:center;gap:7px;
+}
+.ev-role{
+  font-weight:600;font-size:11px;padding:1px 7px;border-radius:20px;
+  background:var(--surface-2);color:var(--text-3);
+}
+.ev-role.internal{background:rgba(99,102,241,.12);color:var(--c-high-ac)}
 
 .ev-phrase{
   margin-top:11px;padding:9px 13px;
