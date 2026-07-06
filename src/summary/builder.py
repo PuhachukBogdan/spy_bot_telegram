@@ -7,6 +7,14 @@ Produces a single self-contained HTML page:
   - Per-manager timeline sections with color-coded event cards
 
 No external CSS or JS — the output is a standalone file safe to serve directly.
+
+Visual system: "Signal Desk" — a risk-intelligence briefing. The report reads
+as instrument readout: all data (scores, dates, counts, category cells, aff_ids)
+is set in a monospace face; the heat-map is a "signal matrix"; severity is
+encoded by a left "spine" on each card plus a badge. Two themes ship from one
+token set: light "paper briefing" (warm ivory, default) and dark "control room".
+The single shared ``_BASE_CSS`` block below styles BOTH the standalone report and
+the tabbed dashboard, so the two never drift — edit styling there, once.
 """
 
 from __future__ import annotations
@@ -97,253 +105,278 @@ class ManagerData:
 
 
 # ---------------------------------------------------------------------------
-# HTML template (inline; autoescape=True for XSS safety)
+# Shared visual system ("Signal Desk")
 # ---------------------------------------------------------------------------
 
-_TEMPLATE = """\
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Urbanist:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<title>{{ title }}</title>
-<style>
-/* ── Reset ───────────────────────────────────────── */
+# Webfonts (Cyrillic-safe): Archivo = the one display moment (the h1 hero);
+# IBM Plex Sans = body + evidence quotes; IBM Plex Mono = the signature data
+# treatment. All three carry Cyrillic, so Russian quotes/labels render evenly.
+_FONT_LINK = (
+    '<link rel="preconnect" href="https://fonts.googleapis.com">'
+    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+    '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+    "family=Archivo:wght@700;800&"
+    "family=IBM+Plex+Mono:wght@500;600;700&"
+    "family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap"
+    '">'
+)
+
+# Every color and type decision derives from these tokens. Light "paper
+# briefing" (warm ivory) is the default :root; dark "control room" applies under
+# the OS preference AND the viewer's explicit toggle (data-theme wins both ways).
+_BASE_CSS = """
+/* ── Reset ─────────────────────────────────────────── */
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 
-/* ── Tokens (light, businesslike) ────────────────── */
+/* ── Tokens: light "paper briefing" (warm ivory) ───── */
 :root{
-  --bg:        #f4f5f7;
-  --surface:   #ffffff;
-  --surface-2: #f1f5f9;
-  --border:    #e2e8f0;
-  --border-dim:#eceef1;
-  --text-1:    #0f172a;
-  --text-2:    #475569;
-  --text-3:    #94a3b8;
-  --accent:    #4f46e5;
-  --accent-dim:#eef2ff;
+  --paper:#ECE9E2; --surface:#F7F5F0; --surface-2:#EEEAE2;
+  --line:#DED8CD; --line-2:#E7E2D9;
+  --ink:#15171C; --ink-2:#565C69; --ink-3:#969BA6;
+  --accent:#1E4D6B; --accent-soft:rgba(30,77,107,.09);
 
-  --shadow-sm: 0 1px 2px rgba(15,23,42,.05);
-  --shadow-md: 0 1px 3px rgba(15,23,42,.08),0 1px 2px rgba(15,23,42,.04);
+  --crit:#B42318; --crit-bg:#FBEEEC; --crit-line:#F0CFC9;
+  --high:#B25A0B; --high-bg:#FBF3E8; --high-line:#EFDCC0;
+  --med:#565C69;  --med-bg:#EEEAE2;  --med-line:#DCD6CB;
+  --low:#969BA6;  --low-bg:#F3F1EA;  --low-line:#E7E2D9;
+  --ok:#2E7D5B;
 
-  --c-crit-fg:#b91c1c; --c-crit-bg:#fef2f2; --c-crit-bd:#fecaca; --c-crit-ac:#dc2626;
-  --c-high-fg:#b45309; --c-high-bg:#fffbeb; --c-high-bd:#fde68a; --c-high-ac:#f59e0b;
-  --c-med-fg: #475569; --c-med-bg: #f1f5f9; --c-med-bd: #cbd5e1; --c-med-ac:#94a3b8;
-  --c-low-fg: #94a3b8; --c-low-bg: #f8fafc; --c-low-bd: #e2e8f0; --c-low-ac:#cbd5e1;
-  --c-ok:     #16a34a;
+  --shadow:0 1px 2px rgba(21,23,28,.05);
+  --shadow-lift:0 6px 20px -8px rgba(21,23,28,.18),0 1px 2px rgba(21,23,28,.06);
+
+  --sans:'IBM Plex Sans',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+  --mono:'IBM Plex Mono',ui-monospace,'SF Mono','Cascadia Code','Consolas',monospace;
+  --display:'Archivo','IBM Plex Sans',system-ui,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --paper:#0F1216; --surface:#161A20; --surface-2:#1C212A;
+    --ink:#E7E9ED; --ink-2:#A2A9B5; --ink-3:#6D7480;
+    --line:#252A33; --line-2:#1E232B;
+    --accent:#6FB2D4; --accent-soft:rgba(111,178,212,.14);
+
+    --crit:#F1897E; --crit-bg:rgba(180,35,24,.17); --crit-line:rgba(241,137,126,.32);
+    --high:#E5A863; --high-bg:rgba(178,90,11,.18); --high-line:rgba(229,168,99,.32);
+    --med:#A2A9B5;  --med-bg:#1C212A;  --med-line:#2C323C;
+    --low:#6D7480;  --low-bg:#161A20;  --low-line:#242932;
+    --ok:#5FBE93;
+
+    --shadow:0 1px 2px rgba(0,0,0,.4);
+    --shadow-lift:0 8px 24px -10px rgba(0,0,0,.6),0 1px 2px rgba(0,0,0,.4);
+  }
+}
+/* Viewer's explicit theme toggle must win over the OS preference, both ways. */
+:root[data-theme="light"]{
+  --paper:#ECE9E2; --surface:#F7F5F0; --surface-2:#EEEAE2;
+  --line:#DED8CD; --line-2:#E7E2D9;
+  --ink:#15171C; --ink-2:#565C69; --ink-3:#969BA6;
+  --accent:#1E4D6B; --accent-soft:rgba(30,77,107,.09);
+  --crit:#B42318; --crit-bg:#FBEEEC; --crit-line:#F0CFC9;
+  --high:#B25A0B; --high-bg:#FBF3E8; --high-line:#EFDCC0;
+  --med:#565C69;  --med-bg:#EEEAE2;  --med-line:#DCD6CB;
+  --low:#969BA6;  --low-bg:#F3F1EA;  --low-line:#E7E2D9;
+  --ok:#2E7D5B;
+  --shadow:0 1px 2px rgba(21,23,28,.05);
+  --shadow-lift:0 6px 20px -8px rgba(21,23,28,.18),0 1px 2px rgba(21,23,28,.06);
+}
+:root[data-theme="dark"]{
+  --paper:#0F1216; --surface:#161A20; --surface-2:#1C212A;
+  --ink:#E7E9ED; --ink-2:#A2A9B5; --ink-3:#6D7480;
+  --line:#252A33; --line-2:#1E232B;
+  --accent:#6FB2D4; --accent-soft:rgba(111,178,212,.14);
+  --crit:#F1897E; --crit-bg:rgba(180,35,24,.17); --crit-line:rgba(241,137,126,.32);
+  --high:#E5A863; --high-bg:rgba(178,90,11,.18); --high-line:rgba(229,168,99,.32);
+  --med:#A2A9B5;  --med-bg:#1C212A;  --med-line:#2C323C;
+  --low:#6D7480;  --low-bg:#161A20;  --low-line:#242932;
+  --ok:#5FBE93;
+  --shadow:0 1px 2px rgba(0,0,0,.4);
+  --shadow-lift:0 8px 24px -10px rgba(0,0,0,.6),0 1px 2px rgba(0,0,0,.4);
 }
 
-/* ── Base ────────────────────────────────────────── */
+/* ── Base ──────────────────────────────────────────── */
 html{scroll-behavior:smooth}
 body{
-  font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
-  background:var(--bg);color:var(--text-1);
+  font-family:var(--sans);
+  background:var(--paper);color:var(--ink);
   font-size:14px;line-height:1.6;
-  -webkit-font-smoothing:antialiased;
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
 }
-h1,h2,.section-label,.stat-num,.heatmap td.total-cell{
-  font-family:'Urbanist','Inter',sans-serif;
-}
+a{color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.01em}
 
-/* ── Header ──────────────────────────────────────── */
-.accent-bar{height:3px;background:var(--accent)}
-.page-header{
-  background:var(--surface);
-  padding:26px 48px 0;
-  border-bottom:1px solid var(--border);
-}
-.page-header h1{font-size:24px;font-weight:700;letter-spacing:-.02em;margin-bottom:4px}
-.page-header .meta{color:var(--text-3);font-size:12.5px;margin-bottom:22px}
-.page-header .meta strong{color:var(--text-2);font-weight:600}
+.accent-bar{height:2px;background:var(--accent)}
 
-/* ── Header stat strip ───────────────────────────── */
-.stat-strip{display:flex;flex-wrap:wrap;gap:0;border-top:1px solid var(--border-dim)}
-.stat-cell{
-  padding:14px 26px 16px;border-right:1px solid var(--border-dim);
-  display:flex;flex-direction:column;gap:2px;
-}
-.stat-cell:first-child{padding-left:0}
-.stat-num{font-size:22px;font-weight:700;line-height:1;color:var(--text-1)}
-.stat-num.crit{color:var(--c-crit-ac)}
-.stat-num.high{color:var(--c-high-ac)}
-.stat-lbl{font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:.06em}
+/* ── Header ────────────────────────────────────────── */
+.page-header{background:var(--surface);border-bottom:1px solid var(--line);padding:30px 48px 0}
+.page-header h1{font-family:var(--display);font-size:29px;font-weight:800;letter-spacing:-.025em;line-height:1.1;text-wrap:balance;margin-bottom:8px}
+.page-header .meta{font-family:var(--mono);color:var(--ink-3);font-size:12px;margin-bottom:26px}
+.page-header .meta strong{color:var(--ink-2);font-weight:600}
 
-/* ── Layout ──────────────────────────────────────── */
-.layout{
-  display:grid;
-  grid-template-columns:236px 1fr;
-  align-items:start;
-}
+/* ── Header stat readouts ──────────────────────────── */
+.stat-strip{display:flex;flex-wrap:wrap}
+.stat-cell{padding:15px 30px 18px;border-left:1px solid var(--line-2);display:flex;flex-direction:column;gap:3px}
+.stat-cell:first-child{padding-left:0;border-left:none}
+.stat-num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:25px;font-weight:700;line-height:1;color:var(--ink);letter-spacing:-.02em}
+.stat-num.crit{color:var(--crit)}
+.stat-num.high{color:var(--high)}
+.stat-lbl{font-size:11px;color:var(--ink-3);text-transform:uppercase;letter-spacing:.09em}
 
-/* ── Sidebar ─────────────────────────────────────── */
-.sidebar{
-  position:sticky;top:0;height:100vh;
-  overflow-y:auto;background:var(--surface);
-  border-right:1px solid var(--border);
-  padding:24px 14px;
-}
-.sidebar-label{
-  display:block;
-  font-size:10px;font-weight:700;color:var(--text-3);
-  text-transform:uppercase;letter-spacing:.1em;
-  padding:0 8px;margin-bottom:12px;
-}
-.sb-item{
-  display:flex;align-items:center;gap:8px;
-  padding:7px 9px;border-radius:7px;
-  text-decoration:none;color:var(--text-2);
-  font-size:12.5px;font-weight:500;
-  transition:background .1s,color .1s;
-  margin-bottom:1px;
-}
-.sb-item:hover{background:var(--surface-2);color:var(--text-1)}
-.sb-item .sb-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.sb-crit{
-  flex-shrink:0;font-size:10px;font-weight:700;
-  color:#fff;background:var(--c-crit-ac);
-  border-radius:999px;padding:1px 7px;line-height:16px;
-}
-.sb-count{flex-shrink:0;font-size:11px;font-weight:600;color:var(--text-3)}
-.sb-clean{flex-shrink:0;font-size:13px;color:var(--c-ok)}
+/* ── Layout ────────────────────────────────────────── */
+.layout{display:grid;grid-template-columns:250px 1fr;align-items:start}
 
-/* ── Main ────────────────────────────────────────── */
-.main{padding:36px 48px;min-width:0;max-width:1180px}
+/* ── Sidebar roster ────────────────────────────────── */
+.sidebar{position:sticky;top:0;height:100vh;overflow-y:auto;background:var(--surface);border-right:1px solid var(--line);padding:26px 14px}
+.sidebar-label{display:block;font-family:var(--mono);font-size:10px;font-weight:600;color:var(--ink-3);text-transform:uppercase;letter-spacing:.16em;padding:0 10px;margin-bottom:14px}
+.sb-item{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:6px;text-decoration:none;color:var(--ink-2);font-size:12.5px;font-weight:500;transition:background .12s,color .12s;margin-bottom:1px}
+.sb-item:hover{background:var(--surface-2);color:var(--ink)}
+.sb-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-size:12px;letter-spacing:-.01em}
+.sb-crit{flex-shrink:0;font-family:var(--mono);font-size:10px;font-weight:700;color:#fff;background:var(--crit);border-radius:3px;padding:1px 6px;line-height:16px}
+:root[data-theme="dark"] .sb-crit{color:#1a0d0b}
+.sb-count{flex-shrink:0;font-family:var(--mono);font-size:11px;font-weight:600;color:var(--ink-3)}
+.sb-clean{flex-shrink:0;font-size:12px;color:var(--ok)}
 
-/* ── Section label ───────────────────────────────── */
-.section-label{
-  font-size:11px;font-weight:700;color:var(--text-3);
-  text-transform:uppercase;letter-spacing:.1em;
-  margin-bottom:14px;
-}
+/* ── Main ──────────────────────────────────────────── */
+.main{padding:38px 48px 72px;min-width:0;max-width:1200px}
+.section-label{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--ink-3);text-transform:uppercase;letter-spacing:.16em;margin-bottom:16px;display:flex;align-items:center;gap:12px}
+.section-label::after{content:"";flex:1;height:1px;background:var(--line)}
 
-/* ── Heatmap ─────────────────────────────────────── */
-.heatmap-wrap{
-  overflow-x:auto;margin-bottom:52px;
-  background:var(--surface);border:1px solid var(--border);
-  border-radius:12px;box-shadow:var(--shadow-sm);
-}
-.heatmap{border-collapse:collapse;font-size:12px;white-space:nowrap;width:100%}
-.heatmap th{
-  padding:13px 12px;text-align:center;
-  font-weight:600;color:var(--text-3);font-size:10.5px;
-  text-transform:uppercase;letter-spacing:.04em;
-  border-bottom:1px solid var(--border);
-}
-.heatmap th.mgr-col{text-align:left;min-width:170px;padding-left:20px}
-.heatmap td{
-  padding:11px 14px;text-align:center;
-  border-bottom:1px solid var(--border-dim);
-  font-size:12.5px;font-weight:600;
-}
+/* ── Signal matrix (heat-map) ──────────────────────── */
+.heatmap-wrap{overflow-x:auto;margin-bottom:56px;background:var(--surface);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow)}
+.heatmap{border-collapse:collapse;width:100%;white-space:nowrap}
+.heatmap th{padding:14px 10px;text-align:center;font-family:var(--mono);font-weight:600;color:var(--ink-3);font-size:10px;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--line)}
+.heatmap th.mgr-col{text-align:left;min-width:184px;padding-left:22px}
+.heatmap td{padding:12px;text-align:center;border-bottom:1px solid var(--line-2);font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:13px;font-weight:600}
 .heatmap tbody tr:last-child td{border-bottom:none}
 .heatmap tbody tr:hover td{background:var(--surface-2)}
-.heatmap td.mgr-cell{text-align:left;padding-left:20px}
-.heatmap td.mgr-cell a{color:var(--text-1);text-decoration:none;font-weight:600}
+.heatmap td.mgr-cell{text-align:left;padding-left:22px}
+.heatmap td.mgr-cell a{color:var(--ink);text-decoration:none;font-weight:600;font-family:var(--mono);font-size:12px}
 .heatmap td.mgr-cell a:hover{color:var(--accent)}
-.heatmap td.total-cell{
-  font-weight:700;color:var(--text-1);
-  border-left:1px solid var(--border);
-}
-.cell-zero{color:#cbd5e1}
-.cell-warm{color:var(--c-high-fg);background:var(--c-high-bg)}
-.cell-hot {color:var(--c-crit-fg);background:var(--c-crit-bg);font-weight:700}
-.heatmap tbody tr:hover td.cell-warm{background:#fef6dd}
-.heatmap tbody tr:hover td.cell-hot{background:#fde8e8}
+.heatmap td.total-cell{font-weight:700;color:var(--ink);border-left:1px solid var(--line)}
+.cell-zero{color:var(--ink-3);opacity:.45}
+.cell-warm{color:var(--high);background:var(--high-bg)}
+.cell-hot{color:var(--crit);background:var(--crit-bg);font-weight:700;position:relative}
+.cell-hot::after{content:"";position:absolute;top:5px;right:5px;width:4px;height:4px;background:var(--crit);border-radius:50%}
 
-/* ── Manager section ─────────────────────────────── */
-.mgr-section{margin-bottom:48px;scroll-margin-top:18px}
-.mgr-header{
-  display:flex;align-items:center;flex-wrap:wrap;
-  gap:10px;margin-bottom:16px;
-  padding-bottom:13px;border-bottom:1px solid var(--border);
-}
-.mgr-header h2{font-size:18px;font-weight:700;color:var(--text-1);letter-spacing:-.01em}
-.pill{
-  font-size:11px;font-weight:600;
-  background:var(--surface);border:1px solid var(--border);border-radius:999px;
-  padding:3px 11px;color:var(--text-2);
-}
-.pill.crit{
-  color:var(--c-crit-fg);background:var(--c-crit-bg);
-  border-color:var(--c-crit-bd);
-}
+/* ── Manager dossier ───────────────────────────────── */
+.mgr-section{margin-bottom:52px;scroll-margin-top:20px}
+.mgr-header{display:flex;align-items:baseline;flex-wrap:wrap;gap:12px;margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--line)}
+.mgr-header h2{font-family:var(--mono);font-size:19px;font-weight:700;letter-spacing:-.015em;color:var(--ink)}
+.pill{font-family:var(--mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--line);border-radius:5px;padding:3px 10px;color:var(--ink-2)}
+.pill.crit{color:var(--crit);background:var(--crit-bg);border-color:var(--crit-line)}
+.pill.clean{color:var(--ok)}
 
-/* ── Event cards ─────────────────────────────────── */
-.event{
-  background:var(--surface);border:1px solid var(--border);
-  border-left:4px solid var(--c-low-ac);
-  border-radius:10px;padding:14px 18px;margin:10px 0;
-  box-shadow:var(--shadow-sm);
-  transition:box-shadow .15s,transform .15s;
-}
-.event:hover{box-shadow:var(--shadow-md);transform:translateY(-1px)}
-.event.critical{border-left-color:var(--c-crit-ac)}
-.event.high    {border-left-color:var(--c-high-ac)}
-.event.medium  {border-left-color:var(--c-med-ac)}
-.event.low     {border-left-color:var(--c-low-ac);opacity:.82}
+/* ── Event cards (severity spine) ──────────────────── */
+.event{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--low);border-radius:8px;padding:16px 20px;margin:10px 0;box-shadow:var(--shadow);transition:box-shadow .16s ease,transform .16s ease}
+.event:hover{box-shadow:var(--shadow-lift);transform:translateY(-1px)}
+.event.critical{border-left-color:var(--crit)}
+.event.high{border-left-color:var(--high)}
+.event.medium{border-left-color:var(--med)}
+.event.low{border-left-color:var(--low)}
+.event-header{display:flex;align-items:center;gap:11px;flex-wrap:wrap}
+.badge{font-family:var(--mono);display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;border:1px solid}
+.badge.critical{color:var(--crit);background:var(--crit-bg);border-color:var(--crit-line)}
+.badge.high{color:var(--high);background:var(--high-bg);border-color:var(--high-line)}
+.badge.medium{color:var(--med);background:var(--med-bg);border-color:var(--med-line)}
+.badge.low{color:var(--low);background:var(--low-bg);border-color:var(--low-line)}
+.ev-partner{font-weight:700;color:var(--ink);font-size:14px}
+.ev-type{color:var(--ink-2);font-size:13px}
+.ev-score{font-family:var(--mono);color:var(--ink-3);font-size:12px;font-weight:600;font-variant-numeric:tabular-nums}
+.ev-date{font-family:var(--mono);color:var(--ink-3);font-size:11.5px;margin-left:auto}
+.ev-author{margin-top:11px;color:var(--ink-2);font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:8px}
+.ev-role{font-family:var(--mono);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.05em;padding:2px 7px;border-radius:4px;background:var(--surface-2);color:var(--ink-3);border:1px solid var(--line)}
+.ev-role.internal{background:var(--accent-soft);color:var(--accent);border-color:transparent}
+.ev-phrase{margin-top:12px;padding:10px 14px;background:var(--surface-2);border-radius:6px;border-left:2px solid var(--line);color:var(--ink-2);font-size:13px;font-style:italic}
+.ev-expl{margin-top:11px;color:var(--ink-2);font-size:13px;line-height:1.66;max-width:74ch}
 
-/* ── Badges ──────────────────────────────────────── */
-.event-header{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.badge{
-  display:inline-flex;align-items:center;
-  padding:3px 9px;border-radius:6px;
-  font-size:10px;font-weight:700;
-  text-transform:uppercase;letter-spacing:.06em;
-  border:1px solid;
-}
-.badge.critical{color:var(--c-crit-fg);background:var(--c-crit-bg);border-color:var(--c-crit-bd)}
-.badge.high    {color:var(--c-high-fg);background:var(--c-high-bg);border-color:var(--c-high-bd)}
-.badge.medium  {color:var(--c-med-fg); background:var(--c-med-bg); border-color:var(--c-med-bd)}
-.badge.low     {color:var(--c-low-fg); background:var(--c-low-bg); border-color:var(--c-low-bd)}
+/* ── Empty state ───────────────────────────────────── */
+.no-events{color:var(--ink-3);font-size:13px;padding:14px 18px;background:var(--surface);border:1px dashed var(--line);border-radius:8px}
+.no-events::before{content:'\\2713  ';color:var(--ok);font-weight:700}
 
-.ev-partner{font-weight:700;color:var(--text-1);font-size:14px}
-.ev-type   {color:var(--text-2);font-size:13px}
-.ev-score  {color:var(--text-3);font-size:12px;font-weight:600}
-.ev-date   {color:var(--text-3);font-size:12px;margin-left:auto}
-
-.ev-author{
-  margin-top:9px;color:var(--text-2);font-size:12.5px;font-weight:600;
-  display:flex;align-items:center;gap:7px;
-}
-.ev-role{
-  font-weight:600;font-size:11px;padding:1px 7px;border-radius:20px;
-  background:var(--surface-2);color:var(--text-3);
-}
-.ev-role.internal{background:rgba(99,102,241,.12);color:var(--c-high-ac)}
-
-.ev-phrase{
-  margin-top:11px;padding:9px 13px;
-  background:var(--surface-2);border-radius:7px;
-  font-style:italic;color:var(--text-2);font-size:13px;
-  border-left:3px solid var(--border);
-}
-.ev-expl{
-  margin-top:9px;color:var(--text-2);
-  font-size:13px;line-height:1.65;
-}
-
-/* ── Empty state ─────────────────────────────────── */
-.no-events{
-  color:var(--text-3);font-style:italic;font-size:13px;
-  padding:13px 16px;background:var(--surface);
-  border:1px dashed var(--border);border-radius:10px;
-}
-.no-events::before{content:'✓  ';color:var(--c-ok);font-style:normal;font-weight:700}
-
-/* ── Back to top ─────────────────────────────────── */
-.back-top{
-  display:inline-flex;align-items:center;gap:5px;
-  margin-top:16px;color:var(--text-3);font-size:12px;font-weight:500;
-  text-decoration:none;transition:color .1s;
-}
+/* ── Back to top ───────────────────────────────────── */
+.back-top{display:inline-flex;align-items:center;gap:6px;margin-top:18px;color:var(--ink-3);font-family:var(--mono);font-size:11px;text-decoration:none;text-transform:uppercase;letter-spacing:.08em;transition:color .12s}
 .back-top:hover{color:var(--accent)}
-</style>
-</head>
-<body>
+
+/* ── Page-load reveal ──────────────────────────────── */
+@keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.mgr-section,.heatmap-wrap{animation:rise .5s ease both}
+.heatmap-wrap{animation-delay:.05s}
+"""
+
+# Dashboard-only additions: the sticky segmented tab bar + panels. Appended to
+# _BASE_CSS for the dashboard shell only.
+_DASH_EXTRA_CSS = """
+/* ── Tab bar (segmented control) ───────────────────── */
+.dash-tabs{display:flex;align-items:center;gap:6px;height:52px;background:var(--surface);border-bottom:1px solid var(--line);padding:0 36px;position:sticky;top:0;z-index:100}
+.tab-btn{font-family:var(--mono);padding:7px 16px;font-size:12px;font-weight:600;color:var(--ink-2);border:none;background:none;cursor:pointer;border-radius:6px;text-transform:uppercase;letter-spacing:.06em;transition:background .15s,color .15s}
+.tab-btn:hover{background:var(--surface-2);color:var(--ink)}
+.tab-btn.active{color:var(--accent);background:var(--accent-soft)}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
+.tab-empty{padding:80px 48px;color:var(--ink-3);font-style:italic;font-size:14px}
+/* Nested report bodies keep their own sticky sidebar below the tab bar. */
+.tab-panel .sidebar{top:52px;height:calc(100vh - 52px)}
+"""
+
+# Responsive rules shared by both shells. References only classes that exist in
+# both bodies; injected after _BASE_CSS (+ any extra) so the breakpoint wins.
+_RESPONSIVE_CSS = """
+/* ── Responsive (phones / small tablets) ───────────── */
+@media (max-width:820px){
+  body{font-size:13.5px}
+  .page-header{padding:20px 16px 0}
+  .page-header h1{font-size:23px}
+  .page-header .meta{margin-bottom:18px}
+  .stat-cell{padding:11px 18px 13px}
+  .stat-cell:first-child{padding-left:0}
+  .stat-num{font-size:20px}
+  .layout{grid-template-columns:1fr}
+  .sidebar{position:static;height:auto;border-right:none;border-bottom:1px solid var(--line);padding:12px 14px;display:flex;flex-direction:row;align-items:center;gap:8px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .tab-panel .sidebar{top:0;height:auto}
+  .sidebar-label{flex:0 0 auto;margin:0 6px 0 0;padding:0}
+  .sb-item{flex:0 0 auto;margin-bottom:0;background:var(--surface-2);border:1px solid var(--line);border-radius:999px;padding:6px 12px}
+  .sb-name{flex:0 1 auto;max-width:150px}
+  .main{padding:24px 14px 56px}
+  .section-label{margin-bottom:12px}
+  .heatmap-wrap{margin-bottom:36px;-webkit-overflow-scrolling:touch}
+  .mgr-section{margin-bottom:36px}
+  .mgr-header h2{font-size:16px}
+  .event{padding:14px 15px}
+  .event-header{gap:8px}
+  .ev-partner{font-size:13.5px}
+  .ev-date{margin-left:0}
+  .dash-tabs{padding:0 12px;height:48px}
+  .tab-btn{padding:7px 12px}
+  .tab-empty{padding:48px 18px}
+}
+@media (prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important;scroll-behavior:auto!important}
+}
+"""
+
+
+def _page(title_html: str, body: str, *, extra_css: str = "") -> str:
+    """Assemble a full HTML document from the shared head + given body/CSS."""
+    css = _BASE_CSS + extra_css + _RESPONSIVE_CSS
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="ru">\n<head>\n'
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f"{_FONT_LINK}\n"
+        f"<title>{title_html}</title>\n"
+        f"<style>{css}</style>\n"
+        "</head>\n<body>\n"
+        f"{body}\n"
+        "</body>\n</html>\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Report body (Jinja markup; autoescape=True for XSS safety)
+# ---------------------------------------------------------------------------
+
+_REPORT_BODY = """\
 <a id="top"></a>
 <div class="accent-bar"></div>
 
@@ -361,7 +394,7 @@ h1,h2,.section-label,.stat-num,.heatmap td.total-cell{
 <div class="layout">
 
 <aside class="sidebar">
-  <span class="sidebar-label">Managers</span>
+  <span class="sidebar-label">Roster</span>
   {% for m in managers %}
   <a class="sb-item" href="#mgr-{{ m.id }}">
     <span class="sb-name">{{ m.name }}</span>
@@ -377,7 +410,7 @@ h1,h2,.section-label,.stat-num,.heatmap td.total-cell{
 
 <main class="main">
 
-  <p class="section-label">Risk Heatmap</p>
+  <p class="section-label">Signal Matrix</p>
   <div class="heatmap-wrap">
   <table class="heatmap">
     <thead>
@@ -435,64 +468,10 @@ h1,h2,.section-label,.stat-num,.heatmap td.total-cell{
 
 </main>
 </div>
-</body>
-</html>
 """
-
-# Shared mobile/responsive rules, appended into every template's <style> block.
-# Injecting once (rather than duplicating in each literal) keeps the breakpoint
-# behaviour identical across the standalone report and the dashboard.
-_RESPONSIVE_CSS = """
-/* ── Responsive (phones / small tablets) ─────────── */
-@media (max-width:768px){
-  body{font-size:13.5px}
-  .page-header{padding:18px 16px 0}
-  .page-header h1{font-size:20px}
-  .page-header .meta{font-size:12px;margin-bottom:16px}
-  .stat-strip{border-top:none}
-  .stat-cell{padding:10px 16px 12px}
-  .stat-cell:first-child{padding-left:0}
-  .stat-num{font-size:18px}
-  /* The manager jump-nav becomes a horizontal scrolling chip ribbon. */
-  .layout{grid-template-columns:1fr}
-  .sidebar{
-    position:static;height:auto;
-    border-right:none;border-bottom:1px solid var(--border);
-    padding:12px 14px;
-    display:flex;flex-direction:row;align-items:center;gap:8px;
-    overflow-x:auto;-webkit-overflow-scrolling:touch;
-  }
-  .sidebar-label{flex:0 0 auto;margin:0 4px 0 0;padding:0}
-  .sb-item{
-    flex:0 0 auto;margin-bottom:0;
-    background:var(--surface-2);border:1px solid var(--border);
-    border-radius:999px;padding:6px 12px;
-  }
-  .sb-item .sb-name{flex:0 1 auto;max-width:150px}
-  .main{padding:22px 14px}
-  .section-label{margin-bottom:10px}
-  /* Wide heatmap scrolls horizontally with iOS momentum instead of squashing. */
-  .heatmap-wrap{margin-bottom:34px;-webkit-overflow-scrolling:touch}
-  .mgr-section{margin-bottom:34px}
-  .mgr-header h2{font-size:16px}
-  .event{padding:13px 14px}
-  .event-header{gap:7px}
-  .ev-partner{font-size:13.5px}
-  .ev-date{margin-left:0}
-  .dash-tabs{padding:0 12px;height:48px}
-  .tab-btn{padding:7px 14px;font-size:12.5px}
-  .tab-empty{padding:48px 18px}
-}
-"""
-
-
-def _with_responsive(tpl: str) -> str:
-    """Append the shared responsive rules just before the template's </style>."""
-    return tpl.replace("</style>", _RESPONSIVE_CSS + "</style>", 1)
-
 
 _env = Environment(autoescape=True)
-_template = _env.from_string(_with_responsive(_TEMPLATE))
+_template = _env.from_string(_page("{{ title }}", _REPORT_BODY))
 
 
 # ---------------------------------------------------------------------------
@@ -607,280 +586,7 @@ def _extract_body(html: str) -> str:
     return body
 
 
-_DASHBOARD_TEMPLATE = """\
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Urbanist:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<title>Risk Reports Dashboard</title>
-<style>
-/* ── Reset ───────────────────────────────────────── */
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-
-/* ── Tokens (light, businesslike) ────────────────── */
-:root{
-  --bg:        #f4f5f7;
-  --surface:   #ffffff;
-  --surface-2: #f1f5f9;
-  --border:    #e2e8f0;
-  --border-dim:#eceef1;
-  --text-1:    #0f172a;
-  --text-2:    #475569;
-  --text-3:    #94a3b8;
-  --accent:    #4f46e5;
-  --accent-dim:#eef2ff;
-
-  --shadow-sm: 0 1px 2px rgba(15,23,42,.05);
-  --shadow-md: 0 1px 3px rgba(15,23,42,.08),0 1px 2px rgba(15,23,42,.04);
-
-  --c-crit-fg:#b91c1c; --c-crit-bg:#fef2f2; --c-crit-bd:#fecaca; --c-crit-ac:#dc2626;
-  --c-high-fg:#b45309; --c-high-bg:#fffbeb; --c-high-bd:#fde68a; --c-high-ac:#f59e0b;
-  --c-med-fg: #475569; --c-med-bg: #f1f5f9; --c-med-bd: #cbd5e1; --c-med-ac:#94a3b8;
-  --c-low-fg: #94a3b8; --c-low-bg: #f8fafc; --c-low-bd: #e2e8f0; --c-low-ac:#cbd5e1;
-  --c-ok:     #16a34a;
-}
-
-/* ── Base ────────────────────────────────────────── */
-html{scroll-behavior:smooth}
-body{
-  font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
-  background:var(--bg);color:var(--text-1);
-  font-size:14px;line-height:1.6;
-  -webkit-font-smoothing:antialiased;
-}
-h1,h2,.section-label,.stat-num,.heatmap td.total-cell{
-  font-family:'Urbanist','Inter',sans-serif;
-}
-
-/* ── Accent bar ──────────────────────────────────── */
-.accent-bar{height:3px;background:var(--accent)}
-
-/* ── Tab bar (segmented control) ─────────────────── */
-.dash-tabs{
-  display:flex;align-items:center;gap:6px;
-  height:52px;
-  background:var(--surface);
-  border-bottom:1px solid var(--border);
-  padding:0 36px;
-  position:sticky;top:0;z-index:100;
-}
-.tab-btn{
-  padding:7px 18px;
-  font-size:13px;font-weight:600;color:var(--text-2);
-  border:none;background:none;cursor:pointer;
-  border-radius:8px;
-  transition:background .15s,color .15s;
-  font-family:'Inter',sans-serif;
-}
-.tab-btn:hover{background:var(--surface-2);color:var(--text-1)}
-.tab-btn.active{color:var(--accent);background:var(--accent-dim)}
-
-/* ── Tab panels ──────────────────────────────────── */
-.tab-panel{display:none}
-.tab-panel.active{display:block}
-.tab-empty{
-  padding:80px 48px;color:var(--text-3);
-  font-style:italic;font-size:14px;
-}
-
-/* ── Header ──────────────────────────────────────── */
-.page-header{
-  background:var(--surface);
-  padding:26px 48px 0;
-  border-bottom:1px solid var(--border);
-}
-.page-header h1{font-size:24px;font-weight:700;letter-spacing:-.02em;margin-bottom:4px}
-.page-header .meta{color:var(--text-3);font-size:12.5px;margin-bottom:22px}
-.page-header .meta strong{color:var(--text-2);font-weight:600}
-
-/* ── Header stat strip ───────────────────────────── */
-.stat-strip{display:flex;flex-wrap:wrap;gap:0;border-top:1px solid var(--border-dim)}
-.stat-cell{
-  padding:14px 26px 16px;border-right:1px solid var(--border-dim);
-  display:flex;flex-direction:column;gap:2px;
-}
-.stat-cell:first-child{padding-left:0}
-.stat-num{font-size:22px;font-weight:700;line-height:1;color:var(--text-1)}
-.stat-num.crit{color:var(--c-crit-ac)}
-.stat-num.high{color:var(--c-high-ac)}
-.stat-lbl{font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:.06em}
-
-/* ── Layout ──────────────────────────────────────── */
-.layout{
-  display:grid;
-  grid-template-columns:236px 1fr;
-  align-items:start;
-}
-
-/* ── Sidebar ─────────────────────────────────────── */
-.sidebar{
-  position:sticky;top:52px;height:calc(100vh - 52px);
-  overflow-y:auto;background:var(--surface);
-  border-right:1px solid var(--border);
-  padding:24px 14px;
-}
-.sidebar-label{
-  display:block;
-  font-size:10px;font-weight:700;color:var(--text-3);
-  text-transform:uppercase;letter-spacing:.1em;
-  padding:0 8px;margin-bottom:12px;
-}
-.sb-item{
-  display:flex;align-items:center;gap:8px;
-  padding:7px 9px;border-radius:7px;
-  text-decoration:none;color:var(--text-2);
-  font-size:12.5px;font-weight:500;
-  transition:background .1s,color .1s;
-  margin-bottom:1px;
-}
-.sb-item:hover{background:var(--surface-2);color:var(--text-1)}
-.sb-item .sb-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.sb-crit{
-  flex-shrink:0;font-size:10px;font-weight:700;
-  color:#fff;background:var(--c-crit-ac);
-  border-radius:999px;padding:1px 7px;line-height:16px;
-}
-.sb-count{flex-shrink:0;font-size:11px;font-weight:600;color:var(--text-3)}
-.sb-clean{flex-shrink:0;font-size:13px;color:var(--c-ok)}
-
-/* ── Main ────────────────────────────────────────── */
-.main{padding:36px 48px;min-width:0;max-width:1180px}
-
-/* ── Section label ───────────────────────────────── */
-.section-label{
-  font-size:11px;font-weight:700;color:var(--text-3);
-  text-transform:uppercase;letter-spacing:.1em;
-  margin-bottom:14px;
-}
-
-/* ── Heatmap ─────────────────────────────────────── */
-.heatmap-wrap{
-  overflow-x:auto;margin-bottom:52px;
-  background:var(--surface);border:1px solid var(--border);
-  border-radius:12px;box-shadow:var(--shadow-sm);
-}
-.heatmap{border-collapse:collapse;font-size:12px;white-space:nowrap;width:100%}
-.heatmap th{
-  padding:13px 12px;text-align:center;
-  font-weight:600;color:var(--text-3);font-size:10.5px;
-  text-transform:uppercase;letter-spacing:.04em;
-  border-bottom:1px solid var(--border);
-}
-.heatmap th.mgr-col{text-align:left;min-width:170px;padding-left:20px}
-.heatmap td{
-  padding:11px 14px;text-align:center;
-  border-bottom:1px solid var(--border-dim);
-  font-size:12.5px;font-weight:600;
-}
-.heatmap tbody tr:last-child td{border-bottom:none}
-.heatmap tbody tr:hover td{background:var(--surface-2)}
-.heatmap td.mgr-cell{text-align:left;padding-left:20px}
-.heatmap td.mgr-cell a{color:var(--text-1);text-decoration:none;font-weight:600}
-.heatmap td.mgr-cell a:hover{color:var(--accent)}
-.heatmap td.total-cell{
-  font-weight:700;color:var(--text-1);
-  border-left:1px solid var(--border);
-}
-.cell-zero{color:#cbd5e1}
-.cell-warm{color:var(--c-high-fg);background:var(--c-high-bg)}
-.cell-hot {color:var(--c-crit-fg);background:var(--c-crit-bg);font-weight:700}
-.heatmap tbody tr:hover td.cell-warm{background:#fef6dd}
-.heatmap tbody tr:hover td.cell-hot{background:#fde8e8}
-
-/* ── Manager section ─────────────────────────────── */
-.mgr-section{margin-bottom:48px;scroll-margin-top:18px}
-.mgr-header{
-  display:flex;align-items:center;flex-wrap:wrap;
-  gap:10px;margin-bottom:16px;
-  padding-bottom:13px;border-bottom:1px solid var(--border);
-}
-.mgr-header h2{font-size:18px;font-weight:700;color:var(--text-1);letter-spacing:-.01em}
-.pill{
-  font-size:11px;font-weight:600;
-  background:var(--surface);border:1px solid var(--border);border-radius:999px;
-  padding:3px 11px;color:var(--text-2);
-}
-.pill.crit{
-  color:var(--c-crit-fg);background:var(--c-crit-bg);
-  border-color:var(--c-crit-bd);
-}
-
-/* ── Event cards ─────────────────────────────────── */
-.event{
-  background:var(--surface);border:1px solid var(--border);
-  border-left:4px solid var(--c-low-ac);
-  border-radius:10px;padding:14px 18px;margin:10px 0;
-  box-shadow:var(--shadow-sm);
-  transition:box-shadow .15s,transform .15s;
-}
-.event:hover{box-shadow:var(--shadow-md);transform:translateY(-1px)}
-.event.critical{border-left-color:var(--c-crit-ac)}
-.event.high    {border-left-color:var(--c-high-ac)}
-.event.medium  {border-left-color:var(--c-med-ac)}
-.event.low     {border-left-color:var(--c-low-ac);opacity:.82}
-
-/* ── Badges ──────────────────────────────────────── */
-.event-header{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.badge{
-  display:inline-flex;align-items:center;
-  padding:3px 9px;border-radius:6px;
-  font-size:10px;font-weight:700;
-  text-transform:uppercase;letter-spacing:.06em;
-  border:1px solid;
-}
-.badge.critical{color:var(--c-crit-fg);background:var(--c-crit-bg);border-color:var(--c-crit-bd)}
-.badge.high    {color:var(--c-high-fg);background:var(--c-high-bg);border-color:var(--c-high-bd)}
-.badge.medium  {color:var(--c-med-fg); background:var(--c-med-bg); border-color:var(--c-med-bd)}
-.badge.low     {color:var(--c-low-fg); background:var(--c-low-bg); border-color:var(--c-low-bd)}
-
-.ev-partner{font-weight:700;color:var(--text-1);font-size:14px}
-.ev-type   {color:var(--text-2);font-size:13px}
-.ev-score  {color:var(--text-3);font-size:12px;font-weight:600}
-.ev-date   {color:var(--text-3);font-size:12px;margin-left:auto}
-
-.ev-author{
-  margin-top:9px;color:var(--text-2);font-size:12.5px;font-weight:600;
-  display:flex;align-items:center;gap:7px;
-}
-.ev-role{
-  font-weight:600;font-size:11px;padding:1px 7px;border-radius:20px;
-  background:var(--surface-2);color:var(--text-3);
-}
-.ev-role.internal{background:rgba(99,102,241,.12);color:var(--c-high-ac)}
-
-.ev-phrase{
-  margin-top:11px;padding:9px 13px;
-  background:var(--surface-2);border-radius:7px;
-  font-style:italic;color:var(--text-2);font-size:13px;
-  border-left:3px solid var(--border);
-}
-.ev-expl{
-  margin-top:9px;color:var(--text-2);
-  font-size:13px;line-height:1.65;
-}
-
-/* ── Empty state ─────────────────────────────────── */
-.no-events{
-  color:var(--text-3);font-style:italic;font-size:13px;
-  padding:13px 16px;background:var(--surface);
-  border:1px dashed var(--border);border-radius:10px;
-}
-.no-events::before{content:'✓  ';color:var(--c-ok);font-style:normal;font-weight:700}
-
-/* ── Back to top ─────────────────────────────────── */
-.back-top{
-  display:inline-flex;align-items:center;gap:5px;
-  margin-top:16px;color:var(--text-3);font-size:12px;font-weight:500;
-  text-decoration:none;transition:color .1s;
-}
-.back-top:hover{color:var(--accent)}
-</style>
-</head>
-<body>
+_DASH_BODY = """\
 <div class="accent-bar"></div>
 <div class="dash-tabs">
   <button class="tab-btn active" data-tab="weekly" onclick="showTab('weekly')">Weekly</button>
@@ -903,11 +609,11 @@ function showTab(name) {
   document.querySelector('[data-tab="' + name + '"]').classList.add('active');
 }
 </script>
-</body>
-</html>
 """
 
-_dash_template = _env.from_string(_with_responsive(_DASHBOARD_TEMPLATE))
+_dash_template = _env.from_string(
+    _page("Risk Reports Dashboard", _DASH_BODY, extra_css=_DASH_EXTRA_CSS)
+)
 
 
 def build_dashboard_html(
