@@ -6,9 +6,15 @@ Tick logic (CLAUDE.md ops-alerts):
      WITHOUT broadcasting — so a fresh deploy never blasts history into groups.
      Counting starts from launch.
   3. Steady state, per incident:
-     - unseen + active  → insert, broadcast to active groups, record messages.
+     - unseen + active  → insert as PENDING (no broadcast yet). We hold the alert
+       for ``OPS_INCIDENT_BROADCAST_DELAY_SECONDS`` so a provider that recovers
+       inside the window never reaches partners.
      - unseen + resolved → skip (never announce a resolution we didn't post).
      - seen + seeded_only → update fields only; stays silent (no messages exist).
+     - seen + pending (no messages yet):
+         · resolved inside the window → update silently, never announce it.
+         · still active past the delay → broadcast now + record messages.
+         · still active inside the delay → keep waiting.
      - seen + posted    → update fields, edit the posted messages in place.
 
 DB access never spans a network call (post-commit dispatch pattern): reads /
@@ -20,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from typing import Any
 
 from aiogram import Bot
 
@@ -60,8 +67,14 @@ async def _seed_first_run(incidents: list[Incident]) -> None:
     log.info("ops.incidents.seeded", count=len(incidents))
 
 
-async def _handle_new(bot: Bot, inc: Incident) -> None:
-    """Insert + broadcast a never-seen active incident."""
+async def _record_pending(inc: Incident) -> None:
+    """First sight of an active incident: record it, do NOT broadcast yet.
+
+    The broadcast is deferred by ``OPS_INCIDENT_BROADCAST_DELAY_SECONDS``. A later
+    tick promotes it (``_broadcast_pending``) once it is still active past the
+    delay; if it resolves inside the window it is never announced. The row's
+    ``created_at`` (DB default now()) is our first-detection clock.
+    """
     now = datetime.now(UTC)
     async with acquire_connection() as conn:
         await state.insert_incident(
@@ -77,6 +90,12 @@ async def _handle_new(bot: Bot, inc: Incident) -> None:
             last_update=inc.iso_date or now,
             seeded_only=False,
         )
+    log.info("ops.incidents.pending", incident_id=inc.incident_id)
+
+
+async def _broadcast_pending(bot: Bot, inc: Incident) -> None:
+    """Promote a pending incident: broadcast it now and record the sent messages."""
+    async with acquire_connection() as conn:
         groups = await list_active_group_chats(conn)
 
     if not groups:
@@ -105,8 +124,15 @@ async def _handle_new(bot: Bot, inc: Incident) -> None:
     )
 
 
-async def _handle_update(bot: Bot, inc: Incident, seeded_only: bool) -> None:
-    """Update a known incident; edit its posted messages (skip if it was seeded)."""
+async def _handle_update(bot: Bot, inc: Incident, existing: dict[str, Any]) -> None:
+    """Refresh a known incident, then act on its stage.
+
+    Stages after the field update:
+      - seeded_only        → silent (nothing was ever posted).
+      - pending (no msgs)  → recovered inside the delay → stay silent; still active
+        past the delay → broadcast now; still active inside it → keep waiting.
+      - already broadcast  → edit the posted messages in place.
+    """
     now = datetime.now(UTC)
     async with acquire_connection() as conn:
         await state.update_incident(
@@ -116,11 +142,24 @@ async def _handle_update(bot: Bot, inc: Incident, seeded_only: bool) -> None:
             last_update=inc.iso_date or now,
             details=inc.details,
         )
-        if seeded_only:
+        if bool(existing["seeded_only"]):
             return  # silent incident — nothing was posted, nothing to edit
         messages = await state.list_incident_messages(conn, inc.incident_id)
 
     if not messages:
+        # Pending: recorded on first sight but held for the broadcast delay.
+        if inc.is_resolved:
+            log.info("ops.incidents.recovered_in_window", incident_id=inc.incident_id)
+            return  # recovered before the delay elapsed — never announce it
+        age = (now - existing["created_at"]).total_seconds()
+        if age >= settings.OPS_INCIDENT_BROADCAST_DELAY_SECONDS:
+            await _broadcast_pending(bot, inc)
+        else:
+            log.info(
+                "ops.incidents.pending_wait",
+                incident_id=inc.incident_id,
+                age_seconds=int(age),
+            )
         return
 
     text = format_update(inc, updated_at=_stamp())
@@ -175,9 +214,9 @@ async def run_incidents_tick(bot: Bot) -> None:
         if existing is None:
             if inc.is_resolved:
                 continue  # never announce a resolution we didn't post
-            await _handle_new(bot, inc)
+            await _record_pending(inc)
         else:
-            await _handle_update(bot, inc, seeded_only=bool(existing["seeded_only"]))
+            await _handle_update(bot, inc, existing)
 
 
 async def incidents_worker_loop(bot: Bot, interval_seconds: int | None = None) -> None:

@@ -9,7 +9,7 @@ business-mode FakeBot deliberately forbids.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -359,15 +359,60 @@ async def test_first_run_seeds_without_broadcast(iw_patch: dict[str, Any]) -> No
     assert iw_patch["broadcast"] == 0  # nothing sent on first run
 
 
-async def test_new_active_incident_broadcasts(iw_patch: dict[str, Any]) -> None:
+async def test_new_active_incident_is_pending_not_broadcast(iw_patch: dict[str, Any]) -> None:
+    # A never-seen active incident is recorded but held for the broadcast delay —
+    # no message goes out on first sight (a sub-hour dip may recover on its own).
     iw_patch["count"] = 5
     iw_patch["existing"] = None
     iw_patch["incidents"] = [_incident("NEW", status="In progress")]
     await iw.run_incidents_tick(OpsFakeBot())  # type: ignore[arg-type]
     assert len(iw_patch["inserted"]) == 1
     assert iw_patch["inserted"][0]["seeded_only"] is False
+    assert iw_patch["broadcast"] == 0  # deferred, not sent yet
+    assert iw_patch["recorded"] == []
+
+
+async def test_pending_incident_broadcasts_after_delay(iw_patch: dict[str, Any]) -> None:
+    # Still active past the delay → promoted to a live broadcast.
+    iw_patch["count"] = 5
+    iw_patch["existing"] = {
+        "seeded_only": False,
+        "created_at": datetime.now(UTC) - timedelta(hours=2),
+    }
+    iw_patch["messages"] = []  # pending: nothing posted yet
+    iw_patch["incidents"] = [_incident("OLD", status="In progress")]
+    await iw.run_incidents_tick(OpsFakeBot())  # type: ignore[arg-type]
+    assert len(iw_patch["updated"]) == 1
     assert iw_patch["broadcast"] == 1
     assert len(iw_patch["recorded"]) == 2  # one per group
+
+
+async def test_pending_incident_waits_inside_delay(iw_patch: dict[str, Any]) -> None:
+    # Active but younger than the delay → keep waiting, nothing sent.
+    iw_patch["count"] = 5
+    iw_patch["existing"] = {
+        "seeded_only": False,
+        "created_at": datetime.now(UTC) - timedelta(minutes=10),
+    }
+    iw_patch["messages"] = []
+    iw_patch["incidents"] = [_incident("YOUNG", status="In progress")]
+    await iw.run_incidents_tick(OpsFakeBot())  # type: ignore[arg-type]
+    assert len(iw_patch["updated"]) == 1
+    assert iw_patch["broadcast"] == 0
+
+
+async def test_pending_incident_recovered_in_window_is_never_sent(iw_patch: dict[str, Any]) -> None:
+    # Resolved before the delay elapsed → silent, no broadcast (the whole point).
+    iw_patch["count"] = 5
+    iw_patch["existing"] = {
+        "seeded_only": False,
+        "created_at": datetime.now(UTC) - timedelta(minutes=10),
+    }
+    iw_patch["messages"] = []
+    iw_patch["incidents"] = [_incident("GONE", status="Resolved")]
+    await iw.run_incidents_tick(OpsFakeBot())  # type: ignore[arg-type]
+    assert len(iw_patch["updated"]) == 1  # status refreshed
+    assert iw_patch["broadcast"] == 0
 
 
 async def test_unseen_resolved_incident_is_skipped(iw_patch: dict[str, Any]) -> None:
