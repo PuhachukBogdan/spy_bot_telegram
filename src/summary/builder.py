@@ -111,6 +111,7 @@ class EventData:
     author_role: str | None
     status: str
     date_str: str
+    date_iso: str    # YYYY-MM-DD — client-side date-range filter key (monthly)
 
 
 @dataclass
@@ -245,6 +246,15 @@ a{color:inherit}
 .stat-num.high{color:var(--high)}
 .stat-lbl{font-size:11px;color:var(--ink-3);text-transform:uppercase;letter-spacing:.09em}
 
+/* ── Date-range picker (monthly report only) ───────── */
+.daterange{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:13px 48px;background:var(--surface);border-bottom:1px solid var(--line)}
+.dr-label{font-family:var(--mono);font-size:10px;font-weight:600;color:var(--ink-3);text-transform:uppercase;letter-spacing:.14em}
+.dr-input{font-family:var(--mono);font-size:12px;color:var(--ink);background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:6px 10px;outline:none;transition:border-color .12s;color-scheme:light}
+.dr-input:focus{border-color:var(--accent)}
+.dr-sep{color:var(--ink-3)}
+.dr-reset{font-family:var(--mono);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-2);background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:6px 12px;cursor:pointer;transition:background .12s,color .12s}
+.dr-reset:hover{background:var(--accent-soft);color:var(--accent)}
+
 /* ── Layout ────────────────────────────────────────── */
 .layout{display:grid;grid-template-columns:250px 1fr;align-items:start}
 
@@ -336,6 +346,7 @@ a{color:inherit}
 .mgr-section{margin-bottom:52px;scroll-margin-top:20px}
 .mgr-header{display:flex;align-items:baseline;flex-wrap:wrap;gap:12px;margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--line)}
 .mgr-header h2{font-family:var(--mono);font-size:19px;font-weight:700;letter-spacing:-.015em;color:var(--ink)}
+.mgr-pills{display:contents}
 .pill{font-family:var(--mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--line);border-radius:5px;padding:3px 10px;color:var(--ink-2)}
 .pill.crit{color:var(--crit);background:var(--crit-bg);border-color:var(--crit-line)}
 .pill.high{color:var(--high);background:var(--high-bg);border-color:var(--high-line)}
@@ -409,6 +420,7 @@ _RESPONSIVE_CSS = """
   .page-header{padding:20px 16px 0}
   .page-header h1{font-size:23px}
   .page-header .meta{margin-bottom:18px}
+  .daterange{padding:11px 16px;gap:8px}
   .stat-cell{padding:11px 18px 13px}
   .stat-cell:first-child{padding-left:0}
   .stat-num{font-size:20px}
@@ -489,8 +501,10 @@ _NAV_SCRIPT = """
         }
       }
     }
-    root.querySelectorAll('[data-view]').forEach(function(el){
-      el.addEventListener('click', function(e){ e.preventDefault(); show(el.getAttribute('data-view')); });
+    // Delegated so dynamically re-rendered cards (monthly date filter) still work.
+    root.addEventListener('click', function(e){
+      var el = e.target.closest ? e.target.closest('[data-view]') : null;
+      if (el && root.contains(el)) { e.preventDefault(); show(el.getAttribute('data-view')); }
     });
     if (search){
       search.addEventListener('input', function(){
@@ -519,6 +533,138 @@ _NAV_SCRIPT = """
   var roots = document.querySelectorAll('[data-report]');
   var useHash = roots.length === 1;
   roots.forEach(function(r){ initReport(r, useHash); });
+})();
+</script>
+"""
+
+# Monthly-only client-side date-range filter. Emitted (with the data island +
+# picker) only when period_type == "monthly". It recomputes every aggregate from
+# the embedded per-event dates for the chosen sub-range — stat strip, sidebar
+# counts, category bars, manager cards, per-manager dossiers (event cards +
+# pills), proposals count, and the period label. It does NOT render on load
+# (the server HTML already shows the full month); it engages only when the user
+# picks a range. Scoped to the root that carries [data-month-data]; the weekly
+# root (dashboard) has none and is skipped. Events without a date are dropped
+# from a sub-range (their bucket is unknown) rather than mis-placed.
+_MONTH_FILTER_SCRIPT = """
+<script>
+(function(){
+  var MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function fmt(iso){var p=(iso||'').split('-');if(p.length!==3)return iso||'';return p[2]+' '+(MONTHS[parseInt(p[1],10)-1]||p[1])+' '+p[0];}
+  function initMonth(root){
+    if(root.hasAttribute('data-month-ready'))return;
+    var dataEl=root.querySelector('[data-month-data]');
+    if(!dataEl)return;
+    root.setAttribute('data-month-ready','1');
+    var D;try{D=JSON.parse(dataEl.textContent);}catch(e){return;}
+    var fromI=root.querySelector('[data-range-from]'),toI=root.querySelector('[data-range-to]'),
+        resetB=root.querySelector('[data-range-reset]'),periodEl=root.querySelector('[data-period]');
+    if(!fromI||!toI)return;
+    var catOrder={},catLabel={};
+    (D.categories||[]).forEach(function(c,i){catOrder[c[0]]=i;catLabel[c[0]]=c[1];});
+    var lo0=D.periodStart,hi0=D.periodEnd;
+    fromI.min=lo0;fromI.max=hi0;fromI.value=lo0;
+    toI.min=lo0;toI.max=hi0;toI.value=hi0;
+
+    function inRange(d,lo,hi){return d>=lo&&d<=hi;}
+    function badges(total,crit,isAll){
+      if(total===0&&!isAll)return '<span class="sb-clean">\\u2713</span>';
+      var s='';if(crit)s+='<span class="sb-crit">'+crit+'!</span>';s+='<span class="sb-count">'+total+'</span>';return s;
+    }
+    function catRows(cat){
+      var arr=[],max=0,k;
+      for(k in cat){arr.push({key:k,total:cat[k].total,hi:cat[k].hi,lo:cat[k].lo});if(cat[k].total>max)max=cat[k].total;}
+      arr.sort(function(a,b){var o1=catOrder[a.key]==null?99:catOrder[a.key],o2=catOrder[b.key]==null?99:catOrder[b.key];return (b.total-a.total)||(o1-o2);});
+      return arr.map(function(c){
+        var pct=max?Math.max(8,Math.round(c.total/max*100)):0;
+        return '<div class="cat-row"><span class="cat-label">'+esc(catLabel[c.key]||c.key)+'</span>'
+          +'<span class="cat-track"><span class="cat-fill" style="width:'+pct+'%">'
+          +'<span class="seg hi" style="flex:'+c.hi+'"></span><span class="seg lo" style="flex:'+c.lo+'"></span>'
+          +'</span></span><span class="cat-count">'+c.total+'</span></div>';
+      }).join('');
+    }
+    function cards(perMgr){
+      return (D.managers||[]).map(function(m){
+        var pm=perMgr[m.id]||{crit:0,high:0,med:0,low:0,total:0};
+        var head='<div class="mc-top"><span class="mc-name">'+esc(m.name)+'</span>'
+          +(pm.total===0?'<span class="mc-clean">\\u2713 clean</span>':'<span class="mc-total">'+pm.total+'</span>')+'</div>';
+        var body='';
+        if(pm.total>0){
+          var pills='';if(pm.crit)pills+='<span class="mc-pill crit">'+pm.crit+' crit</span>';
+          if(pm.high)pills+='<span class="mc-pill high">'+pm.high+' high</span>';
+          if(pm.med)pills+='<span class="mc-pill med">'+pm.med+' med</span>';
+          var bar='';if(pm.crit)bar+='<span class="seg crit" style="flex:'+pm.crit+'"></span>';
+          if(pm.high)bar+='<span class="seg high" style="flex:'+pm.high+'"></span>';
+          if(pm.med)bar+='<span class="seg med" style="flex:'+pm.med+'"></span>';
+          if(pm.low)bar+='<span class="seg low" style="flex:'+pm.low+'"></span>';
+          body='<div class="mc-pills">'+pills+'</div><div class="mc-bar">'+bar+'</div>';
+        }
+        return '<a href="#" class="mgr-card'+(pm.total===0?' is-clean':'')+'" data-view="'+esc(m.id)+'" data-slug="'+esc(m.slug)+'" data-name="'+esc(m.name)+'">'+head+body+'</a>';
+      }).join('');
+    }
+    function setStat(n,v){var el=root.querySelector('[data-stat="'+n+'"]');if(el)el.textContent=v;}
+
+    function render(lo,hi){
+      var evs=(D.events||[]).filter(function(e){return e.d&&inRange(e.d,lo,hi);});
+      var stats={total:evs.length,critical:0,high:0,medium:0,low:0},perMgr={},cat={};
+      evs.forEach(function(e){
+        if(e.lvl==='critical')stats.critical++;else if(e.lvl==='high')stats.high++;else if(e.lvl==='medium')stats.medium++;else stats.low++;
+        var pm=perMgr[e.m]||(perMgr[e.m]={crit:0,high:0,med:0,low:0,total:0});pm.total++;
+        if(e.lvl==='critical')pm.crit++;else if(e.lvl==='high')pm.high++;else if(e.lvl==='medium')pm.med++;else pm.low++;
+        var c=cat[e.type]||(cat[e.type]={hi:0,lo:0,total:0});c.total++;
+        if(e.lvl==='critical'||e.lvl==='high')c.hi++;else c.lo++;
+      });
+      var proposals=(D.proposalDates||[]).filter(function(d){return d&&inRange(d,lo,hi);}).length;
+      var mgrs=D.managers||[],flagged=0;mgrs.forEach(function(m){if(perMgr[m.id]&&perMgr[m.id].total>0)flagged++;});
+      setStat('total',stats.total);setStat('critical',stats.critical);setStat('high',stats.high);
+      setStat('medium',stats.medium);setStat('proposals',proposals);setStat('flagged',flagged+'/'+mgrs.length);
+      if(periodEl)periodEl.textContent=fmt(lo)+' \\u2013 '+fmt(hi);
+      var allItem=root.querySelector('.sidebar [data-view="all"]');
+      if(allItem)allItem.innerHTML='<span class="sb-name">All</span>'+badges(stats.total,stats.critical,true);
+      root.querySelectorAll('.sidebar .sb-item[data-view]').forEach(function(b){
+        var v=b.getAttribute('data-view');if(v==='all')return;
+        var pm=perMgr[v]||{total:0,crit:0};
+        b.innerHTML='<span class="sb-name">'+esc(b.getAttribute('data-name'))+'</span>'+badges(pm.total,pm.crit,false);
+      });
+      var summary=root.querySelector('[data-summary]');
+      if(summary){
+        if(stats.total===0){
+          summary.innerHTML='<div class="portfolio-clean"><span class="pc-check">\\u2713</span><div>'
+            +'<p class="pc-title">No risk signals in selected range</p>'
+            +'<p class="pc-sub">All '+mgrs.length+' monitored portfolio'+(mgrs.length!==1?'s':'')+' clean. '
+            +proposals+' manager proposal'+(proposals!==1?'s':'')+' logged.</p></div></div>';
+        }else{
+          summary.innerHTML='<p class="section-label">Risk by Category</p><div class="cat-list">'+catRows(cat)+'</div>'
+            +'<div class="cat-legend"><span><i class="hi"></i>Critical / High</span><span><i class="lo"></i>Medium / Low</span></div>'
+            +'<p class="section-label">Managers</p><div class="mgr-cards">'+cards(perMgr)+'</div>';
+        }
+      }
+      mgrs.forEach(function(m){
+        var sec=root.querySelector('.mgr-section[data-mgr="'+m.id+'"]');if(!sec)return;
+        var pm=perMgr[m.id]||{total:0,crit:0,high:0,med:0,low:0};
+        var evcards=sec.querySelectorAll('.event'),vis=0;
+        evcards.forEach(function(c){var d=c.getAttribute('data-date');var sh=d&&inRange(d,lo,hi);c.style.display=sh?'':'none';if(sh)vis++;});
+        var pillsEl=sec.querySelector('[data-mgr-pills]');
+        if(pillsEl){var h='<span class="pill">'+pm.total+' event'+(pm.total!==1?'s':'')+'</span>';
+          if(pm.crit)h+='<span class="pill crit">'+pm.crit+' critical</span>';
+          if(pm.high)h+='<span class="pill high">'+pm.high+' high</span>';
+          if(pm.med)h+='<span class="pill med">'+pm.med+' medium</span>';pillsEl.innerHTML=h;}
+        var note=sec.querySelector('[data-no-range]');
+        if(note)note.style.display=(evcards.length>0&&vis===0)?'':'none';
+      });
+    }
+    function apply(){
+      var lo=fromI.value||lo0,hi=toI.value||hi0;
+      if(lo>hi){var t=lo;lo=hi;hi=t;}
+      if(lo<lo0)lo=lo0;if(hi>hi0)hi=hi0;
+      render(lo,hi);
+    }
+    fromI.addEventListener('change',apply);
+    toI.addEventListener('change',apply);
+    if(resetB)resetB.addEventListener('click',function(){fromI.value=lo0;toI.value=hi0;apply();});
+  }
+  document.querySelectorAll('[data-report]').forEach(initMonth);
 })();
 </script>
 """
@@ -557,16 +703,25 @@ _REPORT_BODY = """\
 
 <header class="page-header">
   <h1>{{ title }}</h1>
-  <p class="meta">Period: <strong>{{ period_label }}</strong>&nbsp;&nbsp;·&nbsp;&nbsp;Generated: {{ generated_at }}</p>
+  <p class="meta">Period: <strong data-period>{{ period_label }}</strong>&nbsp;&nbsp;·&nbsp;&nbsp;Generated: {{ generated_at }}</p>
   <div class="stat-strip">
-    <div class="stat-cell"><span class="stat-num">{{ stats.total_events }}</span><span class="stat-lbl">Risk events</span></div>
-    <div class="stat-cell"><span class="stat-num crit">{{ stats.critical }}</span><span class="stat-lbl">Critical</span></div>
-    <div class="stat-cell"><span class="stat-num high">{{ stats.high }}</span><span class="stat-lbl">High</span></div>
-    <div class="stat-cell"><span class="stat-num">{{ stats.medium }}</span><span class="stat-lbl">Medium</span></div>
-    <div class="stat-cell"><span class="stat-num">{{ stats.proposals }}</span><span class="stat-lbl">Mgr proposals</span></div>
-    <div class="stat-cell"><span class="stat-num">{{ stats.flagged }}/{{ stats.managers }}</span><span class="stat-lbl">Managers flagged</span></div>
+    <div class="stat-cell"><span class="stat-num" data-stat="total">{{ stats.total_events }}</span><span class="stat-lbl">Risk events</span></div>
+    <div class="stat-cell"><span class="stat-num crit" data-stat="critical">{{ stats.critical }}</span><span class="stat-lbl">Critical</span></div>
+    <div class="stat-cell"><span class="stat-num high" data-stat="high">{{ stats.high }}</span><span class="stat-lbl">High</span></div>
+    <div class="stat-cell"><span class="stat-num" data-stat="medium">{{ stats.medium }}</span><span class="stat-lbl">Medium</span></div>
+    <div class="stat-cell"><span class="stat-num" data-stat="proposals">{{ stats.proposals }}</span><span class="stat-lbl">Mgr proposals</span></div>
+    <div class="stat-cell"><span class="stat-num" data-stat="flagged">{{ stats.flagged }}/{{ stats.managers }}</span><span class="stat-lbl">Managers flagged</span></div>
   </div>
 </header>
+{% if is_monthly %}
+<div class="daterange" data-daterange>
+  <span class="dr-label">Date range</span>
+  <input type="date" class="dr-input" data-range-from aria-label="Range start date">
+  <span class="dr-sep">–</span>
+  <input type="date" class="dr-input" data-range-to aria-label="Range end date">
+  <button type="button" class="dr-reset" data-range-reset>Reset</button>
+</div>
+{% endif %}
 
 <div class="layout">
 
@@ -597,7 +752,7 @@ _REPORT_BODY = """\
 <main class="main">
 
   {# ── All view: portfolio summary (no per-event list) ── #}
-  <div class="view-all-only">
+  <div class="view-all-only"><div data-summary>
   {% if stats.total_events == 0 %}
     <div class="portfolio-clean">
       <span class="pc-check">✓</span>
@@ -644,7 +799,7 @@ _REPORT_BODY = """\
     {% endfor %}
     </div>
   {% endif %}
-  </div>
+  </div></div>
 
   {# ── Per-AffID detail dossiers (shown one at a time in single view) ── #}
   {% for m in managers %}
@@ -652,14 +807,16 @@ _REPORT_BODY = """\
     <div class="mgr-header">
       <button type="button" class="mgr-back" data-view="all">← All</button>
       <h2>{{ m.name }}</h2>
-      <span class="pill">{{ m.total }} event{{ 's' if m.total != 1 else '' }}</span>
-      {% if m.critical_count %}<span class="pill crit">{{ m.critical_count }} critical</span>{% endif %}
-      {% if m.high_count %}<span class="pill high">{{ m.high_count }} high</span>{% endif %}
-      {% if m.medium_count %}<span class="pill med">{{ m.medium_count }} medium</span>{% endif %}
+      <span class="mgr-pills" data-mgr-pills>
+        <span class="pill">{{ m.total }} event{{ 's' if m.total != 1 else '' }}</span>
+        {% if m.critical_count %}<span class="pill crit">{{ m.critical_count }} critical</span>{% endif %}
+        {% if m.high_count %}<span class="pill high">{{ m.high_count }} high</span>{% endif %}
+        {% if m.medium_count %}<span class="pill med">{{ m.medium_count }} medium</span>{% endif %}
+      </span>
     </div>
     {% if m.events %}
       {% for ev in m.events %}
-      <div class="event {{ ev.risk_level }}">
+      <div class="event {{ ev.risk_level }}" data-date="{{ ev.date_iso }}">
         <div class="event-header">
           <span class="badge {{ ev.risk_level }}">{{ ev.risk_level }}</span>
           <span class="ev-partner">{{ ev.partner_name }}</span>
@@ -675,11 +832,16 @@ _REPORT_BODY = """\
     {% else %}
       <p class="no-events">No risk events in this period — clean portfolio.</p>
     {% endif %}
+    {% if is_monthly %}<p class="no-events" data-no-range style="display:none">No risk events in the selected range.</p>{% endif %}
   </section>
   {% endfor %}
 
 </main>
 </div>
+{% if is_monthly %}
+<script type="application/json" data-month-data>{{ month_data|tojson }}</script>
+{{ month_script }}
+{% endif %}
 </div>
 """
 
@@ -701,6 +863,7 @@ def build_report_html(
     heatmap_rows: list[dict[str, Any]],
     event_rows: list[dict[str, Any]],
     proposals_count: int = 0,
+    proposal_dates: list[datetime] | None = None,
 ) -> str:
     """Render a complete HTML report page and return the HTML string.
 
@@ -713,6 +876,10 @@ def build_report_html(
         event_rows: rows from list_events_for_report() — full event + attribution.
         proposals_count: portfolio-wide count of manager proposals in the period
             (activity_signals) — a top-line summary metric, defaults to 0.
+        proposal_dates: proposal timestamps for the period. Supplied for the
+            MONTHLY report only, so the client-side date-range filter can
+            recompute the proposals count for a sub-range. None → weekly (no
+            filter, count stays the full-period figure).
     """
     _HI = ("critical", "high")
     # Build heatmap index: manager_id → {risk_type: count}
@@ -740,6 +907,7 @@ def build_report_html(
             author_role=str(row["author_role"]) if row.get("author_role") else None,
             status=str(row.get("status") or ""),
             date_str=ts.strftime("%Y-%m-%d %H:%M"),
+            date_iso=ts.strftime("%Y-%m-%d"),
         )
         events_index.setdefault(mid, []).append(ev)
 
@@ -810,6 +978,30 @@ def build_report_html(
         )
     categories_summary.sort(key=lambda c: (-c["total"], order.get(c["key"], 99)))
 
+    # Monthly-only: data island for the client-side date-range filter. The
+    # picker is bounded to the report's actual window [since, until]; events and
+    # proposals carry ISO dates so the browser can recompute every aggregate for
+    # any sub-range without a server round-trip.
+    is_monthly = period_type == "monthly"
+    month_data: dict[str, Any] = {}
+    month_script: Markup | str = ""
+    if is_monthly:
+        month_data = {
+            "periodStart": since.strftime("%Y-%m-%d"),
+            "periodEnd": until.strftime("%Y-%m-%d"),
+            "categories": [[k, v] for k, v in RISK_CATEGORIES],
+            "managers": [
+                {"id": m.id, "slug": m.slug, "name": m.name} for m in manager_list
+            ],
+            "events": [
+                {"m": m.id, "d": ev.date_iso, "lvl": ev.risk_level, "type": ev.risk_type}
+                for m in manager_list
+                for ev in m.events
+            ],
+            "proposalDates": [d.strftime("%Y-%m-%d") for d in (proposal_dates or [])],
+        }
+        month_script = Markup(_MONTH_FILTER_SCRIPT)
+
     return str(
         _template.render(
             title=title,
@@ -819,6 +1011,9 @@ def build_report_html(
             categories=RISK_CATEGORIES,
             categories_summary=categories_summary,
             stats=stats,
+            is_monthly=is_monthly,
+            month_data=month_data,
+            month_script=month_script,
         )
     )
 

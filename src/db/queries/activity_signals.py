@@ -66,6 +66,32 @@ async def count_proposals(
     return int(row["n"]) if row else 0
 
 
+async def list_proposal_dates(
+    conn: asyncpg.Connection,
+    since: datetime,
+    until: datetime,
+) -> list[datetime]:
+    """Timestamps of all manager proposals in [since, until).
+
+    Supplied to the MONTHLY report builder so the client-side date-range filter
+    can recompute the proposals count for a chosen sub-range. Weekly reports
+    don't need this (they use :func:`count_proposals`).
+    """
+    rows = await conn.fetch(
+        """
+        SELECT created_at
+        FROM activity_signals
+        WHERE signal_type = 'manager_proposal'
+          AND created_at >= $1
+          AND created_at < $2
+        ORDER BY created_at
+        """,
+        since,
+        until,
+    )
+    return [r["created_at"] for r in rows]
+
+
 async def list_by_sender_since(
     conn: asyncpg.Connection,
     *,

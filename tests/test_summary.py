@@ -386,6 +386,80 @@ def test_detected_phrase_is_html_escaped() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Monthly date-range filter — picker + data island (weekly untouched)
+# ---------------------------------------------------------------------------
+
+
+def test_monthly_report_has_date_range_picker() -> None:
+    mgr = _mgr()
+    html = build_report_html(
+        period_type="monthly",
+        since=_SINCE,
+        until=_UNTIL,
+        managers=[mgr],
+        heatmap_rows=[],
+        event_rows=[_event_row(mgr["id"])],
+    )
+    # Native bounded date inputs (dropdown calendar) + reset.
+    assert "data-daterange" in html
+    assert "data-range-from" in html
+    assert "data-range-to" in html
+    assert "data-range-reset" in html
+    # Data island the client filter reads from, bounded to the report window.
+    assert "data-month-data" in html
+    assert '"periodStart"' in html
+    assert '"periodEnd"' in html
+
+
+def test_monthly_data_island_carries_event_dates() -> None:
+    mgr = _mgr()
+    row = _event_row(mgr["id"], risk_level="high", risk_type="shadow_deal")
+    html = build_report_html(
+        period_type="monthly",
+        since=_SINCE,
+        until=_UNTIL,
+        managers=[mgr],
+        heatmap_rows=[],
+        event_rows=[row],
+    )
+    # Event cards carry their date; the island carries the machine-readable copy.
+    assert 'data-date="2026-06-05"' in html
+    assert '"d": "2026-06-05"' in html
+    assert '"lvl": "high"' in html
+
+
+def test_monthly_proposal_dates_embedded() -> None:
+    mgr = _mgr()
+    html = build_report_html(
+        period_type="monthly",
+        since=_SINCE,
+        until=_UNTIL,
+        managers=[mgr],
+        heatmap_rows=[],
+        event_rows=[],
+        proposal_dates=[datetime(2026, 6, 8, 10, 0, tzinfo=UTC)],
+    )
+    assert '"proposalDates"' in html
+    assert '"2026-06-08"' in html
+
+
+def test_weekly_report_has_no_date_range_filter() -> None:
+    # Weekly is untouched: no picker, no data island, no month filter script.
+    mgr = _mgr()
+    html = build_report_html(
+        period_type="weekly",
+        since=_SINCE,
+        until=_UNTIL,
+        managers=[mgr],
+        heatmap_rows=[],
+        event_rows=[_event_row(mgr["id"])],
+    )
+    assert "data-daterange" not in html
+    assert "data-month-data" not in html
+    assert "data-month-ready" not in html
+
+
+# ---------------------------------------------------------------------------
 # RISK_CATEGORIES completeness
 # ---------------------------------------------------------------------------
 
@@ -436,6 +510,9 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     async def fake_proposals(conn: Any, since: Any, until: Any) -> int:
         return 0
 
+    async def fake_proposal_dates(conn: Any, since: Any, until: Any) -> list[Any]:
+        return []
+
     async def fake_save(conn: Any, *, period_type: Any, period_start: Any,
                         period_end: Any, rendered_html: Any, event_count: Any,
                         share_token: Any, expires_at: Any,
@@ -461,6 +538,7 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(gen_mod, "risk_heatmap", fake_heatmap)
     monkeypatch.setattr(gen_mod, "list_events_for_report", fake_events)
     monkeypatch.setattr(gen_mod, "count_proposals", fake_proposals)
+    monkeypatch.setattr(gen_mod, "list_proposal_dates", fake_proposal_dates)
     monkeypatch.setattr(gen_mod, "save_summary", fake_save)
     monkeypatch.setattr(gen_mod, "mark_summary_delivered", fake_deliver)
     monkeypatch.setattr(gen_mod, "_post_slack_link", fake_post)

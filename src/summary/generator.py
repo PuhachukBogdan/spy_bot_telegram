@@ -21,7 +21,7 @@ from typing import Any, Literal
 from src.alerts.slack import get_slack_client
 from src.config import settings
 from src.db.client import acquire_connection
-from src.db.queries.activity_signals import count_proposals
+from src.db.queries.activity_signals import count_proposals, list_proposal_dates
 from src.db.queries.summaries import (
     create_dashboard,
     list_active_managers,
@@ -77,7 +77,14 @@ async def generate_report(
         managers = await list_active_managers(conn)
         heatmap_rows = await risk_heatmap(conn, since, until)
         event_rows = await list_events_for_report(conn, since, until)
-        proposals = await count_proposals(conn, since, until)
+        # Monthly needs per-proposal dates for the client-side range filter;
+        # weekly only needs the total count.
+        if period_type == "monthly":
+            proposal_dates = await list_proposal_dates(conn, since, until)
+            proposals = len(proposal_dates)
+        else:
+            proposals = await count_proposals(conn, since, until)
+            proposal_dates = None
 
     html = build_report_html(
         period_type=period_type,
@@ -87,6 +94,7 @@ async def generate_report(
         heatmap_rows=heatmap_rows,
         event_rows=event_rows,
         proposals_count=proposals,
+        proposal_dates=proposal_dates,
     )
 
     report_pw = _gen_password()
