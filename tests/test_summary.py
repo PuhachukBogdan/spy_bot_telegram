@@ -275,11 +275,49 @@ def test_toc_shows_critical_count() -> None:
 
 
 # ---------------------------------------------------------------------------
-# build_report_html — heatmap cell classes
+# build_report_html — All-view summary (category bars, manager cards, clean)
 # ---------------------------------------------------------------------------
 
 
-def test_heatmap_zero_cell() -> None:
+def test_all_view_shows_risk_by_category() -> None:
+    # The wide matrix is replaced by a compact per-category bar list.
+    mgr = _mgr()
+    html = build_report_html(
+        period_type="weekly",
+        since=_SINCE,
+        until=_UNTIL,
+        managers=[mgr],
+        heatmap_rows=[],
+        event_rows=[_event_row(mgr["id"], risk_type="private_channel")],
+    )
+    assert "Risk by Category" in html
+    assert 'class="cat-row"' in html
+    assert "Private Channel" in html
+
+
+def test_all_view_manager_card_shows_severity() -> None:
+    mgr = _mgr("Alice")
+    rows = [
+        _event_row(mgr["id"], risk_level="critical"),
+        _event_row(mgr["id"], risk_level="high"),
+        _event_row(mgr["id"], risk_level="medium"),
+    ]
+    html = build_report_html(
+        period_type="weekly",
+        since=_SINCE,
+        until=_UNTIL,
+        managers=[mgr],
+        heatmap_rows=[],
+        event_rows=rows,
+    )
+    assert "mgr-card" in html
+    assert "mc-pill" in html
+    assert "1 crit" in html
+    assert "1 high" in html
+    assert "1 med" in html
+
+
+def test_all_view_clean_banner_when_no_events() -> None:
     mgr = _mgr()
     html = build_report_html(
         period_type="weekly",
@@ -289,33 +327,39 @@ def test_heatmap_zero_cell() -> None:
         heatmap_rows=[],
         event_rows=[],
     )
-    assert "cell-zero" in html
+    assert "portfolio-clean" in html
+    assert "No risk signals this period" in html
+    # No category bars / manager cards when the portfolio is clean.
+    assert 'class="cat-row"' not in html
 
 
-def test_heatmap_warm_cell_one_event() -> None:
+def test_proposals_count_surfaced_in_summary() -> None:
     mgr = _mgr()
     html = build_report_html(
         period_type="weekly",
         since=_SINCE,
         until=_UNTIL,
         managers=[mgr],
-        heatmap_rows=[_heatmap_row(mgr["id"], cnt=1)],
+        heatmap_rows=[],
+        event_rows=[],
+        proposals_count=7,
+    )
+    assert "Mgr proposals" in html
+    assert ">7<" in html
+
+
+def test_manager_slug_deep_link_present() -> None:
+    # A manager with an aff_id gets a URL-safe slug for the #hash deep-link.
+    mgr = _mgr(tg_username="anna_k", aff_id="78516")
+    html = build_report_html(
+        period_type="weekly",
+        since=_SINCE,
+        until=_UNTIL,
+        managers=[mgr],
+        heatmap_rows=[],
         event_rows=[_event_row(mgr["id"])],
     )
-    assert "cell-warm" in html
-
-
-def test_heatmap_hot_cell_three_events() -> None:
-    mgr = _mgr()
-    html = build_report_html(
-        period_type="weekly",
-        since=_SINCE,
-        until=_UNTIL,
-        managers=[mgr],
-        heatmap_rows=[_heatmap_row(mgr["id"], cnt=3)],
-        event_rows=[_event_row(mgr["id"]) for _ in range(3)],
-    )
-    assert "cell-hot" in html
+    assert 'data-slug="78516"' in html
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +433,9 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     async def fake_events(conn: Any, since: Any, until: Any) -> list[dict[str, Any]]:
         return []
 
+    async def fake_proposals(conn: Any, since: Any, until: Any) -> int:
+        return 0
+
     async def fake_save(conn: Any, *, period_type: Any, period_start: Any,
                         period_end: Any, rendered_html: Any, event_count: Any,
                         share_token: Any, expires_at: Any,
@@ -413,6 +460,7 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(gen_mod, "list_active_managers", fake_managers)
     monkeypatch.setattr(gen_mod, "risk_heatmap", fake_heatmap)
     monkeypatch.setattr(gen_mod, "list_events_for_report", fake_events)
+    monkeypatch.setattr(gen_mod, "count_proposals", fake_proposals)
     monkeypatch.setattr(gen_mod, "save_summary", fake_save)
     monkeypatch.setattr(gen_mod, "mark_summary_delivered", fake_deliver)
     monkeypatch.setattr(gen_mod, "_post_slack_link", fake_post)

@@ -21,6 +21,7 @@ from typing import Any, Literal
 from src.alerts.slack import get_slack_client
 from src.config import settings
 from src.db.client import acquire_connection
+from src.db.queries.activity_signals import count_proposals
 from src.db.queries.summaries import (
     create_dashboard,
     list_active_managers,
@@ -76,6 +77,7 @@ async def generate_report(
         managers = await list_active_managers(conn)
         heatmap_rows = await risk_heatmap(conn, since, until)
         event_rows = await list_events_for_report(conn, since, until)
+        proposals = await count_proposals(conn, since, until)
 
     html = build_report_html(
         period_type=period_type,
@@ -84,6 +86,7 @@ async def generate_report(
         managers=managers,
         heatmap_rows=heatmap_rows,
         event_rows=event_rows,
+        proposals_count=proposals,
     )
 
     report_pw = _gen_password()

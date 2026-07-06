@@ -55,6 +55,25 @@ def _risk_type_label(risk_type: str) -> str:
     return _RISK_TYPE_LABELS.get(risk_type, risk_type.replace("_", " ").title())
 
 
+def _slug(mgr: dict[str, Any], taken: set[str]) -> str:
+    """URL-safe handle for a manager's #hash deep-link.
+
+    Prefers aff_id (e.g. ``78516``), then tg_username, then a short id. Sanitised
+    to ``[a-z0-9-]`` and de-duplicated so two managers never collide on one hash.
+    """
+    aff = (mgr.get("aff_id") or "").strip()
+    tg = (mgr.get("tg_username") or "").strip().lstrip("@")
+    raw = aff or tg or str(mgr.get("id") or "")[:8]
+    base = _re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-") or "mgr"
+    slug = base
+    i = 2
+    while slug in taken:
+        slug = f"{base}-{i}"
+        i += 1
+    taken.add(slug)
+    return slug
+
+
 def _manager_label(mgr: dict[str, Any]) -> str:
     """Format manager display name: "{aff_id} | @{tg_username}" or either alone.
 
@@ -96,12 +115,16 @@ class EventData:
 
 @dataclass
 class ManagerData:
-    id: str          # UUID as string — used in HTML id="mgr-{id}" anchors
+    id: str          # UUID as string — the data-view / data-mgr nav key
+    slug: str        # URL-safe handle (aff_id / tg_username) for the #hash deep-link
     name: str
     events: list[EventData]
     heatmap: dict[str, int]   # risk_type → count
     total: int
     critical_count: int
+    high_count: int
+    medium_count: int
+    low_count: int
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +270,52 @@ a{color:inherit}
 .section-label{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--ink-3);text-transform:uppercase;letter-spacing:.16em;margin-bottom:16px;display:flex;align-items:center;gap:12px}
 .section-label::after{content:"";flex:1;height:1px;background:var(--line)}
 
-/* ── Signal matrix (heat-map) ──────────────────────── */
+/* ── Portfolio summary: clean banner (All view, zero risk) ── */
+.portfolio-clean{display:flex;align-items:center;gap:18px;background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--ok);border-radius:10px;padding:22px 26px;margin-bottom:44px;box-shadow:var(--shadow)}
+.pc-check{flex-shrink:0;width:38px;height:38px;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:700;color:var(--ok);background:rgba(46,125,91,.12);border-radius:50%}
+.pc-title{font-family:var(--display);font-size:18px;font-weight:800;color:var(--ink);letter-spacing:-.02em}
+.pc-sub{color:var(--ink-2);font-size:13px;margin-top:3px}
+
+/* ── Portfolio summary: risk-by-category bars (All view) ──── */
+.cat-list{display:flex;flex-direction:column;gap:9px;margin-bottom:52px;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:22px 26px;box-shadow:var(--shadow)}
+.cat-row{display:grid;grid-template-columns:150px 1fr 34px;align-items:center;gap:16px}
+.cat-label{font-size:12.5px;color:var(--ink-2);font-weight:500;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cat-track{height:14px;border-radius:4px;background:var(--surface-2);overflow:hidden}
+.cat-fill{display:flex;height:100%;min-width:4px;border-radius:4px;overflow:hidden}
+.seg{display:block;min-width:0}
+.cat-fill .seg.hi{background:var(--crit)}
+.cat-fill .seg.lo{background:var(--med)}
+.cat-count{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:13px;font-weight:700;color:var(--ink)}
+.cat-legend{display:flex;gap:18px;margin:-38px 0 52px;font-family:var(--mono);font-size:10.5px;color:var(--ink-3);text-transform:uppercase;letter-spacing:.06em}
+.cat-legend span{display:inline-flex;align-items:center;gap:6px}
+.cat-legend i{width:9px;height:9px;border-radius:2px;display:inline-block}
+.cat-legend i.hi{background:var(--crit)}
+.cat-legend i.lo{background:var(--med)}
+
+/* ── Portfolio summary: manager cards (All view) ──────────── */
+.mgr-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:14px;margin-bottom:44px}
+.mgr-card{display:flex;flex-direction:column;gap:11px;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px 18px;text-decoration:none;color:inherit;box-shadow:var(--shadow);transition:box-shadow .16s ease,transform .16s ease,border-color .16s ease}
+.mgr-card:hover{box-shadow:var(--shadow-lift);transform:translateY(-1px);border-color:var(--accent)}
+.mgr-card.is-clean{opacity:.66}
+.mgr-card.is-clean:hover{opacity:1}
+.mc-top{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
+.mc-name{font-family:var(--mono);font-size:12.5px;font-weight:600;color:var(--ink);letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mc-total{flex-shrink:0;font-family:var(--mono);font-size:22px;font-weight:700;line-height:1;color:var(--ink);font-variant-numeric:tabular-nums}
+.mc-clean{flex-shrink:0;font-size:12px;color:var(--ok);font-weight:600}
+.mc-pills{display:flex;flex-wrap:wrap;gap:5px}
+.mc-pill{font-family:var(--mono);font-size:10px;font-weight:700;padding:2px 7px;border-radius:4px;border:1px solid;text-transform:uppercase;letter-spacing:.04em}
+.mc-pill.crit{color:var(--crit);background:var(--crit-bg);border-color:var(--crit-line)}
+.mc-pill.high{color:var(--high);background:var(--high-bg);border-color:var(--high-line)}
+.mc-pill.med{color:var(--med);background:var(--med-bg);border-color:var(--med-line)}
+.mc-bar{display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--surface-2)}
+.mc-bar .seg.crit{background:var(--crit)}
+.mc-bar .seg.high{background:var(--high)}
+.mc-bar .seg.med{background:var(--med)}
+.mc-bar .seg.low{background:var(--low)}
+
+/* ── Signal matrix (heat-map) — retained for transitional stored
+      bodies embedded in the dashboard during the report expiry window;
+      new reports no longer emit the matrix (superseded by the summary). ── */
 .heatmap-wrap{overflow-x:auto;margin-bottom:56px;background:var(--surface);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow)}
 .heatmap{border-collapse:collapse;width:100%;white-space:nowrap}
 .heatmap th{padding:14px 10px;text-align:center;font-family:var(--mono);font-weight:600;color:var(--ink-3);font-size:10px;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--line)}
@@ -270,6 +338,8 @@ a{color:inherit}
 .mgr-header h2{font-family:var(--mono);font-size:19px;font-weight:700;letter-spacing:-.015em;color:var(--ink)}
 .pill{font-family:var(--mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--line);border-radius:5px;padding:3px 10px;color:var(--ink-2)}
 .pill.crit{color:var(--crit);background:var(--crit-bg);border-color:var(--crit-line)}
+.pill.high{color:var(--high);background:var(--high-bg);border-color:var(--high-line)}
+.pill.med{color:var(--med);background:var(--med-bg);border-color:var(--med-line)}
 .pill.clean{color:var(--ok)}
 
 /* ── Navigation modes: All (default) vs single-manager view ─ */
@@ -311,8 +381,8 @@ a{color:inherit}
 
 /* ── Page-load reveal ──────────────────────────────── */
 @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-.mgr-section,.heatmap-wrap{animation:rise .5s ease both}
-.heatmap-wrap{animation-delay:.05s}
+.mgr-section,.heatmap-wrap,.cat-list,.mgr-cards,.portfolio-clean{animation:rise .5s ease both}
+.mgr-cards{animation-delay:.05s}
 """
 
 # Dashboard-only additions: the sticky segmented tab bar + panels. Appended to
@@ -351,6 +421,11 @@ _RESPONSIVE_CSS = """
   .main{padding:24px 14px 56px}
   .section-label{margin-bottom:12px}
   .heatmap-wrap{margin-bottom:36px;-webkit-overflow-scrolling:touch}
+  .cat-list{padding:16px 16px;margin-bottom:36px}
+  .cat-row{grid-template-columns:96px 1fr 28px;gap:10px}
+  .cat-label{font-size:11.5px}
+  .cat-legend{margin:-28px 0 36px}
+  .mgr-cards{grid-template-columns:1fr 1fr;gap:10px;margin-bottom:32px}
   .mgr-section{margin-bottom:36px}
   .mgr-header h2{font-size:16px}
   .event{padding:14px 15px}
@@ -367,27 +442,52 @@ _RESPONSIVE_CSS = """
 """
 
 # Client-side navigation. Scoped per ``[data-report]`` root so the dashboard's
-# two embedded report bodies (weekly + monthly) never cross-wire. Adds: the
-# ``All`` view (default — full report), a per-manager single view (heat-map
-# hidden, only that manager's dossier shown), a "← All" back control, and a
-# search box that filters ONLY the roster list without touching the open view.
-# Pure presentation: no data, no routing, degrades to the full page if JS is off.
+# two embedded report bodies (weekly + monthly) never cross-wire. Two views:
+#   • ``All`` (default) — the portfolio *summary* (category bars + manager cards);
+#     every per-manager dossier is hidden here.
+#   • a per-AffID *detail* view — the summary hides, only that manager's dossier
+#     shows, with a "← All" control and the roster item highlighted.
+# When the page holds exactly ONE report (the standalone /r/{token} page), the
+# selected AffID is mirrored to the URL as ``#{slug}`` so a view is shareable and
+# deep-linkable; the dashboard (two roots) skips the hash to stay unambiguous.
+# The roster search filters ONLY the sidebar list, never the open view. Pure
+# presentation — degrades to the full stacked report if JS is off.
 _NAV_SCRIPT = """
 <script>
 (function(){
-  function initReport(root){
+  function initReport(root, useHash){
+    if (root.hasAttribute('data-nav-ready')) { return; }
+    root.setAttribute('data-nav-ready', '1');
     var search = root.querySelector('[data-search]');
     var empty = root.querySelector('[data-empty]');
-    function show(view){
+    var slugToView = {}, viewToSlug = {};
+    root.querySelectorAll('[data-slug]').forEach(function(el){
+      var v = el.getAttribute('data-view') || el.getAttribute('data-mgr');
+      var s = el.getAttribute('data-slug');
+      if (v && s){ slugToView[s] = v; viewToSlug[v] = s; }
+    });
+    function apply(view){
       root.classList.toggle('mode-all', view === 'all');
       root.classList.toggle('mode-single', view !== 'all');
+      // Dossiers show ONLY in a specific manager's detail view; All is summary-only.
       root.querySelectorAll('.mgr-section').forEach(function(s){
-        s.style.display = (view === 'all' || s.getAttribute('data-mgr') === view) ? '' : 'none';
+        s.style.display = (view !== 'all' && s.getAttribute('data-mgr') === view) ? '' : 'none';
       });
       root.querySelectorAll('.sidebar [data-view]').forEach(function(b){
         b.classList.toggle('active', b.getAttribute('data-view') === view);
       });
       if (view !== 'all') { window.scrollTo(0, 0); }
+    }
+    function show(view){
+      apply(view);
+      if (useHash){
+        var s = viewToSlug[view];
+        if (view !== 'all' && s){
+          if (location.hash !== '#' + s) { history.replaceState(null, '', '#' + s); }
+        } else if (location.hash){
+          history.replaceState(null, '', location.pathname + location.search);
+        }
+      }
     }
     root.querySelectorAll('[data-view]').forEach(function(el){
       el.addEventListener('click', function(e){ e.preventDefault(); show(el.getAttribute('data-view')); });
@@ -405,9 +505,20 @@ _NAV_SCRIPT = """
         if (empty) { empty.style.display = shown ? 'none' : 'block'; }
       });
     }
-    show('all');
+    function fromHash(){
+      var h = decodeURIComponent((location.hash || '').replace(/^#/, ''));
+      return (h && slugToView[h]) ? slugToView[h] : 'all';
+    }
+    if (useHash){
+      window.addEventListener('hashchange', function(){ apply(fromHash()); });
+      apply(fromHash());
+    } else {
+      apply('all');
+    }
   }
-  document.querySelectorAll('[data-report]').forEach(initReport);
+  var roots = document.querySelectorAll('[data-report]');
+  var useHash = roots.length === 1;
+  roots.forEach(function(r){ initReport(r, useHash); });
 })();
 </script>
 """
@@ -451,6 +562,8 @@ _REPORT_BODY = """\
     <div class="stat-cell"><span class="stat-num">{{ stats.total_events }}</span><span class="stat-lbl">Risk events</span></div>
     <div class="stat-cell"><span class="stat-num crit">{{ stats.critical }}</span><span class="stat-lbl">Critical</span></div>
     <div class="stat-cell"><span class="stat-num high">{{ stats.high }}</span><span class="stat-lbl">High</span></div>
+    <div class="stat-cell"><span class="stat-num">{{ stats.medium }}</span><span class="stat-lbl">Medium</span></div>
+    <div class="stat-cell"><span class="stat-num">{{ stats.proposals }}</span><span class="stat-lbl">Mgr proposals</span></div>
     <div class="stat-cell"><span class="stat-num">{{ stats.flagged }}/{{ stats.managers }}</span><span class="stat-lbl">Managers flagged</span></div>
   </div>
 </header>
@@ -468,7 +581,7 @@ _REPORT_BODY = """\
   </button>
   <span class="sidebar-label">Managers</span>
   {% for m in managers %}
-  <button type="button" class="sb-item" data-view="{{ m.id }}" data-name="{{ m.name }}">
+  <button type="button" class="sb-item" data-view="{{ m.id }}" data-slug="{{ m.slug }}" data-name="{{ m.name }}">
     <span class="sb-name">{{ m.name }}</span>
     {% if m.total == 0 %}
       <span class="sb-clean">✓</span>
@@ -483,42 +596,66 @@ _REPORT_BODY = """\
 
 <main class="main">
 
+  {# ── All view: portfolio summary (no per-event list) ── #}
   <div class="view-all-only">
-  <p class="section-label">Signal Matrix</p>
-  <div class="heatmap-wrap">
-  <table class="heatmap">
-    <thead>
-      <tr>
-        <th class="mgr-col">Manager</th>
-        {% for _, label in categories %}<th>{{ label }}</th>{% endfor %}
-        <th>Total</th>
-      </tr>
-    </thead>
-    <tbody>
-    {% for m in managers %}
-      <tr>
-        <td class="mgr-cell"><a href="#" data-view="{{ m.id }}">{{ m.name }}</a></td>
-        {% for key, _ in categories %}
-          {% set cnt = m.heatmap.get(key, 0) %}
-          <td class="{{ 'cell-hot' if cnt >= 3 else ('cell-warm' if cnt >= 1 else 'cell-zero') }}">
-            {{- cnt if cnt else '·' -}}
-          </td>
-        {% endfor %}
-        <td class="total-cell">{{ m.total }}</td>
-      </tr>
+  {% if stats.total_events == 0 %}
+    <div class="portfolio-clean">
+      <span class="pc-check">✓</span>
+      <div>
+        <p class="pc-title">No risk signals this period</p>
+        <p class="pc-sub">All {{ stats.managers }} monitored portfolio{{ 's' if stats.managers != 1 else '' }} clean. {{ stats.proposals }} manager proposal{{ 's' if stats.proposals != 1 else '' }} logged.</p>
+      </div>
+    </div>
+  {% else %}
+    <p class="section-label">Risk by Category</p>
+    <div class="cat-list">
+    {% for c in categories_summary %}
+      <div class="cat-row">
+        <span class="cat-label">{{ c.label }}</span>
+        <span class="cat-track"><span class="cat-fill" style="width:{{ c.pct }}%"><span class="seg hi" style="flex:{{ c.hi }}"></span><span class="seg lo" style="flex:{{ c.lo }}"></span></span></span>
+        <span class="cat-count">{{ c.total }}</span>
+      </div>
     {% endfor %}
-    </tbody>
-  </table>
-  </div>
+    </div>
+    <div class="cat-legend"><span><i class="hi"></i>Critical / High</span><span><i class="lo"></i>Medium / Low</span></div>
+
+    <p class="section-label">Managers</p>
+    <div class="mgr-cards">
+    {% for m in managers %}
+      <a href="#" class="mgr-card{{ ' is-clean' if m.total == 0 else '' }}" data-view="{{ m.id }}" data-slug="{{ m.slug }}" data-name="{{ m.name }}">
+        <div class="mc-top">
+          <span class="mc-name">{{ m.name }}</span>
+          {% if m.total == 0 %}<span class="mc-clean">✓ clean</span>{% else %}<span class="mc-total">{{ m.total }}</span>{% endif %}
+        </div>
+        {% if m.total > 0 %}
+        <div class="mc-pills">
+          {% if m.critical_count %}<span class="mc-pill crit">{{ m.critical_count }} crit</span>{% endif %}
+          {% if m.high_count %}<span class="mc-pill high">{{ m.high_count }} high</span>{% endif %}
+          {% if m.medium_count %}<span class="mc-pill med">{{ m.medium_count }} med</span>{% endif %}
+        </div>
+        <div class="mc-bar">
+          {% if m.critical_count %}<span class="seg crit" style="flex:{{ m.critical_count }}"></span>{% endif %}
+          {% if m.high_count %}<span class="seg high" style="flex:{{ m.high_count }}"></span>{% endif %}
+          {% if m.medium_count %}<span class="seg med" style="flex:{{ m.medium_count }}"></span>{% endif %}
+          {% if m.low_count %}<span class="seg low" style="flex:{{ m.low_count }}"></span>{% endif %}
+        </div>
+        {% endif %}
+      </a>
+    {% endfor %}
+    </div>
+  {% endif %}
   </div>
 
+  {# ── Per-AffID detail dossiers (shown one at a time in single view) ── #}
   {% for m in managers %}
-  <section class="mgr-section" data-mgr="{{ m.id }}">
+  <section class="mgr-section" data-mgr="{{ m.id }}" data-slug="{{ m.slug }}">
     <div class="mgr-header">
       <button type="button" class="mgr-back" data-view="all">← All</button>
       <h2>{{ m.name }}</h2>
       <span class="pill">{{ m.total }} event{{ 's' if m.total != 1 else '' }}</span>
       {% if m.critical_count %}<span class="pill crit">{{ m.critical_count }} critical</span>{% endif %}
+      {% if m.high_count %}<span class="pill high">{{ m.high_count }} high</span>{% endif %}
+      {% if m.medium_count %}<span class="pill med">{{ m.medium_count }} medium</span>{% endif %}
     </div>
     {% if m.events %}
       {% for ev in m.events %}
@@ -538,7 +675,6 @@ _REPORT_BODY = """\
     {% else %}
       <p class="no-events">No risk events in this period — clean portfolio.</p>
     {% endif %}
-    <a class="back-top" href="#top">↑ Back to top</a>
   </section>
   {% endfor %}
 
@@ -564,6 +700,7 @@ def build_report_html(
     managers: list[dict[str, Any]],
     heatmap_rows: list[dict[str, Any]],
     event_rows: list[dict[str, Any]],
+    proposals_count: int = 0,
 ) -> str:
     """Render a complete HTML report page and return the HTML string.
 
@@ -574,7 +711,10 @@ def build_report_html(
         managers: rows from list_active_managers() — id, full_name.
         heatmap_rows: rows from risk_heatmap() — manager_id, risk_type, cnt.
         event_rows: rows from list_events_for_report() — full event + attribution.
+        proposals_count: portfolio-wide count of manager proposals in the period
+            (activity_signals) — a top-line summary metric, defaults to 0.
     """
+    _HI = ("critical", "high")
     # Build heatmap index: manager_id → {risk_type: count}
     heatmap_index: dict[UUID, dict[str, int]] = {}
     for row in heatmap_rows:
@@ -605,6 +745,7 @@ def build_report_html(
 
     # Assemble ManagerData for each manager
     manager_list: list[ManagerData] = []
+    taken_slugs: set[str] = set()
     for mgr in managers:
         mid = UUID(str(mgr["id"]))
         mid_str = str(mid)
@@ -612,11 +753,15 @@ def build_report_html(
         manager_list.append(
             ManagerData(
                 id=mid_str,
+                slug=_slug(mgr, taken_slugs),
                 name=_manager_label(mgr),
                 events=evs,
                 heatmap=heatmap_index.get(mid, {}),
                 total=len(evs),
                 critical_count=sum(1 for e in evs if e.risk_level == "critical"),
+                high_count=sum(1 for e in evs if e.risk_level == "high"),
+                medium_count=sum(1 for e in evs if e.risk_level == "medium"),
+                low_count=sum(1 for e in evs if e.risk_level == "low"),
             )
         )
 
@@ -630,9 +775,40 @@ def build_report_html(
         "total_events": len(all_events),
         "critical": sum(1 for e in all_events if e.risk_level == "critical"),
         "high": sum(1 for e in all_events if e.risk_level == "high"),
+        "medium": sum(1 for e in all_events if e.risk_level == "medium"),
+        "low": sum(1 for e in all_events if e.risk_level == "low"),
+        "proposals": proposals_count,
         "managers": len(manager_list),
         "flagged": sum(1 for m in manager_list if m.total > 0),
     }
+
+    # Portfolio risk-by-category breakdown (replaces the wide manager×category
+    # matrix): per category a hi (critical+high) / lo (medium+low) split, sorted
+    # by volume, only non-zero categories, bar width relative to the busiest.
+    cat_acc: dict[str, dict[str, int]] = {}
+    for e in all_events:
+        d = cat_acc.setdefault(e.risk_type, {"hi": 0, "lo": 0, "total": 0})
+        if e.risk_level in _HI:
+            d["hi"] += 1
+        else:
+            d["lo"] += 1
+        d["total"] += 1
+    max_total = max((d["total"] for d in cat_acc.values()), default=0)
+    order = {k: i for i, (k, _) in enumerate(RISK_CATEGORIES)}
+    categories_summary: list[dict[str, Any]] = []
+    for key, d in cat_acc.items():
+        pct = max(8, round(d["total"] / max_total * 100)) if max_total else 0
+        categories_summary.append(
+            {
+                "key": key,
+                "label": _risk_type_label(key),
+                "total": d["total"],
+                "hi": d["hi"],
+                "lo": d["lo"],
+                "pct": pct,
+            }
+        )
+    categories_summary.sort(key=lambda c: (-c["total"], order.get(c["key"], 99)))
 
     return str(
         _template.render(
@@ -641,6 +817,7 @@ def build_report_html(
             generated_at=generated_at,
             managers=manager_list,
             categories=RISK_CATEGORIES,
+            categories_summary=categories_summary,
             stats=stats,
         )
     )
