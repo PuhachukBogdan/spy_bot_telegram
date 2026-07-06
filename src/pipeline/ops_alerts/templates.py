@@ -6,8 +6,9 @@ on stray ``<`` / ``>`` / ``&`` in feed content.
 
 These messages broadcast into partner groups (the sanctioned proactive-write
 path), so they must never reveal the monitoring source: the feed's own
-status-page URL and incident id are NOT rendered, and the free-text ``details``
-is stripped of HTML — which also drops any source links held in tag attributes.
+status-page URL and incident id are NOT rendered, the provider name is NOT
+rendered, and the free-text ``details`` is stripped of HTML — which also drops
+any source links held in tag attributes.
 """
 
 from __future__ import annotations
@@ -43,7 +44,6 @@ def format_new_incident(inc: Incident, *, detected_at: str) -> str:
     return (
         "🚨 <b>PAYMENT ALERT — NEW ISSUE</b>\n"
         f"<b>Country:</b> {_esc(inc.country)}\n"
-        f"<b>Provider:</b> {_esc(inc.provider)}\n"
         f"<b>Issue:</b> {_esc(inc.issue)}\n"
         f"<b>Status:</b> {_esc(inc.status)}\n"
         f"<b>Detection time:</b> {_esc(detected_at)}\n\n"
@@ -58,7 +58,6 @@ def format_update(inc: Incident, *, updated_at: str) -> str:
     return (
         f"{header}\n\n"
         f"<b>Country:</b> {_esc(inc.country)}\n"
-        f"<b>Provider:</b> {_esc(inc.provider)}\n"
         f"<b>Issue:</b> {_esc(inc.issue)}\n"
         f"<b>Status:</b> {_esc(inc.status)}\n"
         f"<b>Last update:</b> {_esc(updated_at)}\n\n"
@@ -71,7 +70,6 @@ def format_holiday(holiday: Holiday) -> str:
         "🎊 <b>ARGENTINA HOLIDAY REMINDER</b>\n"
         f"{_esc(holiday.name)}\n"
         f"<b>Date:</b> {holiday.date.isoformat()}\n"
-        f"<b>Population celebrating:</b> {holiday.population}%\n"
         f"<b>Business impact:</b> {_esc(holiday.impact)}\n\n"
         "⚠️ <b>Expect potential changes in:</b>\n"
         "- Deposits activity\n"

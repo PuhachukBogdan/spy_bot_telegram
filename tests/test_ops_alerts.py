@@ -237,6 +237,8 @@ def test_incident_templates_do_not_leak_source() -> None:
         assert "d24" not in out.lower()        # no source-provider name
         assert "http" not in out.lower()       # no link rendered at all
         assert inc.incident_id not in out      # no internal incident id
+        assert "santander" not in out.lower()  # payment provider name never shown
+        assert "provider" not in out.lower()   # no Provider: field at all
 
 
 def test_format_update_resolved_header() -> None:
@@ -248,7 +250,9 @@ def test_format_update_resolved_header() -> None:
 
 def test_format_holiday_has_name() -> None:
     h = get_holidays(2026)[0]  # Año Nuevo
-    assert "Año Nuevo" in format_holiday(h)
+    out = format_holiday(h)
+    assert "Año Nuevo" in out
+    assert "Population celebrating" not in out  # dropped from the header
 
 
 # ---------------------------------------------------------------------------
