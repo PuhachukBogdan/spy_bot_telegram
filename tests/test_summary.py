@@ -494,6 +494,10 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "delivered": [],
         "slack_posts": [],
         "dashboard_pw": None,
+        "slack_set": [],
+        "revoked_keep": [],
+        "superseded": [],
+        "prev_dash": None,
     }
 
     mgr_id = uuid4()
@@ -525,14 +529,30 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     async def fake_post(period_type: Any, since: Any, until: Any,
                         event_count: Any, dashboard_url: Any,
-                        password: Any) -> None:
+                        password: Any) -> str:
         rec["slack_posts"].append(dashboard_url)
+        return "1700000000.000100"
 
     async def fake_create_dashboard(
         conn: Any, *, share_token: Any, access_password: Any, expires_at: Any
     ) -> Any:
         rec["dashboard_pw"] = access_password
         return uuid4()
+
+    async def fake_get_active_dashboard(conn: Any) -> Any:
+        return rec["prev_dash"]
+
+    async def fake_set_dashboard_slack(
+        conn: Any, dashboard_id: Any, slack_channel: Any, slack_ts: Any
+    ) -> None:
+        rec["slack_set"].append((slack_channel, slack_ts))
+
+    async def fake_revoke(conn: Any, keep_id: Any) -> int:
+        rec["revoked_keep"].append(keep_id)
+        return 1
+
+    async def fake_supersede(channel: Any, ts: Any) -> None:
+        rec["superseded"].append((channel, ts))
 
     monkeypatch.setattr(gen_mod, "list_active_managers", fake_managers)
     monkeypatch.setattr(gen_mod, "risk_heatmap", fake_heatmap)
@@ -543,6 +563,10 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(gen_mod, "mark_summary_delivered", fake_deliver)
     monkeypatch.setattr(gen_mod, "_post_slack_link", fake_post)
     monkeypatch.setattr(gen_mod, "create_dashboard", fake_create_dashboard)
+    monkeypatch.setattr(gen_mod, "get_active_dashboard", fake_get_active_dashboard)
+    monkeypatch.setattr(gen_mod, "set_dashboard_slack", fake_set_dashboard_slack)
+    monkeypatch.setattr(gen_mod, "revoke_dashboards_except", fake_revoke)
+    monkeypatch.setattr(gen_mod, "_supersede_message", fake_supersede)
     monkeypatch.setattr(gen_mod, "acquire_connection", lambda: _NullConn())
 
     return rec
@@ -564,6 +588,59 @@ async def test_generate_report_saves_html_and_returns_url(
     # password is surfaced
     assert result.dashboard_password is not None
     assert len(result.dashboard_password) == 8
+
+
+async def test_generate_report_revokes_old_links(
+    patched_generator: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A new report records its Slack ts and revokes every other dashboard token,
+    # keeping only the just-created one active.
+    monkeypatch.setattr(gen_mod.settings, "SERVER_BASE_URL", "https://example.com")
+    await gen_mod.generate_report(period_type="weekly")
+    assert patched_generator["slack_set"], "new dashboard's Slack ts must be stored"
+    channel, ts = patched_generator["slack_set"][0]
+    assert ts == "1700000000.000100"
+    assert len(patched_generator["revoked_keep"]) == 1  # revoke-all-except-new ran
+    # No previous message → nothing superseded.
+    assert patched_generator["superseded"] == []
+
+
+async def test_generate_report_supersedes_previous_message(
+    patched_generator: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With a previously-advertised dashboard, its Slack message is retired.
+    patched_generator["prev_dash"] = {
+        "id": uuid4(),
+        "slack_channel": "C123",
+        "slack_ts": "1699999999.000001",
+    }
+    monkeypatch.setattr(gen_mod.settings, "SERVER_BASE_URL", "https://example.com")
+    await gen_mod.generate_report(period_type="weekly")
+    assert patched_generator["superseded"] == [("C123", "1699999999.000001")]
+
+
+async def test_generate_report_slack_down_keeps_old_link(
+    patched_generator: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If the new post fails, the old link must NOT be revoked (avoid a channel
+    # with zero working links).
+    async def bad_post(*args: Any, **kwargs: Any) -> str:
+        raise RuntimeError("Slack down")
+
+    patched_generator["prev_dash"] = {
+        "id": uuid4(),
+        "slack_channel": "C123",
+        "slack_ts": "1699999999.000001",
+    }
+    monkeypatch.setattr(gen_mod, "_post_slack_link", bad_post)
+    monkeypatch.setattr(gen_mod.settings, "SERVER_BASE_URL", "https://example.com")
+    result = await gen_mod.generate_report(period_type="weekly")
+    assert result.slack_delivered is False
+    assert patched_generator["revoked_keep"] == []   # nothing revoked
+    assert patched_generator["superseded"] == []     # old message untouched
 
 
 async def test_generate_report_monthly_url(

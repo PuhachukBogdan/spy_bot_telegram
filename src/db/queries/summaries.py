@@ -275,3 +275,82 @@ async def get_dashboard_by_token(
     if row is None:
         return None
     return dict(row)
+
+
+async def dashboard_token_known(
+    conn: asyncpg.Connection,
+    share_token: str,
+) -> bool:
+    """True if the token exists at all (even if expired/revoked).
+
+    Lets the route tell "superseded by a newer report" (show a friendly notice)
+    from "never existed" (a plain 404).
+    """
+    row = await conn.fetchrow(
+        "SELECT 1 FROM dashboards WHERE share_token = $1", share_token
+    )
+    return row is not None
+
+
+async def get_active_dashboard(
+    conn: asyncpg.Connection,
+) -> dict[str, Any] | None:
+    """The currently-advertised dashboard: newest non-expired row with a Slack ts.
+
+    At steady state there is exactly one (each new report revokes the rest). Used
+    to find the previous Slack message so it can be retired when a newer report
+    is posted.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT id, share_token, slack_channel, slack_ts
+        FROM dashboards
+        WHERE slack_ts IS NOT NULL
+          AND (expires_at IS NULL OR expires_at > now())
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+    )
+    if row is None:
+        return None
+    return dict(row)
+
+
+async def set_dashboard_slack(
+    conn: asyncpg.Connection,
+    dashboard_id: UUID,
+    slack_channel: str,
+    slack_ts: str,
+) -> None:
+    """Record the Slack message (channel + ts) that advertises this dashboard."""
+    await conn.execute(
+        "UPDATE dashboards SET slack_channel = $2, slack_ts = $3 WHERE id = $1",
+        dashboard_id,
+        slack_channel,
+        slack_ts,
+    )
+
+
+async def revoke_dashboards_except(
+    conn: asyncpg.Connection,
+    keep_id: UUID,
+) -> int:
+    """Expire every dashboard token except ``keep_id`` (revoke old Slack links).
+
+    Sets ``expires_at = now()`` so :func:`get_dashboard_by_token` stops resolving
+    them. Only touches links still live. Returns the number revoked.
+    """
+    result = await conn.execute(
+        """
+        UPDATE dashboards
+        SET expires_at = now()
+        WHERE id <> $1
+          AND (expires_at IS NULL OR expires_at > now())
+        """,
+        keep_id,
+    )
+    # asyncpg returns e.g. "UPDATE 3"
+    try:
+        return int(result.split()[-1])
+    except (ValueError, IndexError):
+        return 0

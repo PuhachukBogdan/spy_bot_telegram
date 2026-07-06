@@ -29,6 +29,7 @@ from src.bot.instance import bot, dp  # noqa: E402  (after setup_logging on purp
 from src.config import settings  # noqa: E402
 from src.db.client import acquire_connection, close_pool, get_pool  # noqa: E402
 from src.db.queries.summaries import (  # noqa: E402
+    dashboard_token_known,
     get_dashboard_by_token,
     get_latest_summary_html,
     get_summary_by_share_token,
@@ -290,6 +291,28 @@ def _pw_form(*, title: str, action: str, error: bool = False) -> str:
     )
 
 
+def _superseded_page() -> str:
+    """Shown when a dashboard token exists but was retired by a newer report."""
+    return (
+        "<!DOCTYPE html>"
+        '<html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>Report superseded</title>"
+        "<style>"
+        "body{font-family:system-ui,sans-serif;background:#f4f5f7;"
+        "display:flex;align-items:center;justify-content:center;height:100vh;margin:0}"
+        ".card{background:#fff;border-radius:12px;padding:36px 40px;width:380px;"
+        "text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.1)}"
+        "h1{font-size:18px;font-weight:700;margin-bottom:10px;color:#0f172a}"
+        "p{color:#64748b;font-size:13.5px;line-height:1.6}"
+        "</style></head><body>"
+        '<div class="card"><h1>This report link has been replaced</h1>'
+        "<p>A newer report has since been generated. Open the latest report "
+        "message in your Slack reports channel to view the current dashboard.</p>"
+        "</div></body></html>"
+    )
+
+
 @app.get("/r/{share_token}")
 async def get_report(share_token: str, request: Request) -> Response:
     """Serve a pre-rendered HTML report by its capability token.
@@ -350,7 +373,15 @@ async def get_dashboard(share_token: str, request: Request) -> Response:
     """
     async with acquire_connection() as conn:
         dash = await get_dashboard_by_token(conn, share_token)
+        if dash is None:
+            # Distinguish a retired link (superseded by a newer report) from an
+            # unknown one, so the user gets a helpful notice instead of a 404.
+            known = await dashboard_token_known(conn, share_token)
+        else:
+            known = True
     if dash is None:
+        if known:
+            return Response(content=_superseded_page(), media_type="text/html")
         return Response(status_code=404)
     cookie = _auth_cookie("d", share_token)
     if request.cookies.get(cookie) != "1":

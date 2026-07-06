@@ -24,11 +24,14 @@ from src.db.client import acquire_connection
 from src.db.queries.activity_signals import count_proposals, list_proposal_dates
 from src.db.queries.summaries import (
     create_dashboard,
+    get_active_dashboard,
     list_active_managers,
     list_events_for_report,
     mark_summary_delivered,
+    revoke_dashboards_except,
     risk_heatmap,
     save_summary,
+    set_dashboard_slack,
 )
 from src.summary.builder import build_report_html
 from src.utils.logging import get_logger
@@ -116,7 +119,10 @@ async def generate_report(
     dash_token = secrets.token_hex(32)
     dash_expires = until + timedelta(days=30)
     async with acquire_connection() as conn:
-        await create_dashboard(
+        # The link currently advertised in Slack (to retire once the new one is
+        # live). Read BEFORE inserting the new row.
+        prev_dash = await get_active_dashboard(conn)
+        dash_id = await create_dashboard(
             conn,
             share_token=dash_token,
             access_password=dash_pw,
@@ -126,8 +132,9 @@ async def generate_report(
     dashboard_url = _dashboard_url(dash_token)
     slack_delivered = True
     slack_error: str | None = None
+    new_ts: str | None = None
     try:
-        await _post_slack_link(
+        new_ts = await _post_slack_link(
             period_type, since, until, len(event_rows), dashboard_url, dash_pw
         )
     except Exception as exc:
@@ -138,6 +145,24 @@ async def generate_report(
             error=slack_error,
             channel=settings.SLACK_CHANNEL_REPORTS,
         )
+
+    # Only retire the old link once the NEW one is confirmed posted — otherwise a
+    # Slack outage would leave the channel with no working link at all.
+    if slack_delivered and new_ts:
+        channel = settings.SLACK_CHANNEL_REPORTS
+        async with acquire_connection() as conn:
+            await set_dashboard_slack(conn, dash_id, channel, new_ts)
+            revoked = await revoke_dashboards_except(conn, dash_id)
+        log.info("summary.old_links_revoked", count=revoked)
+        if prev_dash and prev_dash.get("slack_ts"):
+            # Best-effort: edit the previous message to drop its (now-dead) button.
+            try:
+                await _supersede_message(
+                    prev_dash.get("slack_channel") or channel,
+                    str(prev_dash["slack_ts"]),
+                )
+            except Exception as exc:
+                log.warning("summary.supersede_failed", error=str(exc))
 
     async with acquire_connection() as conn:
         await mark_summary_delivered(conn, summary_id)
@@ -165,6 +190,33 @@ def _dashboard_url(dash_token: str) -> str:
     return f"{base}/dashboard/{dash_token}"
 
 
+async def _supersede_message(channel: str, ts: str) -> None:
+    """Edit a previous report message so its link is clearly retired.
+
+    Drops the "Open Dashboard" button and marks the message superseded, so no one
+    clicks a now-revoked link. Kept (not deleted) to preserve the audit trail of
+    when reports were posted.
+    """
+    text = "This report link has been replaced by a newer report."
+    blocks: list[dict[str, Any]] = [
+        {"type": "divider"},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    ":outbox_tray:  *This report has been superseded.*\n"
+                    "A newer report was posted below — open the latest message "
+                    "for the live dashboard. This link is no longer active."
+                ),
+            },
+        },
+    ]
+    client = get_slack_client()
+    await client.chat_update(channel=channel, ts=ts, text=text, blocks=blocks)
+    log.info("summary.superseded_prev", channel=channel, ts=ts)
+
+
 async def _post_slack_link(
     period_type: str,
     since: datetime,
@@ -172,7 +224,7 @@ async def _post_slack_link(
     event_count: int,
     dashboard_url: str,
     password: str,
-) -> None:
+) -> str:
     label = "Weekly" if period_type == "weekly" else "Monthly"
     channel = settings.SLACK_CHANNEL_REPORTS
     since_str = since.strftime("%d %b %Y")
@@ -226,5 +278,7 @@ async def _post_slack_link(
         },
     ]
     client = get_slack_client()
-    await client.chat_postMessage(channel=channel, text=fallback, blocks=blocks)
+    resp = await client.chat_postMessage(channel=channel, text=fallback, blocks=blocks)
     log.info("summary.slack_posted", channel=channel, period_type=period_type)
+    ts = resp.get("ts")
+    return str(ts) if ts else ""
