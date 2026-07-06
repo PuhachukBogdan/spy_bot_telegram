@@ -226,10 +226,16 @@ a{color:inherit}
 .layout{display:grid;grid-template-columns:250px 1fr;align-items:start}
 
 /* ── Sidebar roster ────────────────────────────────── */
-.sidebar{position:sticky;top:0;height:100vh;overflow-y:auto;background:var(--surface);border-right:1px solid var(--line);padding:26px 14px}
-.sidebar-label{display:block;font-family:var(--mono);font-size:10px;font-weight:600;color:var(--ink-3);text-transform:uppercase;letter-spacing:.16em;padding:0 10px;margin-bottom:14px}
-.sb-item{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:6px;text-decoration:none;color:var(--ink-2);font-size:12.5px;font-weight:500;transition:background .12s,color .12s;margin-bottom:1px}
+.sidebar{position:sticky;top:0;height:100vh;overflow-y:auto;background:var(--surface);border-right:1px solid var(--line);padding:20px 14px}
+.sb-search-wrap{padding:0 6px 12px}
+.sb-search{width:100%;font-family:var(--mono);font-size:12px;color:var(--ink);background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:8px 11px;outline:none;transition:border-color .12s}
+.sb-search::placeholder{color:var(--ink-3)}
+.sb-search:focus{border-color:var(--accent)}
+.sb-empty{display:none;padding:8px 12px;font-family:var(--mono);font-size:11px;color:var(--ink-3);font-style:italic}
+.sidebar-label{display:block;font-family:var(--mono);font-size:10px;font-weight:600;color:var(--ink-3);text-transform:uppercase;letter-spacing:.16em;padding:0 10px;margin:12px 0 8px}
+.sb-item{width:100%;display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:6px;border:0;background:none;cursor:pointer;text-align:left;text-decoration:none;color:var(--ink-2);font-family:inherit;font-size:12.5px;font-weight:500;transition:background .12s,color .12s;margin-bottom:1px}
 .sb-item:hover{background:var(--surface-2);color:var(--ink)}
+.sb-item.active{background:var(--accent-soft);color:var(--ink);font-weight:600}
 .sb-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-size:12px;letter-spacing:-.01em}
 .sb-crit{flex-shrink:0;font-family:var(--mono);font-size:10px;font-weight:700;color:#fff;background:var(--crit);border-radius:3px;padding:1px 6px;line-height:16px}
 :root[data-theme="dark"] .sb-crit{color:#1a0d0b}
@@ -265,6 +271,12 @@ a{color:inherit}
 .pill{font-family:var(--mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--line);border-radius:5px;padding:3px 10px;color:var(--ink-2)}
 .pill.crit{color:var(--crit);background:var(--crit-bg);border-color:var(--crit-line)}
 .pill.clean{color:var(--ok)}
+
+/* ── Navigation modes: All (default) vs single-manager view ─ */
+.mode-single .view-all-only{display:none}
+.mgr-back{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-3);background:none;border:0;cursor:pointer;padding:0;margin-right:2px}
+.mgr-back:hover{color:var(--accent)}
+.mode-all .mgr-back{display:none}
 
 /* ── Event cards (severity spine) ──────────────────── */
 .event{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--low);border-radius:8px;padding:16px 20px;margin:10px 0;box-shadow:var(--shadow);transition:box-shadow .16s ease,transform .16s ease}
@@ -331,11 +343,11 @@ _RESPONSIVE_CSS = """
   .stat-cell:first-child{padding-left:0}
   .stat-num{font-size:20px}
   .layout{grid-template-columns:1fr}
-  .sidebar{position:static;height:auto;border-right:none;border-bottom:1px solid var(--line);padding:12px 14px;display:flex;flex-direction:row;align-items:center;gap:8px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .sidebar{position:static;height:auto;max-height:320px;overflow-y:auto;border-right:none;border-bottom:1px solid var(--line);padding:14px 14px;display:block}
   .tab-panel .sidebar{top:0;height:auto}
-  .sidebar-label{flex:0 0 auto;margin:0 6px 0 0;padding:0}
-  .sb-item{flex:0 0 auto;margin-bottom:0;background:var(--surface-2);border:1px solid var(--line);border-radius:999px;padding:6px 12px}
-  .sb-name{flex:0 1 auto;max-width:150px}
+  .sb-search-wrap{padding:0 0 10px}
+  .sidebar-label{margin:10px 0 6px;padding:0 4px}
+  .sb-item{margin-bottom:2px}
   .main{padding:24px 14px 56px}
   .section-label{margin-bottom:12px}
   .heatmap-wrap{margin-bottom:36px;-webkit-overflow-scrolling:touch}
@@ -354,13 +366,63 @@ _RESPONSIVE_CSS = """
 }
 """
 
+# Client-side navigation. Scoped per ``[data-report]`` root so the dashboard's
+# two embedded report bodies (weekly + monthly) never cross-wire. Adds: the
+# ``All`` view (default — full report), a per-manager single view (heat-map
+# hidden, only that manager's dossier shown), a "← All" back control, and a
+# search box that filters ONLY the roster list without touching the open view.
+# Pure presentation: no data, no routing, degrades to the full page if JS is off.
+_NAV_SCRIPT = """
+<script>
+(function(){
+  function initReport(root){
+    var search = root.querySelector('[data-search]');
+    var empty = root.querySelector('[data-empty]');
+    function show(view){
+      root.classList.toggle('mode-all', view === 'all');
+      root.classList.toggle('mode-single', view !== 'all');
+      root.querySelectorAll('.mgr-section').forEach(function(s){
+        s.style.display = (view === 'all' || s.getAttribute('data-mgr') === view) ? '' : 'none';
+      });
+      root.querySelectorAll('.sidebar [data-view]').forEach(function(b){
+        b.classList.toggle('active', b.getAttribute('data-view') === view);
+      });
+      if (view !== 'all') { window.scrollTo(0, 0); }
+    }
+    root.querySelectorAll('[data-view]').forEach(function(el){
+      el.addEventListener('click', function(e){ e.preventDefault(); show(el.getAttribute('data-view')); });
+    });
+    if (search){
+      search.addEventListener('input', function(){
+        var q = search.value.trim().toLowerCase(), shown = 0;
+        root.querySelectorAll('.sidebar .sb-item[data-view]').forEach(function(b){
+          if (b.getAttribute('data-view') === 'all') { return; }
+          var name = (b.getAttribute('data-name') || b.textContent).toLowerCase();
+          var hit = name.indexOf(q) >= 0;
+          b.style.display = hit ? '' : 'none';
+          if (hit) { shown++; }
+        });
+        if (empty) { empty.style.display = shown ? 'none' : 'block'; }
+      });
+    }
+    show('all');
+  }
+  document.querySelectorAll('[data-report]').forEach(initReport);
+})();
+</script>
+"""
+
 
 def _page(title_html: str, body: str, *, extra_css: str = "") -> str:
     """Assemble a full HTML document from the shared head + given body/CSS."""
     css = _BASE_CSS + extra_css + _RESPONSIVE_CSS
+    # Hard-set the light "paper briefing" theme: this is a light-theme product,
+    # so the page must NOT follow a viewer's dark OS (prefers-color-scheme). The
+    # dark "control room" tokens stay in _BASE_CSS but dormant — reachable only
+    # if a future build flips data-theme (e.g. a user toggle).
     return (
         "<!DOCTYPE html>\n"
-        '<html lang="ru">\n<head>\n'
+        '<html lang="ru" data-theme="light">\n<head>\n'
         '<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
         f"{_FONT_LINK}\n"
@@ -368,6 +430,7 @@ def _page(title_html: str, body: str, *, extra_css: str = "") -> str:
         f"<style>{css}</style>\n"
         "</head>\n<body>\n"
         f"{body}\n"
+        f"{_NAV_SCRIPT}\n"
         "</body>\n</html>\n"
     )
 
@@ -379,6 +442,7 @@ def _page(title_html: str, body: str, *, extra_css: str = "") -> str:
 _REPORT_BODY = """\
 <a id="top"></a>
 <div class="accent-bar"></div>
+<div class="report mode-all" data-report>
 
 <header class="page-header">
   <h1>{{ title }}</h1>
@@ -394,9 +458,17 @@ _REPORT_BODY = """\
 <div class="layout">
 
 <aside class="sidebar">
-  <span class="sidebar-label">Roster</span>
+  <div class="sb-search-wrap">
+    <input type="search" class="sb-search" data-search placeholder="Search AffID / manager…" aria-label="Search AffID or manager">
+  </div>
+  <button type="button" class="sb-item sb-all active" data-view="all" data-name="all">
+    <span class="sb-name">All</span>
+    {% if stats.critical %}<span class="sb-crit">{{ stats.critical }}!</span>{% endif %}
+    <span class="sb-count">{{ stats.total_events }}</span>
+  </button>
+  <span class="sidebar-label">Managers</span>
   {% for m in managers %}
-  <a class="sb-item" href="#mgr-{{ m.id }}">
+  <button type="button" class="sb-item" data-view="{{ m.id }}" data-name="{{ m.name }}">
     <span class="sb-name">{{ m.name }}</span>
     {% if m.total == 0 %}
       <span class="sb-clean">✓</span>
@@ -404,12 +476,14 @@ _REPORT_BODY = """\
       {% if m.critical_count %}<span class="sb-crit">{{ m.critical_count }}!</span>{% endif %}
       <span class="sb-count">{{ m.total }}</span>
     {% endif %}
-  </a>
+  </button>
   {% endfor %}
+  <p class="sb-empty" data-empty>No match.</p>
 </aside>
 
 <main class="main">
 
+  <div class="view-all-only">
   <p class="section-label">Signal Matrix</p>
   <div class="heatmap-wrap">
   <table class="heatmap">
@@ -423,7 +497,7 @@ _REPORT_BODY = """\
     <tbody>
     {% for m in managers %}
       <tr>
-        <td class="mgr-cell"><a href="#mgr-{{ m.id }}">{{ m.name }}</a></td>
+        <td class="mgr-cell"><a href="#" data-view="{{ m.id }}">{{ m.name }}</a></td>
         {% for key, _ in categories %}
           {% set cnt = m.heatmap.get(key, 0) %}
           <td class="{{ 'cell-hot' if cnt >= 3 else ('cell-warm' if cnt >= 1 else 'cell-zero') }}">
@@ -436,10 +510,12 @@ _REPORT_BODY = """\
     </tbody>
   </table>
   </div>
+  </div>
 
   {% for m in managers %}
-  <section class="mgr-section" id="mgr-{{ m.id }}">
+  <section class="mgr-section" data-mgr="{{ m.id }}">
     <div class="mgr-header">
+      <button type="button" class="mgr-back" data-view="all">← All</button>
       <h2>{{ m.name }}</h2>
       <span class="pill">{{ m.total }} event{{ 's' if m.total != 1 else '' }}</span>
       {% if m.critical_count %}<span class="pill crit">{{ m.critical_count }} critical</span>{% endif %}
@@ -467,6 +543,7 @@ _REPORT_BODY = """\
   {% endfor %}
 
 </main>
+</div>
 </div>
 """
 

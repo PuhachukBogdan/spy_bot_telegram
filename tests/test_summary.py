@@ -158,7 +158,10 @@ def test_manager_with_no_events_shows_clean() -> None:
     assert "no-events" in html
 
 
-def test_manager_anchor_id_present() -> None:
+def test_manager_nav_attributes_present() -> None:
+    # Navigation is client-side: the section carries data-mgr and the sidebar +
+    # heat-map cell carry data-view (both keyed on the manager id) so the nav
+    # script can switch to that manager's single view. No #mgr- anchors / ids.
     mgr = _mgr("Alice")
     html = build_report_html(
         period_type="weekly",
@@ -169,8 +172,11 @@ def test_manager_anchor_id_present() -> None:
         event_rows=[],
     )
     mid_str = str(mgr["id"])
-    assert f'id="mgr-{mid_str}"' in html
-    assert f'href="#mgr-{mid_str}"' in html
+    assert f'data-mgr="{mid_str}"' in html
+    assert f'data-view="{mid_str}"' in html
+    # The "All" default view and the roster search box are present.
+    assert 'data-view="all"' in html
+    assert "data-search" in html
 
 
 # ---------------------------------------------------------------------------
@@ -329,8 +335,10 @@ def test_detected_phrase_is_html_escaped() -> None:
         heatmap_rows=[_heatmap_row(mgr["id"])],
         event_rows=[row],
     )
-    assert "<script>" not in html
-    assert "&lt;script&gt;" in html
+    # The dangerous payload must be escaped, not rendered live. (A generic
+    # "<script>" check would false-positive on the page's own nav <script>.)
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
 
 
 # ---------------------------------------------------------------------------
