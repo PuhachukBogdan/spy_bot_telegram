@@ -135,8 +135,12 @@ def case_env(monkeypatch: pytest.MonkeyPatch) -> tuple[list[RiskEvent], _FakeSla
     async def _failed(bot: Any, event: Any, channel: str, error: str) -> None:
         raise AssertionError(f"unexpected delivery-failure fallback: {error}")
 
+    async def _no_suppressions(_conn: Any) -> list[Any]:
+        return []
+
     monkeypatch.setattr(dispatch_mod, "critical_mention_prefix", _prefix)
     monkeypatch.setattr(dispatch_mod, "handle_failed_alert", _failed)
+    monkeypatch.setattr(dispatch_mod, "list_active_suppressions", _no_suppressions)
     return store, slack
 
 

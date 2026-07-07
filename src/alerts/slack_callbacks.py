@@ -26,8 +26,10 @@ from src.db.client import acquire_connection
 from src.db.models import RiskEvent
 from src.db.queries.audit import insert_audit_log
 from src.db.queries.chats import get_chat_by_id
+from src.db.queries.messages import get_message_timestamp, get_messages_by_ids
 from src.db.queries.partners import get_partner_by_id
 from src.db.queries.risk_events import update_status
+from src.db.queries.suppressions import create_suppression
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -45,6 +47,7 @@ _STATUS_LABELS: dict[str, str] = {
     "false_positive": "False Positive",
     "confirmed": "Confirmed",
     "escalated": "Escalated",
+    "suppressed": "Suppressed",
 }
 
 
@@ -97,8 +100,7 @@ async def handle_slack_action(raw_body: bytes) -> None:
 
     action = actions[0]
     action_id: str = action.get("action_id", "")
-    status = _ACTION_TO_STATUS.get(action_id)
-    if status is None:
+    if action_id != "suppress_pattern" and action_id not in _ACTION_TO_STATUS:
         log.warning("slack_callback.unknown_action", action_id=action_id)
         return
 
@@ -114,13 +116,27 @@ async def handle_slack_action(raw_body: bytes) -> None:
     slack_user_name: str = (
         slack_user.get("name") or slack_user.get("username") or "unknown"
     )
+    msg_ts: str = (payload.get("message") or {}).get("ts") or ""
 
+    # Suppress = mark this event a false positive AND create a narrow rule so the
+    # SAME signal never re-alerts (idea #2/#5/#6).
+    if action_id == "suppress_pattern":
+        event = await _do_mark(
+            risk_event_id, "false_positive", slack_user_id, slack_user_name
+        )
+        if event is None:
+            log.warning("slack_callback.event_not_found", risk_event_id=str(risk_event_id))
+            return
+        await _create_suppression_from_event(event, slack_user_name)
+        if msg_ts:
+            await _update_slack_message(event, msg_ts, "suppressed", slack_user_name)
+        return
+
+    status = _ACTION_TO_STATUS[action_id]
     event = await _do_mark(risk_event_id, status, slack_user_id, slack_user_name)
     if event is None:
         log.warning("slack_callback.event_not_found", risk_event_id=str(risk_event_id))
         return
-
-    msg_ts: str = (payload.get("message") or {}).get("ts") or ""
     if msg_ts:
         await _update_slack_message(event, msg_ts, status, slack_user_name)
 
@@ -163,6 +179,41 @@ async def _do_mark(
     return event
 
 
+async def _create_suppression_from_event(event: RiskEvent, reviewer: str) -> None:
+    """Create a narrow suppression rule from a confirmed-FP event. Best-effort.
+
+    Pattern = the event's own ``detected_phrase``, scoped to its ``risk_type`` — so
+    ONLY the same signal is suppressed. An event with no phrase yields no rule (a
+    phraseless rule would be too broad and could hide real risks); it is just
+    marked a false positive. Never raises — a rule insert must not crash the
+    callback (the event is already marked FP).
+    """
+    phrase = (event.detected_phrase or "").strip()
+    if not phrase:
+        log.info("slack_callback.suppress_no_phrase", risk_event_id=str(event.id)[:8])
+        return
+    try:
+        async with acquire_connection() as conn:
+            await create_suppression(
+                conn,
+                risk_type=event.risk_type,
+                pattern=phrase,
+                note=f"suppressed via Slack by @{reviewer}",
+                created_by=reviewer,
+            )
+        log.info(
+            "slack_callback.suppression_created",
+            risk_event_id=str(event.id)[:8],
+            risk_type=event.risk_type,
+        )
+    except Exception as exc:
+        log.error(
+            "slack_callback.suppress_failed",
+            risk_event_id=str(event.id)[:8],
+            error=str(exc),
+        )
+
+
 async def _update_slack_message(
     event: RiskEvent,
     msg_ts: str,
@@ -186,9 +237,22 @@ async def _update_slack_message(
                 if event.partner_id is not None
                 else None
             )
+            message_dt = (
+                await get_message_timestamp(conn, event.message_id)
+                if event.message_id
+                else None
+            )
+            context = await get_messages_by_ids(conn, event.context_message_ids or [])
         partner_name = partner.name if partner is not None else None
 
-        blocks, _ = build_alert_blocks(event, chat, partner_name, include_actions=False)
+        blocks, _ = build_alert_blocks(
+            event,
+            chat,
+            partner_name,
+            include_actions=False,
+            message_dt=message_dt,
+            context_messages=context,
+        )
         label = _STATUS_LABELS.get(status, status.replace("_", " ").title())
         blocks.append(
             {

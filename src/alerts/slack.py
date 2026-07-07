@@ -22,7 +22,7 @@ from slack_sdk.http_retry.builtin_async_handlers import async_default_handlers
 from slack_sdk.web.async_client import AsyncWebClient
 
 from src.config import settings
-from src.db.models import Chat, RiskEvent
+from src.db.models import Chat, Message, RiskEvent
 from src.utils.logging import get_logger
 from src.utils.text import short_why
 
@@ -33,6 +33,23 @@ _LEVEL_BADGE = {
     "critical": "\U0001f534 CRITICAL RISK",  # 🔴
     "high": "\U0001f7e0 HIGH RISK",  # 🟠
 }
+# Context snippet: how many surrounding messages to show, and per-line length.
+_CONTEXT_MAX_LINES = 3
+_CONTEXT_LINE_MAX = 160
+
+
+def _context_lines(messages: list[Message]) -> list[str]:
+    """Render up to N context messages as compact ``sender: text`` quote lines."""
+    lines: list[str] = []
+    for m in messages[:_CONTEXT_MAX_LINES]:
+        text = (m.message_text or m.transcription or "").strip().replace("\n", " ")
+        if not text:
+            continue
+        if len(text) > _CONTEXT_LINE_MAX:
+            text = text[:_CONTEXT_LINE_MAX].rstrip() + "…"
+        who = (m.sender_name or "—").strip()
+        lines.append(f">*{who}:* {text}")
+    return lines
 
 _client: AsyncWebClient | None = None
 
@@ -139,6 +156,7 @@ def build_alert_blocks(
     include_actions: bool = True,
     case_note: str | None = None,
     message_dt: datetime | None = None,
+    context_messages: list[Message] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Render one risk event into (Block Kit blocks, fallback text).
 
@@ -151,6 +169,9 @@ def build_alert_blocks(
     ``message_dt`` is the flagged message's Telegram send time — shown as the card
     Date. It falls back to the event's own ``created_at`` (detection time) only if
     the message row is unavailable.
+    ``context_messages`` are the surrounding lines of the case (from
+    ``context_message_ids``); up to a few are shown as a quoted snippet so a
+    reviewer can judge the moment without opening Telegram.
     """
     badge = _LEVEL_BADGE.get(event.risk_level, event.risk_level.upper())
     partner = partner_name or "—"  # —
@@ -176,6 +197,7 @@ def build_alert_blocks(
         blocks.append(
             {"type": "context", "elements": [{"type": "mrkdwn", "text": f"🔁 {case_note}"}]}
         )
+    blocks.append({"type": "divider"})
     blocks += [
         {
             "type": "section",
@@ -194,6 +216,14 @@ def build_alert_blocks(
     if explanation:
         blocks.append(
             {"type": "section", "text": {"type": "mrkdwn", "text": f"*Why:*\n{explanation}"}}
+        )
+    ctx_lines = _context_lines(context_messages or [])
+    if ctx_lines:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "*Context:*\n" + "\n".join(ctx_lines)},
+            }
         )
     blocks.append(
         {
@@ -226,6 +256,12 @@ def build_alert_blocks(
                         "type": "button",
                         "text": {"type": "plain_text", "text": "⬆ Escalate"},
                         "action_id": "mark_escalated",
+                        "value": str(event.id),
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "🔕 Suppress"},
+                        "action_id": "suppress_pattern",
                         "value": str(event.id),
                     },
                 ],

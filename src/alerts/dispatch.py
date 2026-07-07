@@ -36,11 +36,13 @@ from src.alerts.slack import (
     post_alert,
     update_alert,
 )
+from src.alerts.suppression import is_suppressed
 from src.config import settings
 from src.db.client import acquire_connection
 from src.db.models import Chat, RiskEvent
-from src.db.queries.messages import get_message_timestamp
+from src.db.queries.messages import get_message_timestamp, get_messages_by_ids
 from src.db.queries.risk_events import list_case_events, set_slack_message_ts
+from src.db.queries.suppressions import list_active_suppressions
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -64,10 +66,21 @@ async def _dispatch_one(
 
     # One short connection for the pre-send lookups; released before the network call.
     async with acquire_connection() as conn:
+        rules = await list_active_suppressions(conn)
         case_ts = await resolve_open_case_ts(
             conn, chat_id=chat.id, risk_type=event.risk_type
         )
         mention_prefix = await critical_mention_prefix(conn) if is_critical else ""
+
+    # Staff-suppressed signal (confirmed FP): the risk_event stays in the DB for
+    # audit/report, but no Slack alert is posted. Narrow match — never a category.
+    if is_suppressed(event, rules):
+        log.info(
+            "alert.suppressed",
+            risk_event_id=str(event.id)[:8],
+            risk_type=event.risk_type,
+        )
+        return
 
     if case_ts is None:
         await _open_case(bot, chat, partner_name, event, mention_prefix)
@@ -92,8 +105,14 @@ async def _open_case(
             if event.message_id
             else None
         )
+        context = await get_messages_by_ids(conn, event.context_message_ids or [])
     blocks, text = build_alert_blocks(
-        event, chat, partner_name, mention_prefix=mention_prefix, message_dt=message_dt
+        event,
+        chat,
+        partner_name,
+        mention_prefix=mention_prefix,
+        message_dt=message_dt,
+        context_messages=context,
     )
     channel = settings.SLACK_CHANNEL_ALERTS
     try:
@@ -152,10 +171,16 @@ async def _update_case(
             if primary.message_id
             else None
         )
+        context = await get_messages_by_ids(conn, primary.context_message_ids or [])
     # No mention on the edited card itself — re-pinging is the threaded note's job,
     # so a routine update never re-notifies the whole channel.
     blocks, text = build_alert_blocks(
-        primary, chat, partner_name, case_note=case_note, message_dt=message_dt
+        primary,
+        chat,
+        partner_name,
+        case_note=case_note,
+        message_dt=message_dt,
+        context_messages=context,
     )
 
     try:

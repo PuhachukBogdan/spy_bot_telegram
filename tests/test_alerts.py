@@ -18,7 +18,7 @@ from src.alerts import dispatch as dispatch_mod
 from src.alerts.critical import critical_mention_prefix
 from src.alerts.dedup import resolve_open_case_ts
 from src.alerts.slack import SlackDeliveryError, build_alert_blocks
-from src.db.models import Chat, RiskEvent
+from src.db.models import Chat, Message, RiskEvent
 from src.utils.text import short_why
 from tests.conftest import FakeBot
 
@@ -83,6 +83,35 @@ def test_blocks_show_message_date_not_verdict() -> None:
     # Falls back to detection time only when the message row is unavailable.
     blocks2, _ = build_alert_blocks(event, _chat("Acme chat"), "Acme Corp")
     assert event.created_at.strftime("%Y-%m-%d %H:%M UTC") in str(blocks2)
+
+
+def _msg(text: str, who: str = "Bob") -> Message:
+    return Message(
+        id=uuid4(),
+        telegram_message_id=1,
+        chat_id=uuid4(),
+        sender_role="partner",
+        message_type="text",
+        timestamp=datetime.now(UTC),
+        created_at=datetime.now(UTC),
+        message_text=text,
+        sender_name=who,
+    )
+
+
+def test_blocks_render_context_messages() -> None:
+    event = _event(level="high")
+    ctx = [_msg("first line", who="Bob"), _msg("second line", who="Ann")]
+    blocks, _ = build_alert_blocks(event, _chat("c"), "P", context_messages=ctx)
+    flat = str(blocks)
+    assert "*Context:*" in flat
+    assert "first line" in flat and "second line" in flat
+    assert "Bob" in flat and "Ann" in flat
+
+
+def test_blocks_no_context_block_when_absent() -> None:
+    blocks, _ = build_alert_blocks(_event(), _chat("c"), "P")
+    assert "*Context:*" not in str(blocks)
 
 
 def test_short_why_trims_to_two_sentences_and_caps() -> None:
@@ -220,6 +249,9 @@ def patched_dispatch(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     async def fake_list(conn: Any, **kw: Any) -> list[Any]:
         return rec["case_events"]
 
+    async def fake_suppressions(conn: Any) -> list[Any]:
+        return rec.get("suppressions", [])
+
     async def fake_post(
         *, channel: str, text: str, blocks: Any, thread_ts: str | None = None
     ) -> str:
@@ -241,6 +273,7 @@ def patched_dispatch(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     monkeypatch.setattr(dispatch_mod, "resolve_open_case_ts", fake_resolve)
     monkeypatch.setattr(dispatch_mod, "critical_mention_prefix", fake_mentions)
+    monkeypatch.setattr(dispatch_mod, "list_active_suppressions", fake_suppressions)
     monkeypatch.setattr(dispatch_mod, "list_case_events", fake_list)
     monkeypatch.setattr(dispatch_mod, "post_alert", fake_post)
     monkeypatch.setattr(dispatch_mod, "update_alert", fake_update)
@@ -248,6 +281,29 @@ def patched_dispatch(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(dispatch_mod, "handle_failed_alert", fake_failed)
     monkeypatch.setattr(dispatch_mod.settings, "SLACK_CHANNEL_ALERTS", "#alerts")
     return rec
+
+
+async def test_suppressed_event_is_not_posted(
+    patched_dispatch: dict[str, Any],
+) -> None:
+    # A matching narrow rule → the risk_event is skipped at the alert layer: no
+    # post, no update, no ts write (the event still lives in the DB elsewhere).
+    from src.db.models import SuppressionRule
+
+    patched_dispatch["case_ts"] = None
+    event = _event(level="high")  # detected_phrase="между нами", type=private_channel
+    patched_dispatch["suppressions"] = [
+        SuppressionRule(
+            id=uuid4(),
+            risk_type="private_channel",
+            pattern="между нами",
+            created_at=datetime.now(UTC),
+        )
+    ]
+    await dispatch_mod.dispatch_alerts(FakeBot(), _chat("c"), "Acme", [event])  # type: ignore[arg-type]
+    assert patched_dispatch["posts"] == []
+    assert patched_dispatch["updates"] == []
+    assert patched_dispatch["ts_writes"] == []
 
 
 async def test_fresh_case_posts_top_level_and_writes_ts(

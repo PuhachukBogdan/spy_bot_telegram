@@ -215,6 +215,37 @@ async def test_handle_valid_action_calls_do_mark(
 
 
 @pytest.mark.asyncio
+async def test_handle_suppress_marks_fp_and_creates_rule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event_id = uuid4()
+    fake_event = MagicMock()
+    fake_event.risk_level = "high"
+
+    do_mark_mock = AsyncMock(return_value=fake_event)
+    suppr_mock = AsyncMock()
+    update_msg_mock = AsyncMock()
+    monkeypatch.setattr("src.alerts.slack_callbacks._do_mark", do_mark_mock)
+    monkeypatch.setattr(
+        "src.alerts.slack_callbacks._create_suppression_from_event", suppr_mock
+    )
+    monkeypatch.setattr(
+        "src.alerts.slack_callbacks._update_slack_message", update_msg_mock
+    )
+
+    raw = _make_payload(
+        action_id="suppress_pattern", value=str(event_id), msg_ts="1700000000.000100"
+    )
+    await handle_slack_action(raw)
+
+    # Suppress marks the event a false positive AND creates the narrow rule.
+    assert do_mark_mock.call_args.args[1] == "false_positive"
+    suppr_mock.assert_awaited_once()
+    update_msg_mock.assert_awaited_once()
+    assert update_msg_mock.call_args.args[2] == "suppressed"
+
+
+@pytest.mark.asyncio
 async def test_handle_event_not_found_skips_message_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -306,7 +337,12 @@ def test_build_alert_blocks_action_ids_correct() -> None:
     blocks, _ = build_alert_blocks(event, chat, "Partner A")
     actions_block = next(b for b in blocks if b["type"] == "actions")
     action_ids = {el["action_id"] for el in actions_block["elements"]}
-    assert action_ids == {"mark_confirmed", "mark_fp", "mark_escalated"}
+    assert action_ids == {
+        "mark_confirmed",
+        "mark_fp",
+        "mark_escalated",
+        "suppress_pattern",
+    }
 
 
 def test_build_alert_blocks_action_values_are_event_uuid() -> None:

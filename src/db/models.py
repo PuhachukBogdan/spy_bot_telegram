@@ -323,6 +323,18 @@ class FailedAlert(_ORMModel):
     created_at: datetime
 
 
+class SuppressionRule(_ORMModel):
+    """A narrow, staff-created rule that suppresses a specific alert (migration 0020)."""
+
+    id: UUID
+    risk_type: str | None = None
+    pattern: str
+    note: str | None = None
+    created_by: str | None = None
+    active: bool = True
+    created_at: datetime
+
+
 # --- 16. cost_tracking ------------------------------------------------------
 class CostTracking(_ORMModel):
     date: date
