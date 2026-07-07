@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import re
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -50,6 +51,21 @@ _PLAIN_TEXT_EXTS = {
     "txt", "md", "csv", "log", "json", "xml",
     "yaml", "yml", "py", "js", "ts", "sql", "html", "htm",
 }
+
+# Confirmed false positive (2026-07-06, CEO-reviewed): an affiliate COMMISSION /
+# PAYOUT report is a routine partner deliverable. It legitimately carries player
+# commission figures, transaction volumes and player IDs, which the file analyser
+# otherwise reads as a critical data leak (business_secrets + internal_infra).
+# Suppress it by FILENAME so the exclusion is precise to THIS one artifact type and
+# never touches any other data_leak finding (chat leaks, credentials, strategy
+# docs, other spreadsheets, …). Match e.g. "player_commission_report_06-07.xlsx",
+# "Payout Report Q2".
+_BENIGN_REPORT_RE = re.compile(r"(commission|payout)[\s._\-]*report", re.IGNORECASE)
+
+
+def _is_benign_partner_report(file_name: str) -> bool:
+    """True if the document is a routine partner commission/payout report."""
+    return bool(_BENIGN_REPORT_RE.search(file_name))
 
 
 class _NonRetryable(Exception):
@@ -143,6 +159,12 @@ async def _analyze_file(bot: Bot, message_id: UUID) -> tuple[list[RiskEvent], Ch
         raise _Skip("chat not found")
 
     file_id, file_name, mime_type = _media_ref(message)
+
+    # Routine affiliate commission/payout report → confirmed-benign deliverable.
+    # Skip before spending on download/extraction/LLM so it never becomes an alert.
+    if _is_benign_partner_report(file_name):
+        raise _Skip(f"benign partner report (routine deliverable): {file_name}")
+
     data = await _download(bot, file_id)
 
     if len(data) > settings.FILE_MAX_BYTES:

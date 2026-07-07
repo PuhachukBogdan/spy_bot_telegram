@@ -15,7 +15,7 @@ from src.llm.file_schemas import (
     FileRiskFinding,
     build_file_risk_tool,
 )
-from src.pipeline.file_processor import _extract_text
+from src.pipeline.file_processor import _extract_text, _is_benign_partner_report
 
 # ---------------------------------------------------------------------------
 # Schema tests
@@ -204,6 +204,86 @@ def test_extract_text_truncation_handled_by_caller() -> None:
     result = _extract_text(data, "big.txt", "text/plain")
     assert result is not None
     assert len(result) == 50_000
+
+
+# ---------------------------------------------------------------------------
+# benign partner report suppression (2026-07-06 confirmed FP)
+# ---------------------------------------------------------------------------
+
+
+def test_benign_partner_report_matches_commission_and_payout() -> None:
+    # The confirmed-FP artifact and its family are suppressed by filename.
+    assert _is_benign_partner_report("player_commission_report_06-07-2026.xlsx")
+    assert _is_benign_partner_report("Commission Report Q2.xlsx")
+    assert _is_benign_partner_report("payout-report.csv")
+    assert _is_benign_partner_report("Payout_Report.pdf")
+
+
+def test_benign_partner_report_does_not_over_match() -> None:
+    # Precise to commission/payout reports — every other document (including other
+    # data_leak artifacts) is still analysed and can alert.
+    assert not _is_benign_partner_report("credentials.txt")
+    assert not _is_benign_partner_report("internal_strategy.docx")
+    assert not _is_benign_partner_report("player_list.xlsx")
+    assert not _is_benign_partner_report("report_2026.pdf")   # bare 'report'
+    assert not _is_benign_partner_report("commissions.xlsx")  # needs 'report' too
+
+
+@pytest.mark.asyncio
+async def test_analyze_file_skips_benign_report_before_spending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A commission-report document is skipped BEFORE download/extraction/LLM, so it
+    # never becomes a risk_event or an alert (and costs nothing).
+    monkeypatch.setattr("src.pipeline.file_processor.settings.FILE_ANALYSIS_ENABLED", True)
+
+    complete_mock = AsyncMock()
+    monkeypatch.setattr("src.pipeline.file_processor.complete_task", complete_mock)
+
+    msg = MagicMock()
+    msg.id = uuid4()
+    msg.chat_id = uuid4()
+    msg.sender_id = 111
+    msg.raw_payload = {
+        "document": {
+            "file_id": "F1",
+            "file_name": "player_commission_report_06-07-2026.xlsx",
+            "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
+    }
+    monkeypatch.setattr(
+        "src.pipeline.file_processor.get_message_by_id", AsyncMock(return_value=msg)
+    )
+    monkeypatch.setattr(
+        "src.pipeline.file_processor.get_chat_by_id", AsyncMock(return_value=MagicMock())
+    )
+
+    download_mock = AsyncMock()
+    analyze_mock = AsyncMock()
+    monkeypatch.setattr("src.pipeline.file_processor._download", download_mock)
+    monkeypatch.setattr("src.pipeline.file_processor.analyze_file_risk", analyze_mock)
+
+    fake_conn = AsyncMock()
+    fake_ctx = AsyncMock()
+    fake_ctx.__aenter__ = AsyncMock(return_value=fake_conn)
+    fake_ctx.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "src.pipeline.file_processor.acquire_connection", MagicMock(return_value=fake_ctx)
+    )
+
+    from src.db.models import ProcessingQueue
+    from src.pipeline.file_processor import process_file_task
+
+    task = MagicMock(spec=ProcessingQueue)
+    task.id = 7
+    task.payload = {"message_id": str(msg.id)}
+    task.attempts = 1
+
+    await process_file_task(MagicMock(), task)
+
+    complete_mock.assert_awaited_once()      # task completed (skip path)
+    download_mock.assert_not_called()        # never downloaded
+    analyze_mock.assert_not_called()         # never sent to the LLM
 
 
 # ---------------------------------------------------------------------------
