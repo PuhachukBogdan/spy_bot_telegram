@@ -18,17 +18,28 @@ from decimal import Decimal
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 
+from src.alerts.slack import SlackDeliveryError, build_alert_blocks, post_alert
 from src.alerts.system import send_budget_exceeded_alert
 from src.config import settings
 from src.db.client import acquire_connection
+from src.db.models import FailedAlert
+from src.db.queries.alerts import (
+    bump_failed_alert_attempt,
+    list_unresolved_failed_alerts,
+    mark_failed_alert_resolved,
+)
 from src.db.queries.audit import insert_audit_log
 from src.db.queries.chats import (
     count_live_units,
+    get_chat_by_id,
     list_stale_pending_chats,
     mark_chat_abandoned,
 )
 from src.db.queries.cost import get_today, is_circuit_open, trip_circuit_breaker
+from src.db.queries.messages import get_message_timestamp
+from src.db.queries.partners import get_partner_by_id
 from src.db.queries.queue import claim_tasks, recover_stale_tasks
+from src.db.queries.risk_events import get_by_ref, set_slack_message_ts
 from src.db.queries.summaries import summary_exists_since
 from src.pipeline.batch_processor import process_analysis_task
 from src.pipeline.file_processor import process_file_task
@@ -309,6 +320,106 @@ async def stale_task_reaper_loop(
             raise
         except Exception as exc:
             log.error("worker.stale_reaper.error", error=str(exc))
+        await asyncio.sleep(interval)
+
+
+async def _retry_one_failed_alert(bot: Bot, alert: FailedAlert) -> None:
+    """Re-post one undelivered alert, rebuilt from the live risk_event.
+
+    The card is re-rendered from the current risk_event (source of truth), never a
+    stale stored payload. On success the event gets its slack ts and the breadcrumb
+    is resolved; on a repeat Slack failure the attempt count is bumped (and the row
+    retried next tick until the cap). An orphaned/already-delivered row is resolved
+    without re-posting. Never raises — a bad row must not stall the loop.
+    """
+    if alert.risk_event_id is None:
+        async with acquire_connection() as conn:
+            await mark_failed_alert_resolved(conn, alert.id)
+        return
+
+    async with acquire_connection() as conn:
+        event = await get_by_ref(conn, str(alert.risk_event_id))
+    # Gone, or already delivered by some other path → nothing to retry.
+    if event is None or event.slack_message_ts is not None or event.chat_id is None:
+        async with acquire_connection() as conn:
+            await mark_failed_alert_resolved(conn, alert.id)
+        return
+
+    async with acquire_connection() as conn:
+        chat = await get_chat_by_id(conn, event.chat_id)
+        if chat is None:
+            await mark_failed_alert_resolved(conn, alert.id)
+            return
+        partner = (
+            await get_partner_by_id(conn, event.partner_id)
+            if event.partner_id is not None
+            else None
+        )
+        message_dt = (
+            await get_message_timestamp(conn, event.message_id)
+            if event.message_id
+            else None
+        )
+    partner_name = partner.name if partner is not None else None
+
+    blocks, text = build_alert_blocks(
+        event, chat, partner_name, message_dt=message_dt
+    )
+    try:
+        ts = await post_alert(channel=alert.channel, text=text, blocks=blocks)
+    except SlackDeliveryError as exc:
+        async with acquire_connection() as conn:
+            await bump_failed_alert_attempt(conn, alert.id)
+        log.warning(
+            "worker.failed_alert_retry.still_failing",
+            failed_alert_id=str(alert.id),
+            error=str(exc),
+        )
+        return
+
+    async with acquire_connection() as conn:
+        await set_slack_message_ts(conn, event.id, ts)
+        await mark_failed_alert_resolved(conn, alert.id)
+    log.info(
+        "worker.failed_alert_retry.delivered",
+        failed_alert_id=str(alert.id),
+        risk_event_id=str(event.id)[:8],
+    )
+
+
+async def failed_alert_retry_loop(
+    bot: Bot, interval_seconds: int | None = None
+) -> None:
+    """Periodically re-deliver undelivered Slack alerts once Slack recovers.
+
+    Reads the ``failed_alerts`` breadcrumbs (Phase 11) and retries each, up to
+    ``FAILED_ALERT_MAX_RETRIES``. Each retry is isolated; a single bad row is
+    logged and skipped, never aborting the tick or the loop.
+    """
+    interval = interval_seconds or settings.FAILED_ALERT_RETRY_INTERVAL_SECONDS
+    log.info("worker.failed_alert_retry.start", interval_s=interval)
+    while True:
+        try:
+            async with acquire_connection() as conn:
+                pending = await list_unresolved_failed_alerts(
+                    conn, max_retries=settings.FAILED_ALERT_MAX_RETRIES
+                )
+            if pending:
+                log.info("worker.failed_alert_retry.batch", count=len(pending))
+                for alert in pending:
+                    try:
+                        await _retry_one_failed_alert(bot, alert)
+                    except Exception as exc:  # isolate one bad row
+                        log.error(
+                            "worker.failed_alert_retry.row_error",
+                            failed_alert_id=str(alert.id),
+                            error=str(exc),
+                        )
+        except asyncio.CancelledError:
+            log.info("worker.failed_alert_retry.stop")
+            raise
+        except Exception as exc:
+            log.error("worker.failed_alert_retry.error", error=str(exc))
         await asyncio.sleep(interval)
 
 

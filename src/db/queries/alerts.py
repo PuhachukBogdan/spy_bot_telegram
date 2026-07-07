@@ -12,7 +12,7 @@ from uuid import UUID
 
 import asyncpg
 
-from src.db.models import CriticalAlertRecipient
+from src.db.models import CriticalAlertRecipient, FailedAlert
 
 
 async def list_critical_recipients(
@@ -57,4 +57,45 @@ async def record_failed_alert(
         channel,
         payload,
         error,
+    )
+
+
+async def list_unresolved_failed_alerts(
+    conn: asyncpg.Connection, *, max_retries: int, limit: int = 50
+) -> list[FailedAlert]:
+    """Undelivered alerts still worth retrying: unresolved and under the retry cap.
+
+    Oldest first, so a backlog drains in the order it accrued. Rows that hit
+    ``max_retries`` drop out here (retried enough — they stay as an unresolved
+    breadcrumb for inspection rather than being retried forever).
+    """
+    rows = await conn.fetch(
+        """
+        SELECT * FROM failed_alerts
+        WHERE resolved = false AND retry_count < $1
+        ORDER BY created_at ASC
+        LIMIT $2
+        """,
+        max_retries,
+        limit,
+    )
+    return [FailedAlert.from_record(row) for row in rows]
+
+
+async def mark_failed_alert_resolved(conn: asyncpg.Connection, alert_id: UUID) -> None:
+    """Mark a failed alert as delivered (retry succeeded, or the event is gone)."""
+    await conn.execute(
+        "UPDATE failed_alerts SET resolved = true WHERE id = $1", alert_id
+    )
+
+
+async def bump_failed_alert_attempt(conn: asyncpg.Connection, alert_id: UUID) -> None:
+    """Record another failed retry: ++retry_count, stamp last_attempt_at."""
+    await conn.execute(
+        """
+        UPDATE failed_alerts
+        SET retry_count = retry_count + 1, last_attempt_at = now()
+        WHERE id = $1
+        """,
+        alert_id,
     )

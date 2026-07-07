@@ -39,6 +39,7 @@ from src.pipeline.tier1 import pattern_cache  # noqa: E402
 from src.pipeline.workers import (  # noqa: E402
     abandoned_chat_cleanup_loop,
     analysis_worker_loop,
+    failed_alert_retry_loop,
     file_analysis_worker_loop,
     pattern_reload_loop,
     stale_task_reaper_loop,
@@ -129,6 +130,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     summary_task = asyncio.create_task(
         summary_scheduler_loop(), name="summary_scheduler"
     )
+    failed_alert_task = asyncio.create_task(
+        failed_alert_retry_loop(bot), name="failed_alert_retry"
+    )
     ops_alerts_tasks = start_ops_alerts(bot)
     log.info("startup.whisper.worker", enabled=settings.WHISPER_ENABLED)
     log.info("startup.file_analysis.worker", enabled=settings.FILE_ANALYSIS_ENABLED)
@@ -141,7 +145,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # --- shutdown ---
         bg_tasks = (
             cleanup_task, pattern_task, whisper_task, analysis_task,
-            file_task, reaper_task, summary_task,
+            file_task, reaper_task, summary_task, failed_alert_task,
         )
         for task in bg_tasks:
             task.cancel()

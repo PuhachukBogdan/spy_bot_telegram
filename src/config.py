@@ -117,6 +117,11 @@ class Settings(BaseSettings):
     # is one card no matter how many messages it spans. Applies to critical too. A
     # risk type with no open case in the window opens a fresh card.
     RISK_CASE_WINDOW_MINUTES: int = 30
+    # Failed-alert retry: a worker periodically re-posts undelivered Slack alerts
+    # (the failed_alerts breadcrumbs) once Slack recovers, giving up after
+    # FAILED_ALERT_MAX_RETRIES so a permanently-broken row isn't retried forever.
+    FAILED_ALERT_RETRY_INTERVAL_SECONDS: int = 300
+    FAILED_ALERT_MAX_RETRIES: int = 5
 
     # === Tier-2 analysis worker (unified batch + priority lane, decision A) ===
     # One per-chat analyze_chat task; the worker polls this often for due tasks
