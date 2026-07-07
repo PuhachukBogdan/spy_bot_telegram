@@ -70,13 +70,19 @@ def test_blocks_high_badge_and_review_link() -> None:
     assert any("Private Channel" in str(b) for b in blocks)
 
 
-def test_blocks_show_date_not_verdict() -> None:
+def test_blocks_show_message_date_not_verdict() -> None:
     event = _event(level="high")
-    blocks, _ = build_alert_blocks(event, _chat("Acme chat"), "Acme Corp")
+    msg_dt = datetime(2026, 6, 5, 14, 32, tzinfo=UTC)
+    blocks, _ = build_alert_blocks(
+        event, _chat("Acme chat"), "Acme Corp", message_dt=msg_dt
+    )
     flat = str(blocks)
-    assert "*Verdict:*" not in flat       # verdict field dropped
-    assert "*Date:*" in flat              # replaced by the message date
-    assert event.created_at.strftime("%Y-%m-%d %H:%M UTC") in flat
+    assert "*Verdict:*" not in flat                # verdict field dropped
+    assert "*Date:*" in flat                       # replaced by the message date
+    assert "2026-06-05 14:32 UTC" in flat          # the flagged message's send time
+    # Falls back to detection time only when the message row is unavailable.
+    blocks2, _ = build_alert_blocks(event, _chat("Acme chat"), "Acme Corp")
+    assert event.created_at.strftime("%Y-%m-%d %H:%M UTC") in str(blocks2)
 
 
 def test_short_why_trims_to_two_sentences_and_caps() -> None:

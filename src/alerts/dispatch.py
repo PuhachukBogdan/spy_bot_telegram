@@ -39,6 +39,7 @@ from src.alerts.slack import (
 from src.config import settings
 from src.db.client import acquire_connection
 from src.db.models import Chat, RiskEvent
+from src.db.queries.messages import get_message_timestamp
 from src.db.queries.risk_events import list_case_events, set_slack_message_ts
 from src.utils.logging import get_logger
 
@@ -85,8 +86,14 @@ async def _open_case(
 ) -> None:
     """No open case for this (chat × risk_type): post a fresh top-level card."""
     short_id = str(event.id)[:8]
+    async with acquire_connection() as conn:
+        message_dt = (
+            await get_message_timestamp(conn, event.message_id)
+            if event.message_id
+            else None
+        )
     blocks, text = build_alert_blocks(
-        event, chat, partner_name, mention_prefix=mention_prefix
+        event, chat, partner_name, mention_prefix=mention_prefix, message_dt=message_dt
     )
     channel = settings.SLACK_CHANNEL_ALERTS
     try:
@@ -138,9 +145,18 @@ async def _update_case(
 
     phrase = (event.detected_phrase or "").strip()[:_CASE_NOTE_PHRASE_MAX]
     case_note = f"Case: {len(case_events)} signals" + (f" · latest: {phrase}" if phrase else "")
+    # The card renders the most-severe finding, so show that message's send time.
+    async with acquire_connection() as conn:
+        message_dt = (
+            await get_message_timestamp(conn, primary.message_id)
+            if primary.message_id
+            else None
+        )
     # No mention on the edited card itself — re-pinging is the threaded note's job,
     # so a routine update never re-notifies the whole channel.
-    blocks, text = build_alert_blocks(primary, chat, partner_name, case_note=case_note)
+    blocks, text = build_alert_blocks(
+        primary, chat, partner_name, case_note=case_note, message_dt=message_dt
+    )
 
     try:
         await update_alert(channel=channel, ts=case_ts, text=text, blocks=blocks)

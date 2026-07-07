@@ -130,6 +130,20 @@ async def get_message_by_id(
     return Message.from_record(row) if row is not None else None
 
 
+async def get_message_timestamp(
+    conn: asyncpg.Connection, message_id: UUID
+) -> datetime | None:
+    """Return a message's Telegram send time (``timestamp``) by id, or ``None``.
+
+    Used by alert dispatch to show WHEN the flagged message was sent, not when it
+    was analysed: ``created_at`` is the ingestion / analysis cursor, ``timestamp``
+    is the real Telegram send time. A targeted single-column read for the hot
+    dispatch path (no need to hydrate the full row).
+    """
+    ts = await conn.fetchval("SELECT timestamp FROM messages WHERE id = $1", message_id)
+    return ts if isinstance(ts, datetime) else None
+
+
 async def get_messages_around(
     conn: asyncpg.Connection,
     chat_id: UUID,

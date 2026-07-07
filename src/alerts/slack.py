@@ -14,6 +14,7 @@ duplicating the full record.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from slack_sdk.errors import SlackApiError
@@ -137,6 +138,7 @@ def build_alert_blocks(
     mention_prefix: str = "",
     include_actions: bool = True,
     case_note: str | None = None,
+    message_dt: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Render one risk event into (Block Kit blocks, fallback text).
 
@@ -146,6 +148,9 @@ def build_alert_blocks(
     ``case_note`` (e.g. ``"Case: 3 signals · latest: …"``) is shown when an open
     case's card is being updated in place, so the card reads as a developing case
     rather than a single moment.
+    ``message_dt`` is the flagged message's Telegram send time — shown as the card
+    Date. It falls back to the event's own ``created_at`` (detection time) only if
+    the message row is unavailable.
     """
     badge = _LEVEL_BADGE.get(event.risk_level, event.risk_level.upper())
     partner = partner_name or "—"  # —
@@ -154,7 +159,7 @@ def build_alert_blocks(
     short_id = str(event.id)[:8]
     phrase = (event.detected_phrase or "").strip()
     explanation = short_why(event.llm_explanation)
-    message_date = event.created_at.strftime("%Y-%m-%d %H:%M UTC")
+    message_date = (message_dt or event.created_at).strftime("%Y-%m-%d %H:%M UTC")
 
     text = (
         f"{mention_prefix}{badge}: {risk_label} — {partner} "
