@@ -19,6 +19,7 @@ Files above ``FILE_MAX_BYTES`` and unsupported formats are silently skipped.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import re
 from datetime import UTC, datetime, timedelta
@@ -32,7 +33,11 @@ from src.db.client import acquire_connection
 from src.db.models import Chat, Message, ProcessingQueue, RiskEvent
 from src.db.queries.chats import get_chat_by_id
 from src.db.queries.cost import record_llm_cost
-from src.db.queries.messages import get_message_by_id
+from src.db.queries.messages import (
+    file_hash_seen,
+    get_message_by_id,
+    record_file_hash,
+)
 from src.db.queries.partners import get_partner_by_id
 from src.db.queries.queue import complete_task, fail_task, retry_task
 from src.db.queries.risk_events import save_risk_event
@@ -178,6 +183,14 @@ async def _analyze_file(bot: Bot, message_id: UUID) -> tuple[list[RiskEvent], Ch
     if not text.strip():
         raise _Skip("extracted text is empty")
 
+    # Dedup: an identical document already analysed in this chat (e.g. the same
+    # report re-sent daily) is skipped before spending on the LLM. The FIRST copy
+    # is always analysed; only byte-identical re-sends are suppressed.
+    content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    async with acquire_connection() as conn:
+        if await file_hash_seen(conn, chat.id, content_hash):
+            raise _Skip("duplicate document (identical content already analysed)")
+
     async with acquire_connection() as conn:
         system_prompt = await load_template(conn, _FILE_PROMPT)
 
@@ -189,13 +202,23 @@ async def _analyze_file(bot: Bot, message_id: UUID) -> tuple[list[RiskEvent], Ch
     )
 
     if not result.analysis.findings:
-        # Still record cost even when the doc is clean.
+        # Still record cost even when the doc is clean, and mark it analysed so an
+        # identical re-send is skipped.
         async with acquire_connection() as conn:
             if result.cost_usd is not None:
                 await record_llm_cost(conn, result.cost_usd)
+            await record_file_hash(
+                conn, chat_id=chat.id, content_hash=content_hash, message_id=message.id
+            )
         return [], chat
 
     alertable = await _persist(chat, message, file_name, result)
+    # Record only after a successful persist — a failed/ retried analysis must be
+    # able to re-run rather than being skipped as a "duplicate".
+    async with acquire_connection() as conn:
+        await record_file_hash(
+            conn, chat_id=chat.id, content_hash=content_hash, message_id=message.id
+        )
     return alertable, chat
 
 

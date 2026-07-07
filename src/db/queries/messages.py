@@ -144,6 +144,52 @@ async def get_message_timestamp(
     return ts if isinstance(ts, datetime) else None
 
 
+async def file_hash_seen(
+    conn: asyncpg.Connection, chat_id: UUID, content_hash: str
+) -> bool:
+    """True if a document with this exact content was already analysed in this chat."""
+    row = await conn.fetchrow(
+        "SELECT 1 FROM analyzed_file_hashes WHERE chat_id = $1 AND content_hash = $2",
+        chat_id,
+        content_hash,
+    )
+    return row is not None
+
+
+async def record_file_hash(
+    conn: asyncpg.Connection, *, chat_id: UUID, content_hash: str, message_id: UUID
+) -> None:
+    """Mark a (chat, content) pair as analysed. Idempotent (dupe insert is a no-op)."""
+    await conn.execute(
+        """
+        INSERT INTO analyzed_file_hashes (chat_id, content_hash, message_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (chat_id, content_hash) DO NOTHING
+        """,
+        chat_id,
+        content_hash,
+        message_id,
+    )
+
+
+async def get_messages_by_ids(
+    conn: asyncpg.Connection, message_ids: list[UUID]
+) -> list[Message]:
+    """Return messages for the given ids, oldest first (chronological context).
+
+    Used to render the surrounding lines of a risk case on the alert card. Order
+    is by ``timestamp`` so the snippet reads in the order it was said; ids with no
+    row are simply absent.
+    """
+    if not message_ids:
+        return []
+    rows = await conn.fetch(
+        "SELECT * FROM messages WHERE id = ANY($1) ORDER BY timestamp ASC",
+        message_ids,
+    )
+    return [Message.from_record(row) for row in rows]
+
+
 async def get_messages_around(
     conn: asyncpg.Connection,
     chat_id: UUID,

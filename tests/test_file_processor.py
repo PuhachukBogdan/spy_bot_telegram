@@ -286,6 +286,70 @@ async def test_analyze_file_skips_benign_report_before_spending(
     analyze_mock.assert_not_called()         # never sent to the LLM
 
 
+@pytest.mark.asyncio
+async def test_analyze_file_skips_duplicate_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A document whose extracted text was already analysed in this chat is skipped
+    # before the LLM call (dedup): no re-analysis, no re-alert.
+    monkeypatch.setattr("src.pipeline.file_processor.settings.FILE_ANALYSIS_ENABLED", True)
+
+    complete_mock = AsyncMock()
+    monkeypatch.setattr("src.pipeline.file_processor.complete_task", complete_mock)
+
+    msg = MagicMock()
+    msg.id = uuid4()
+    msg.chat_id = uuid4()
+    msg.raw_payload = {
+        "document": {
+            "file_id": "F2",
+            "file_name": "daily_stats.xlsx",  # not a commission report
+            "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
+    }
+    chat = MagicMock()
+    chat.id = uuid4()
+
+    monkeypatch.setattr(
+        "src.pipeline.file_processor.get_message_by_id", AsyncMock(return_value=msg)
+    )
+    monkeypatch.setattr(
+        "src.pipeline.file_processor.get_chat_by_id", AsyncMock(return_value=chat)
+    )
+    monkeypatch.setattr(
+        "src.pipeline.file_processor._download", AsyncMock(return_value=b"xlsxbytes")
+    )
+    monkeypatch.setattr(
+        "src.pipeline.file_processor._extract_text", lambda *a, **k: "same content"
+    )
+    monkeypatch.setattr(
+        "src.pipeline.file_processor.file_hash_seen", AsyncMock(return_value=True)
+    )
+    analyze_mock = AsyncMock()
+    monkeypatch.setattr("src.pipeline.file_processor.analyze_file_risk", analyze_mock)
+
+    fake_conn = AsyncMock()
+    fake_ctx = AsyncMock()
+    fake_ctx.__aenter__ = AsyncMock(return_value=fake_conn)
+    fake_ctx.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "src.pipeline.file_processor.acquire_connection", MagicMock(return_value=fake_ctx)
+    )
+
+    from src.db.models import ProcessingQueue
+    from src.pipeline.file_processor import process_file_task
+
+    task = MagicMock(spec=ProcessingQueue)
+    task.id = 8
+    task.payload = {"message_id": str(msg.id)}
+    task.attempts = 1
+
+    await process_file_task(MagicMock(), task)
+
+    complete_mock.assert_awaited_once()   # task completed (skip path)
+    analyze_mock.assert_not_called()      # duplicate → never re-analysed
+
+
 # ---------------------------------------------------------------------------
 # process_file_task — kill-switch test
 # ---------------------------------------------------------------------------
