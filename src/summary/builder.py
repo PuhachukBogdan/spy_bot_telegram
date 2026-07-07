@@ -672,9 +672,32 @@ _MONTH_FILTER_SCRIPT = """
 """
 
 
+# A floating "save as PDF" affordance (top-right). Uses the browser's own
+# print-to-PDF — no server-side rendering. Hidden when actually printing, and the
+# interactive chrome (sidebar/search/date picker/back button) is stripped so the
+# printed/PDF page is clean content only. Cards avoid mid-card page breaks.
+_PRINT_CSS = """
+.print-btn{position:fixed;top:14px;right:16px;z-index:60;cursor:pointer;
+  font:600 12px/1 var(--mono);letter-spacing:.05em;color:var(--ink);
+  background:var(--surface);border:1px solid var(--line);border-radius:8px;
+  padding:9px 13px;box-shadow:var(--shadow-lift)}
+.print-btn:hover{background:var(--surface-2)}
+@media print{
+  .print-btn{display:none!important}
+  .sidebar,.daterange,.mgr-back,[data-search],.accent-bar{display:none!important}
+  body{background:#fff}
+  .event,.mgr-section,.mgr-card,.cat-row{break-inside:avoid;page-break-inside:avoid}
+}
+"""
+_PRINT_BTN = (
+    '<button type="button" class="print-btn" onclick="window.print()" '
+    'aria-label="Сохранить как PDF">⭳ PDF</button>'
+)
+
+
 def _page(title_html: str, body: str, *, extra_css: str = "") -> str:
     """Assemble a full HTML document from the shared head + given body/CSS."""
-    css = _BASE_CSS + extra_css + _RESPONSIVE_CSS
+    css = _BASE_CSS + extra_css + _RESPONSIVE_CSS + _PRINT_CSS
     # Hard-set the light "paper briefing" theme: this is a light-theme product,
     # so the page must NOT follow a viewer's dark OS (prefers-color-scheme). The
     # dark "control room" tokens stay in _BASE_CSS but dormant — reachable only
@@ -688,6 +711,7 @@ def _page(title_html: str, body: str, *, extra_css: str = "") -> str:
         f"<title>{title_html}</title>\n"
         f"<style>{css}</style>\n"
         "</head>\n<body>\n"
+        f"{_PRINT_BTN}\n"
         f"{body}\n"
         f"{_NAV_SCRIPT}\n"
         "</body>\n</html>\n"

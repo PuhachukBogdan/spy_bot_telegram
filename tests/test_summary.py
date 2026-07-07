@@ -215,6 +215,21 @@ def test_event_card_shows_partner_and_phrase() -> None:
     assert "Off-the-books deal suspected." in html
 
 
+def test_report_has_pdf_print_button() -> None:
+    mgr = _mgr()
+    html = build_report_html(
+        period_type="weekly",
+        since=_SINCE,
+        until=_UNTIL,
+        managers=[mgr],
+        heatmap_rows=[_heatmap_row(mgr["id"])],
+        event_rows=[_event_row(mgr["id"])],
+    )
+    assert 'class="print-btn"' in html
+    assert "window.print()" in html
+    assert "@media print" in html
+
+
 def test_event_card_shows_author_and_role() -> None:
     mgr = _mgr()
     row = _event_row(mgr["id"], author_name="Иван Петров", author_role="internal")
