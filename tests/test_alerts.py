@@ -19,6 +19,7 @@ from src.alerts.critical import critical_mention_prefix
 from src.alerts.dedup import resolve_open_case_ts
 from src.alerts.slack import SlackDeliveryError, build_alert_blocks
 from src.db.models import Chat, RiskEvent
+from src.utils.text import short_why
 from tests.conftest import FakeBot
 
 # --- helpers -----------------------------------------------------------------
@@ -67,6 +68,23 @@ def test_blocks_high_badge_and_review_link() -> None:
     assert f"/risk {str(event.id)[:8]}" in _context_text(blocks)
     # Risk type is humanised.
     assert any("Private Channel" in str(b) for b in blocks)
+
+
+def test_blocks_show_date_not_verdict() -> None:
+    event = _event(level="high")
+    blocks, _ = build_alert_blocks(event, _chat("Acme chat"), "Acme Corp")
+    flat = str(blocks)
+    assert "*Verdict:*" not in flat       # verdict field dropped
+    assert "*Date:*" in flat              # replaced by the message date
+    assert event.created_at.strftime("%Y-%m-%d %H:%M UTC") in flat
+
+
+def test_short_why_trims_to_two_sentences_and_caps() -> None:
+    assert short_why(None) == ""
+    assert short_why("One only.") == "One only."
+    assert short_why("First. Second. Third dropped.") == "First. Second."
+    long = short_why("word " * 100)
+    assert long.endswith("…") and len(long) <= 221
 
 
 def test_blocks_critical_badge_and_mention_prefix() -> None:

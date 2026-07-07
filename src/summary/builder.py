@@ -28,6 +28,8 @@ from uuid import UUID
 from jinja2 import Environment
 from markupsafe import Markup
 
+from src.utils.text import short_why
+
 # ---------------------------------------------------------------------------
 # Risk category registry (canonical order for heat-map columns)
 # ---------------------------------------------------------------------------
@@ -902,7 +904,9 @@ def build_report_html(
             risk_type_label=_risk_type_label(str(row["risk_type"])),
             final_score=int(row["final_score"]),
             detected_phrase=str(row["detected_phrase"]) if row.get("detected_phrase") else None,
-            llm_explanation=str(row["llm_explanation"]) if row.get("llm_explanation") else None,
+            llm_explanation=short_why(str(row["llm_explanation"])) or None
+            if row.get("llm_explanation")
+            else None,
             author=str(row["author_name"]) if row.get("author_name") else None,
             author_role=str(row["author_role"]) if row.get("author_role") else None,
             status=str(row.get("status") or ""),

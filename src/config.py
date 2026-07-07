@@ -169,10 +169,10 @@ class Settings(BaseSettings):
     OPS_FEED_HTTP_RETRY_DELAY_SECONDS: int = 5
     # Grace period after first detecting an active incident before we broadcast it
     # into partner groups. A payment provider that recovers inside this window
-    # never reaches partners — a sub-hour dip is operationally insignificant and
-    # the provider may already be back by the time an alert would land. Only an
-    # incident still active past this delay is announced.
-    OPS_INCIDENT_BROADCAST_DELAY_SECONDS: int = 3600
+    # never reaches partners — a short dip is operationally insignificant and the
+    # provider may already be back by the time an alert would land. Only an
+    # incident still active past this delay (1.5h) is announced.
+    OPS_INCIDENT_BROADCAST_DELAY_SECONDS: int = 5400
     # Argentina holiday reminder: checked daily at this local hour/timezone.
     OPS_HOLIDAYS_TIMEZONE: str = "Europe/Madrid"
     OPS_HOLIDAYS_CRON_HOUR: int = 13

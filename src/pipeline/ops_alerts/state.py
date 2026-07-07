@@ -81,6 +81,19 @@ async def update_incident(
     )
 
 
+async def mark_recovery_posted(conn: asyncpg.Connection, incident_id: str) -> None:
+    """Flag that this incident's one-shot recovery alert has been broadcast.
+
+    Recovery alerts fire once, when a previously-announced incident returns to a
+    resolved status. This flag stops later ticks (which still see the incident as
+    resolved) from re-broadcasting the recovery.
+    """
+    await conn.execute(
+        "UPDATE payment_incidents SET recovery_posted = true WHERE incident_id = $1",
+        incident_id,
+    )
+
+
 async def record_message(
     conn: asyncpg.Connection,
     *,

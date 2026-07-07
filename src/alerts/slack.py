@@ -23,6 +23,7 @@ from slack_sdk.web.async_client import AsyncWebClient
 from src.config import settings
 from src.db.models import Chat, RiskEvent
 from src.utils.logging import get_logger
+from src.utils.text import short_why
 
 log = get_logger(__name__)
 
@@ -31,8 +32,6 @@ _LEVEL_BADGE = {
     "critical": "\U0001f534 CRITICAL RISK",  # 🔴
     "high": "\U0001f7e0 HIGH RISK",  # 🟠
 }
-# LLM explanations can be long; keep the Slack card readable (full text is in /risk).
-_EXPLANATION_MAX = 600
 
 _client: AsyncWebClient | None = None
 
@@ -154,7 +153,8 @@ def build_alert_blocks(
     risk_label = _risk_type_label(event.risk_type)
     short_id = str(event.id)[:8]
     phrase = (event.detected_phrase or "").strip()
-    explanation = (event.llm_explanation or "").strip()[:_EXPLANATION_MAX]
+    explanation = short_why(event.llm_explanation)
+    message_date = event.created_at.strftime("%Y-%m-%d %H:%M UTC")
 
     text = (
         f"{mention_prefix}{badge}: {risk_label} — {partner} "
@@ -178,7 +178,7 @@ def build_alert_blocks(
                 {"type": "mrkdwn", "text": f"*Partner:*\n{partner}"},
                 {"type": "mrkdwn", "text": f"*Chat:*\n{chat_name}"},
                 {"type": "mrkdwn", "text": f"*Risk type:*\n{risk_label}"},
-                {"type": "mrkdwn", "text": f"*Verdict:*\n{event.llm_verdict or '—'}"},
+                {"type": "mrkdwn", "text": f"*Date:*\n{message_date}"},
             ],
         },
     ]

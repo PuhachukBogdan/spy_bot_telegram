@@ -5,63 +5,40 @@ escape every dynamic field with ``html.escape`` to avoid Telegram parse errors
 on stray ``<`` / ``>`` / ``&`` in feed content.
 
 These messages broadcast into partner groups (the sanctioned proactive-write
-path), so they must never reveal the monitoring source: the feed's own
-status-page URL and incident id are NOT rendered, the provider name is NOT
-rendered, and the free-text ``details`` is stripped of HTML — which also drops
-any source links held in tag attributes.
+path), so they must never reveal the monitoring source or the payment provider:
+only the country and the incident's last-update time are ever rendered. The
+feed's free-text fields (issue / status / details) and its links / incident id
+are deliberately NOT shown.
 """
 
 from __future__ import annotations
 
-import re
-from html import escape, unescape
+from html import escape
 
 from src.pipeline.ops_alerts.feed_parser import Incident
 from src.pipeline.ops_alerts.holidays_calendar import Holiday
-
-_TAG_RE = re.compile(r"<[^>]+>")
-_WS_RE = re.compile(r"\s+")
 
 
 def _esc(value: str | None) -> str:
     return escape(value) if value else "—"
 
 
-def _clean(text: str | None) -> str:
-    """Feed free-text → safe plain text for a partner-facing broadcast.
-
-    Unescapes entities, strips every HTML tag (also dropping any source URLs that
-    live inside tag attributes, e.g. ``<a href="https://status.…">``), collapses
-    whitespace, then re-escapes for Telegram's HTML parse mode.
-    """
-    if not text:
-        return "—"
-    plain = _WS_RE.sub(" ", _TAG_RE.sub(" ", unescape(text))).strip()
-    return escape(plain) if plain else "—"
-
-
-def format_new_incident(inc: Incident, *, detected_at: str) -> str:
+def format_new_incident(inc: Incident, *, last_update: str) -> str:
     return (
-        "🚨 <b>PAYMENT ALERT — NEW ISSUE</b>\n"
+        "<b>PSP alert</b>\n"
         f"<b>Country:</b> {_esc(inc.country)}\n"
-        f"<b>Issue:</b> {_esc(inc.issue)}\n"
-        f"<b>Status:</b> {_esc(inc.status)}\n"
-        f"<b>Detection time:</b> {_esc(detected_at)}\n\n"
-        f"📋 <b>Details:</b> {_clean(inc.details)}"
+        f"<b>Last update:</b> {_esc(last_update)}\n\n"
+        "⚠️ <b>Expect potential changes in:</b>\n"
+        "-  click2reg\n"
+        "-  reg2dep"
     )
 
 
-def format_update(inc: Incident, *, updated_at: str) -> str:
-    header = (
-        "✅ <b>RESOLVED</b>" if inc.is_resolved else "🔄 <b>UPDATE</b>"
-    )
+def format_recovery(inc: Incident, *, last_update: str) -> str:
     return (
-        f"{header}\n\n"
+        "✅ <b>PSP recovered</b>\n"
         f"<b>Country:</b> {_esc(inc.country)}\n"
-        f"<b>Issue:</b> {_esc(inc.issue)}\n"
-        f"<b>Status:</b> {_esc(inc.status)}\n"
-        f"<b>Last update:</b> {_esc(updated_at)}\n\n"
-        f"📋 <b>Details:</b>\n{_clean(inc.details)}"
+        f"<b>Last update:</b> {_esc(last_update)}"
     )
 
 
@@ -69,11 +46,8 @@ def format_holiday(holiday: Holiday) -> str:
     return (
         "🎊 <b>ARGENTINA HOLIDAY REMINDER</b>\n"
         f"{_esc(holiday.name)}\n"
-        f"<b>Date:</b> {holiday.date.isoformat()}\n"
-        f"<b>Business impact:</b> {_esc(holiday.impact)}\n\n"
+        f"<b>Date:</b> {holiday.date.isoformat()}\n\n"
         "⚠️ <b>Expect potential changes in:</b>\n"
-        "- Deposits activity\n"
-        "- Registration → FTD conversion\n"
-        "- Customer support volume\n\n"
-        "📊 <b>Plan accordingly for tomorrow's operations</b>"
+        "-  click2reg\n"
+        "-  reg2dep"
     )

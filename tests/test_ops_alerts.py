@@ -36,7 +36,7 @@ from src.pipeline.ops_alerts.holidays_calendar import (
 from src.pipeline.ops_alerts.templates import (
     format_holiday,
     format_new_incident,
-    format_update,
+    format_recovery,
 )
 
 # ---------------------------------------------------------------------------
@@ -206,20 +206,20 @@ def test_find_tomorrow_holiday_year_boundary() -> None:
 
 
 def test_templates_escape_html() -> None:
+    # The only free-text field the minimal templates render is the country;
+    # everything from the feed's body (issue / status / details) is dropped.
     inc = Incident(
-        incident_id="i1", country="Chile", provider="Webpay",
+        incident_id="i1", country="Chile <b>x</b>", provider="Webpay",
         issue="<b>x</b>", link="https://x/i1", details="a & b <script>alert(1)</script>",
         status="In progress", iso_date=None,
     )
-    new = format_new_incident(inc, detected_at="now")
-    upd = format_update(inc, updated_at="now")
-    # The issue field is escaped — never rendered as live HTML.
-    assert "<b>x</b>" not in new and "&lt;b&gt;x&lt;/b&gt;" in new
-    # details HTML is STRIPPED (not escaped-and-shown): no raw tag survives, but
-    # the surrounding text is preserved with its ampersand re-escaped.
-    assert "<script>" not in new and "<script>" not in upd
-    assert "&lt;script&gt;" not in upd  # tag stripped, not rendered as text
-    assert "&amp; b" in upd
+    new = format_new_incident(inc, last_update="now")
+    rec = format_recovery(inc, last_update="now")
+    for out in (new, rec):
+        # The country is escaped — never rendered as live HTML.
+        assert "<b>x</b>" not in out and "&lt;b&gt;x&lt;/b&gt;" in out
+        # The feed body never reaches the message at all.
+        assert "script" not in out.lower()
 
 
 def test_incident_templates_do_not_leak_source() -> None:
@@ -231,28 +231,40 @@ def test_incident_templates_do_not_leak_source() -> None:
         details='<p>Resolved - see <a href="https://status.d24.com/x">status</a></p>',
         status="Resolved", iso_date=None,
     )
-    new = format_new_incident(inc, detected_at="now")
-    upd = format_update(inc, updated_at="now")
-    for out in (new, upd):
+    new = format_new_incident(inc, last_update="now")
+    rec = format_recovery(inc, last_update="now")
+    for out in (new, rec):
         assert "d24" not in out.lower()        # no source-provider name
         assert "http" not in out.lower()       # no link rendered at all
         assert inc.incident_id not in out      # no internal incident id
         assert "santander" not in out.lower()  # payment provider name never shown
         assert "provider" not in out.lower()   # no Provider: field at all
+        assert "conversion" not in out.lower()  # feed issue text never shown
 
 
-def test_format_update_resolved_header() -> None:
-    upd = format_update(_incident(status="Resolved"), updated_at="now")
-    assert "RESOLVED" in upd
-    upd2 = format_update(_incident(status="In progress"), updated_at="now")
-    assert "UPDATE" in upd2
+def test_format_new_incident_is_minimal() -> None:
+    out = format_new_incident(_incident(), last_update="2026-07-03 01:05 UTC")
+    assert "PSP alert" in out
+    assert "Chile" in out
+    assert "2026-07-03 01:05 UTC" in out
+    assert "click2reg" in out and "reg2dep" in out
+
+
+def test_format_recovery_header_and_country() -> None:
+    out = format_recovery(_incident(), last_update="2026-07-03 01:05 UTC")
+    assert "PSP recovered" in out
+    assert "Chile" in out
+    assert "2026-07-03 01:05 UTC" in out
 
 
 def test_format_holiday_has_name() -> None:
     h = get_holidays(2026)[0]  # Año Nuevo
     out = format_holiday(h)
     assert "Año Nuevo" in out
-    assert "Population celebrating" not in out  # dropped from the header
+    assert "Population celebrating" not in out   # dropped from the header
+    assert "Business impact" not in out          # dropped in the new minimal template
+    assert "Plan accordingly" not in out         # footer dropped too
+    assert "click2reg" in out and "reg2dep" in out
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +306,7 @@ async def test_edit_real_failure_reported() -> None:
 def iw_patch(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     rec: dict[str, Any] = {
         "inserted": [], "updated": [], "recorded": [], "broadcast": 0,
-        "edited": 0, "count": 1, "existing": None, "incidents": [],
+        "recovery_marked": [], "count": 1, "existing": None, "incidents": [],
         "groups": [_group(111), _group(222)], "messages": [],
     }
 
@@ -328,15 +340,8 @@ def iw_patch(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         rec["broadcast"] += 1
         return [tg_sender.SendResult(chat_id=u, telegram_message_id=1) for u, _ in targets]
 
-    async def fake_edit(bot: Any, items: Any, text: str, *, concurrency: int) -> list[Any]:
-        rec["edited"] += 1
-        return [tg_sender.EditResult(chat_id=i["chat_id"], ok=True) for i in items]
-
-    async def fake_mark_edited(conn: Any, **kw: Any) -> None:
-        pass
-
-    async def fake_mark_failed(conn: Any, **kw: Any) -> None:
-        pass
+    async def fake_mark_recovery(conn: Any, incident_id: str) -> None:
+        rec["recovery_marked"].append(incident_id)
 
     monkeypatch.setattr(iw, "fetch_incidents", fake_fetch)
     monkeypatch.setattr(iw.state, "count_incidents", fake_count)
@@ -345,11 +350,9 @@ def iw_patch(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(iw.state, "update_incident", fake_update)
     monkeypatch.setattr(iw.state, "record_message", fake_record)
     monkeypatch.setattr(iw.state, "list_incident_messages", fake_list_messages)
-    monkeypatch.setattr(iw.state, "mark_message_edited", fake_mark_edited)
-    monkeypatch.setattr(iw.state, "mark_message_edit_failed", fake_mark_failed)
+    monkeypatch.setattr(iw.state, "mark_recovery_posted", fake_mark_recovery)
     monkeypatch.setattr(iw, "list_active_group_chats", fake_groups)
     monkeypatch.setattr(iw, "broadcast", fake_broadcast)
-    monkeypatch.setattr(iw, "edit_messages", fake_edit)
     monkeypatch.setattr(iw.settings, "OPS_FEED_URL", SimpleNamespace(get_secret_value=lambda: "http://feed"))
     return rec
 
@@ -428,16 +431,48 @@ async def test_unseen_resolved_incident_is_skipped(iw_patch: dict[str, Any]) -> 
     assert iw_patch["broadcast"] == 0
 
 
-async def test_known_posted_incident_is_edited(iw_patch: dict[str, Any]) -> None:
+async def test_posted_incident_resolved_broadcasts_recovery(iw_patch: dict[str, Any]) -> None:
+    # A previously-announced incident that resolved → one-shot recovery alert to
+    # the exact chats that got the original message; the recovery flag is set.
     iw_patch["count"] = 5
-    iw_patch["existing"] = {"seeded_only": False}
+    iw_patch["existing"] = {"seeded_only": False, "recovery_posted": False}
     iw_patch["messages"] = [
         {"chat_id": uuid4(), "telegram_chat_id": 111, "telegram_message_id": 9}
     ]
     iw_patch["incidents"] = [_incident("UPD", status="Resolved")]
     await iw.run_incidents_tick(OpsFakeBot())  # type: ignore[arg-type]
     assert len(iw_patch["updated"]) == 1
-    assert iw_patch["edited"] == 1
+    assert iw_patch["broadcast"] == 1  # recovery went out
+    assert iw_patch["recovery_marked"] == ["UPD"]
+    assert iw_patch["recorded"] == []  # recovery is one-shot, never recorded
+
+
+async def test_posted_incident_still_active_does_nothing(iw_patch: dict[str, Any]) -> None:
+    # The PSP alert already stands; the minimal template has no status to refresh,
+    # so a still-active update produces no message and no edit.
+    iw_patch["count"] = 5
+    iw_patch["existing"] = {"seeded_only": False, "recovery_posted": False}
+    iw_patch["messages"] = [
+        {"chat_id": uuid4(), "telegram_chat_id": 111, "telegram_message_id": 9}
+    ]
+    iw_patch["incidents"] = [_incident("UPD", status="In progress")]
+    await iw.run_incidents_tick(OpsFakeBot())  # type: ignore[arg-type]
+    assert len(iw_patch["updated"]) == 1  # fields refreshed
+    assert iw_patch["broadcast"] == 0
+    assert iw_patch["recovery_marked"] == []
+
+
+async def test_recovery_is_not_sent_twice(iw_patch: dict[str, Any]) -> None:
+    # Recovery already broadcast on an earlier tick → later resolved ticks skip it.
+    iw_patch["count"] = 5
+    iw_patch["existing"] = {"seeded_only": False, "recovery_posted": True}
+    iw_patch["messages"] = [
+        {"chat_id": uuid4(), "telegram_chat_id": 111, "telegram_message_id": 9}
+    ]
+    iw_patch["incidents"] = [_incident("UPD", status="Resolved")]
+    await iw.run_incidents_tick(OpsFakeBot())  # type: ignore[arg-type]
+    assert iw_patch["broadcast"] == 0
+    assert iw_patch["recovery_marked"] == []
 
 
 async def test_seeded_incident_stays_silent_on_update(iw_patch: dict[str, Any]) -> None:
@@ -446,7 +481,7 @@ async def test_seeded_incident_stays_silent_on_update(iw_patch: dict[str, Any]) 
     iw_patch["incidents"] = [_incident("S", status="Resolved")]
     await iw.run_incidents_tick(OpsFakeBot())  # type: ignore[arg-type]
     assert len(iw_patch["updated"]) == 1
-    assert iw_patch["edited"] == 0  # no messages to edit — stays silent
+    assert iw_patch["broadcast"] == 0  # no messages exist — stays silent
 
 
 # ---------------------------------------------------------------------------
