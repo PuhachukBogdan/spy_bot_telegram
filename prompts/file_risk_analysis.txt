@@ -16,6 +16,20 @@ SCORING GUIDELINES:
 - 30-59: Potentially sensitive, may be legitimate (high-level financial summary, partial system info)
 - 0-29: Low concern — include only if something is genuinely suspicious
 
+JUDGE INTENT AND DIRECTION, NOT KEYWORDS OR NUMBERS:
+- The risk is OUR confidential material going OUT to hands that should not have it —
+  an insider leaking company secrets. Judge WHOSE data it is and WHERE it is going,
+  not merely whether the document contains figures or sensitive-looking words.
+- Routine operational documents that this partner legitimately exchanges are NOT
+  leaks even when they contain numbers — commission/payout statements, invoices,
+  performance or stats reports for the partner's OWN account, agreed media plans.
+  Score these ≤ 20.
+- A document flowing INTO the company from the partner, or the partner's own data
+  shared with their manager, is normal business — that is not our side leaking.
+- A leak requires confidential COMPANY data (other partners' terms, internal pricing
+  models, credentials, client databases, infra) reaching a party who should not see
+  it. That is the case to score high.
+
 IMPORTANT:
 - Include a verbatim excerpt (up to 200 characters) that triggered each finding
 - Return an empty findings list if the document is innocuous (marketing materials, public info, general correspondence)
