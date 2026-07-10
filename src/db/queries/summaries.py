@@ -43,6 +43,9 @@ async def risk_heatmap(
         JOIN internal_users u ON u.id = p.owner_manager_id
         WHERE re.created_at >= $1 AND re.created_at < $2
           AND u.role = 'manager' AND u.enabled = true
+          -- events dismissed via Slack (False Positive / Suppress both write
+          -- status='false_positive') never appear in weekly/monthly reports
+          AND re.status IS DISTINCT FROM 'false_positive'
         GROUP BY u.id, re.risk_type
         """,
         since,
@@ -81,6 +84,9 @@ async def list_events_for_report(
         LEFT JOIN messages msg ON msg.id = re.message_id
         WHERE re.created_at >= $1 AND re.created_at < $2
           AND u.role = 'manager' AND u.enabled = true
+          -- events dismissed via Slack (False Positive / Suppress both write
+          -- status='false_positive') never appear in weekly/monthly reports
+          AND re.status IS DISTINCT FROM 'false_positive'
         ORDER BY u.id, re.created_at
         """,
         since,
