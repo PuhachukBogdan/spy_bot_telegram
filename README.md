@@ -26,7 +26,7 @@ Full project context and the phased development plan live in [`CLAUDE.md`](./CLA
 | Slack | `slack_sdk` (Block Kit + Events API) |
 | Queue | Postgres-as-queue (`FOR UPDATE SKIP LOCKED`) |
 | Orchestration (summaries) | in-process asyncio scheduler (`workers.summary_scheduler_loop`) |
-| Deploy | Docker + docker-compose, Caddy reverse proxy |
+| Deploy | Railway (auto-deploy on `git push` to `main`); Docker + Caddy for self-host |
 
 ---
 
@@ -35,10 +35,10 @@ Full project context and the phased development plan live in [`CLAUDE.md`](./CLA
 See `CLAUDE.md` section 4 for the full annotated tree. Top level:
 
 ```
-src/            application code (bot, db, pipeline, llm, alerts, cost, utils)
-supabase/       SQL migrations (17 tables)
+src/            application code (bot, db, pipeline, llm, alerts, summary, utils)
+supabase/       SQL migrations (0001–0020, applied live)
 prompts/        fallback LLM prompts (DB-backed at runtime)
-tests/          unit + integration tests
+tests/          unit + integration tests (no real DB/Slack/network)
 ```
 
 ---
@@ -65,7 +65,15 @@ curl http://localhost:8080/health
 
 ---
 
-## Deployment (Docker + Caddy)
+## Deployment
+
+**Production runs on Railway.** The `tg_ai_bot_bow` service is connected to this repo and
+auto-deploys on every push to `main` — deploying is just `git push origin main` (never
+`railway up`, which uploads the local dir instead of the git SHA). `/health` gates readiness;
+migrations are applied to the live Supabase DB out of band. The Docker + Caddy recipe below is
+the self-host alternative.
+
+### Self-host (Docker + Caddy)
 
 1. **Prerequisites:** a Linux VM with a public IP and a DNS record pointing your domain
    (e.g. `bot.yourcompany.com`) at it. Ports 80 and 443 open.
@@ -94,6 +102,8 @@ The webhook is registered automatically on startup via `bot.set_webhook()` using
 
 ## Development status
 
-Phase 1 (foundation) is scaffolded: project config, folder structure, Docker, Caddy. Module files
-are stubs annotated with the phase that implements them. See `CLAUDE.md` section 8 for the full
-phased plan.
+Phases 1–16 are complete and running in production on Railway: message ingestion, Tier-1
+dictionary + Tier-2 LLM risk analysis, Slack alerts with interactive buttons and one-case/one-card
+dedup, file (document) analysis, the manager-centric weekly/monthly HTML reports, the cost circuit
+breaker, and the Ops Alerts subsystem. Phase 17 (load testing + pilot rollout) is in progress.
+~308 tests, no real DB/Slack/network. See `CLAUDE.md` for the full annotated state and plan.
