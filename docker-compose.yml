@@ -1,3 +1,15 @@
+# Bot service only. HTTPS/TLS is terminated by a shared "edge" Caddy proxy that
+# runs separately on the host (its own compose + Caddyfile, reused across
+# projects) and reaches this container by name over the external `edge` docker
+# network. This container publishes NO host ports.
+#
+# Prereqs on the host (one-time):
+#   docker network create edge
+#   run the edge Caddy with a site block:  <domain> -> reverse_proxy tg-bot:8080
+#   (reference copy of that setup is kept out-of-repo under ops/edge/)
+#
+# Deploy:  docker compose up -d --build
+
 services:
   bot:
     build: .
@@ -6,8 +18,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    ports:
-      - "8080:8080"
+    networks:
+      - edge
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 30s
@@ -20,25 +32,6 @@ services:
         max-size: "10m"
         max-file: "5"
 
-  caddy:
-    image: caddy:2-alpine
-    container_name: tg-bot-caddy
-    restart: unless-stopped
-    depends_on:
-      - bot
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
-
-volumes:
-  caddy_data:
-  caddy_config:
+networks:
+  edge:
+    external: true
