@@ -74,11 +74,14 @@ begin
   delete from admin_audit_log where created_at < cutoff;
   get diagnostics n = row_count; table_name := 'admin_audit_log'; deleted := n; return next;
 
-  -- 7. expired report artefacts (unexpired reports are left live)
-  delete from summaries where expires_at is not null and expires_at < now();
+  -- 7. report artefacts past the retention window. Share tokens expire on their
+  --    own 7d/30d schedule (killing the LINK); here we drop the stored rows only
+  --    after `cutoff`, so report history stays browsable/regenerable for the full
+  --    retention window like everything else — not deleted the moment a link dies.
+  delete from summaries where created_at < cutoff;
   get diagnostics n = row_count; table_name := 'summaries'; deleted := n; return next;
 
-  delete from dashboards where expires_at is not null and expires_at < now();
+  delete from dashboards where created_at < cutoff;
   get diagnostics n = row_count; table_name := 'dashboards'; deleted := n; return next;
 
   return;
