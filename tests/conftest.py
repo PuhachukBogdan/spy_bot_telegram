@@ -82,7 +82,9 @@ class FakeBot:
 
 
 class _Rights:
-    def model_dump(self, mode: str = "json") -> dict[str, Any]:
+    def model_dump(
+        self, mode: str = "json", exclude_none: bool = False, **kwargs: Any
+    ) -> dict[str, Any]:
         return {"can_read_messages": True}
 
 
@@ -99,7 +101,7 @@ class FakeBCUpdate:
         self.date = datetime.now(UTC)
 
     def model_dump(
-        self, mode: str = "json", exclude_none: bool = False
+        self, mode: str = "json", exclude_none: bool = False, **kwargs: Any
     ) -> dict[str, Any]:
         return {"id": self.id, "is_enabled": self.is_enabled}
 
@@ -150,7 +152,7 @@ class FakeDeleted:
         self.message_ids = ids
 
     def model_dump(
-        self, mode: str = "json", exclude_none: bool = False
+        self, mode: str = "json", exclude_none: bool = False, **kwargs: Any
     ) -> dict[str, Any]:
         return {"message_ids": self.message_ids}
 

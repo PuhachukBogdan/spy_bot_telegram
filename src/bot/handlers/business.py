@@ -61,6 +61,7 @@ from src.db.queries.queue import enqueue_chat_analysis
 from src.pipeline.ingest import ingest_message
 from src.pipeline.tier1 import pattern_cache
 from src.utils.logging import get_logger
+from src.utils.telegram import dump_incoming
 
 log = get_logger(__name__)
 
@@ -81,8 +82,12 @@ async def on_business_connection(update: BusinessConnection, bot: Bot) -> None:
     """
     bc_id = update.id
     owner_user_id = update.user.id
-    rights = update.rights.model_dump(mode="json") if update.rights is not None else {}
-    raw = update.model_dump(mode="json", exclude_none=True)
+    rights = (
+        dump_incoming(update.rights, exclude_none=False)
+        if update.rights is not None
+        else {}
+    )
+    raw = dump_incoming(update)
 
     notify: tuple[list[InternalUser], str] | None = None
 
@@ -382,7 +387,7 @@ async def on_deleted_business_messages(deleted: BusinessMessagesDeleted) -> None
     """
     bc_id = deleted.business_connection_id
     peer_user_id = deleted.chat.id
-    payload = deleted.model_dump(mode="json", exclude_none=True)
+    payload = dump_incoming(deleted)
 
     marked = 0
     async with acquire_connection() as conn:

@@ -34,6 +34,7 @@ from src.db.queries.queue import enqueue_chat_analysis, enqueue_task
 from src.pipeline.tier1 import MatchResult, pattern_cache
 from src.utils.language import detect_language
 from src.utils.logging import get_logger
+from src.utils.telegram import dump_incoming
 
 log = get_logger(__name__)
 
@@ -93,7 +94,7 @@ async def ingest_message(message: Message, chat: Chat) -> None:
             source=source,
             business_connection_id=business_connection_id,
             business_peer_user_id=business_peer_user_id,
-            raw_payload=message.model_dump(mode="json", exclude_none=True),
+            raw_payload=dump_incoming(message),
         )
 
         if stored is None:
