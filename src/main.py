@@ -43,6 +43,7 @@ from src.pipeline.workers import (  # noqa: E402
     file_analysis_worker_loop,
     pattern_reload_loop,
     stale_task_reaper_loop,
+    storage_monitor_loop,
     summary_scheduler_loop,
     whisper_worker_loop,
 )
@@ -133,10 +134,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     failed_alert_task = asyncio.create_task(
         failed_alert_retry_loop(bot), name="failed_alert_retry"
     )
+    storage_task = asyncio.create_task(
+        storage_monitor_loop(bot), name="storage_monitor"
+    )
     ops_alerts_tasks = start_ops_alerts(bot)
     log.info("startup.whisper.worker", enabled=settings.WHISPER_ENABLED)
     log.info("startup.file_analysis.worker", enabled=settings.FILE_ANALYSIS_ENABLED)
     log.info("startup.summary_scheduler.worker")
+    log.info(
+        "startup.storage_monitor.worker",
+        limit_mb=settings.SUPABASE_DB_SIZE_LIMIT_MB,
+        threshold_pct=settings.STORAGE_ALERT_THRESHOLD_PERCENT,
+    )
     log.info("startup.ops_alerts.worker", enabled=settings.OPS_ALERTS_ENABLED)
 
     try:
@@ -146,6 +155,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         bg_tasks = (
             cleanup_task, pattern_task, whisper_task, analysis_task,
             file_task, reaper_task, summary_task, failed_alert_task,
+            storage_task,
         )
         for task in bg_tasks:
             task.cancel()

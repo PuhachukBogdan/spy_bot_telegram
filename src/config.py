@@ -186,6 +186,21 @@ class Settings(BaseSettings):
     # Max parallel group sends, to stay under Telegram's ~30 chats/sec limit.
     OPS_BROADCAST_SEMAPHORE: int = 20
 
+    # === Storage monitoring (Supabase database size) ===
+    # The Supabase plan's database-size cap in MB (free tier = 500 MB). A
+    # background worker compares live ``pg_database_size()`` against this and,
+    # once usage crosses STORAGE_ALERT_THRESHOLD_PERCENT, DMs every admin + posts
+    # to Slack so we can purge/upgrade before writes are blocked. Raise this after
+    # a plan upgrade.
+    SUPABASE_DB_SIZE_LIMIT_MB: int = 500
+    STORAGE_ALERT_THRESHOLD_PERCENT: int = 80
+    # How often the monitor samples the DB size (6h — size moves slowly).
+    STORAGE_MONITOR_INTERVAL_SECONDS: int = 21600
+    # While still above the threshold, re-remind at most once per this many hours
+    # so the alert doesn't repeat on every sample. Re-arms (warns again on the
+    # next crossing) once usage drops back under the threshold.
+    STORAGE_ALERT_REPING_HOURS: int = 24
+
     # === Bot ===
     BOT_DM_LANGUAGE: str = "en"
     ENVIRONMENT: Literal["production", "staging", "dev"] = "production"

@@ -19,7 +19,10 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 
 from src.alerts.slack import SlackDeliveryError, build_alert_blocks, post_alert
-from src.alerts.system import send_budget_exceeded_alert
+from src.alerts.system import (
+    send_budget_exceeded_alert,
+    send_storage_warning_alert,
+)
 from src.config import settings
 from src.db.client import acquire_connection
 from src.db.models import FailedAlert
@@ -40,6 +43,7 @@ from src.db.queries.messages import get_message_timestamp
 from src.db.queries.partners import get_partner_by_id
 from src.db.queries.queue import claim_tasks, recover_stale_tasks
 from src.db.queries.risk_events import get_by_ref, set_slack_message_ts
+from src.db.queries.storage import get_database_size_bytes
 from src.db.queries.summaries import summary_exists_since
 from src.pipeline.batch_processor import process_analysis_task
 from src.pipeline.file_processor import process_file_task
@@ -445,6 +449,67 @@ async def pattern_reload_loop(
         except Exception as exc:  # never let one bad reload kill the loop
             log.error("worker.pattern_reload.error", error=str(exc))
         await asyncio.sleep(interval_seconds)
+
+
+async def run_storage_check(
+    bot: Bot, last_alert_at: datetime | None
+) -> datetime | None:
+    """One storage sample: warn admins if the DB crossed the size threshold.
+
+    Returns the ``last_alert_at`` cursor the loop should carry into the next tick:
+      - below threshold → ``None`` (re-arms; a later crossing warns again);
+      - above threshold and an alert just fired → ``now``;
+      - above threshold but alerted within ``STORAGE_ALERT_REPING_HOURS`` → the
+        unchanged prior timestamp (stays quiet, no repeat spam).
+
+    May raise on a DB error (the caller loop logs and swallows it); the alert
+    send itself is best-effort and never raises.
+    """
+    async with acquire_connection() as conn:
+        used_bytes = await get_database_size_bytes(conn)
+    limit_bytes = settings.SUPABASE_DB_SIZE_LIMIT_MB * 1024 * 1024
+    if limit_bytes <= 0:  # misconfigured cap → nothing meaningful to compare
+        return None
+    pct = used_bytes / limit_bytes * 100
+    if pct < settings.STORAGE_ALERT_THRESHOLD_PERCENT:
+        return None  # healthy → re-arm
+
+    now = datetime.now(UTC)
+    reping = timedelta(hours=settings.STORAGE_ALERT_REPING_HOURS)
+    if last_alert_at is not None and now - last_alert_at < reping:
+        return last_alert_at  # already warned recently, stay quiet
+
+    await send_storage_warning_alert(
+        bot, used_bytes=used_bytes, limit_bytes=limit_bytes, pct=pct
+    )
+    return now
+
+
+async def storage_monitor_loop(
+    bot: Bot, interval_seconds: int | None = None
+) -> None:
+    """Warn admins when Supabase DB usage crosses the storage threshold.
+
+    Samples ``pg_database_size`` every ``STORAGE_MONITOR_INTERVAL_SECONDS`` and
+    fires ``send_storage_warning_alert`` (Slack + admin DMs) on a threshold
+    crossing, re-reminding at most once per ``STORAGE_ALERT_REPING_HOURS`` while
+    the condition persists. The alert-dedup cursor is loop-local state, so it
+    resets on restart — a fresh deploy re-warns once if still full, an acceptable
+    (even useful) reminder. Checks immediately on start, then on the interval.
+    Per-iteration errors are logged and swallowed; cancellation propagates.
+    """
+    interval = interval_seconds or settings.STORAGE_MONITOR_INTERVAL_SECONDS
+    log.info("worker.storage_monitor.start", interval_s=interval)
+    last_alert_at: datetime | None = None
+    while True:
+        try:
+            last_alert_at = await run_storage_check(bot, last_alert_at)
+        except asyncio.CancelledError:
+            log.info("worker.storage_monitor.stop")
+            raise
+        except Exception as exc:  # never let one bad sample kill the loop
+            log.error("worker.storage_monitor.error", error=str(exc))
+        await asyncio.sleep(interval)
 
 
 def _last_weekly_occurrence(now: datetime) -> datetime:
