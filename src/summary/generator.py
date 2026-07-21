@@ -23,13 +23,15 @@ from src.config import settings
 from src.db.client import acquire_connection
 from src.db.queries.activity_signals import count_proposals, list_proposal_dates
 from src.db.queries.summaries import (
+    count_chats_added,
+    count_proposals_by_chat,
     create_dashboard,
     get_active_dashboard,
-    list_active_managers,
-    list_events_for_report,
+    list_active_chats,
+    list_chat_added_dates,
+    list_events_by_chat,
     mark_summary_delivered,
     revoke_dashboards_except,
-    risk_heatmap,
     save_summary,
     set_dashboard_slack,
 )
@@ -77,27 +79,32 @@ async def generate_report(
     expires_at = until + span
 
     async with acquire_connection() as conn:
-        managers = await list_active_managers(conn)
-        heatmap_rows = await risk_heatmap(conn, since, until)
-        event_rows = await list_events_for_report(conn, since, until)
-        # Monthly needs per-proposal dates for the client-side range filter;
-        # weekly only needs the total count.
+        chats = await list_active_chats(conn)
+        event_rows = await list_events_by_chat(conn, since, until)
+        chats_added = await count_chats_added(conn, since, until)
+        proposals_by_chat = await count_proposals_by_chat(conn, since, until)
+        # Monthly needs per-item dates for the client-side range filter; weekly
+        # only needs the totals.
         if period_type == "monthly":
             proposal_dates = await list_proposal_dates(conn, since, until)
             proposals = len(proposal_dates)
+            chats_added_dates = await list_chat_added_dates(conn, since, until)
         else:
             proposals = await count_proposals(conn, since, until)
             proposal_dates = None
+            chats_added_dates = None
 
     html = build_report_html(
         period_type=period_type,
         since=since,
         until=until,
-        managers=managers,
-        heatmap_rows=heatmap_rows,
+        chats=chats,
         event_rows=event_rows,
         proposals_count=proposals,
         proposal_dates=proposal_dates,
+        chats_added=chats_added,
+        chats_added_dates=chats_added_dates,
+        proposals_by_chat=proposals_by_chat,
     )
 
     report_pw = _gen_password()

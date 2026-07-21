@@ -13,6 +13,7 @@ import hmac
 import html as _html
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from aiogram.types import Update
@@ -28,6 +29,11 @@ from src.alerts.slack_callbacks import handle_slack_action, verify_slack_signatu
 from src.bot.instance import bot, dp  # noqa: E402  (after setup_logging on purpose)
 from src.config import settings  # noqa: E402
 from src.db.client import acquire_connection, close_pool, get_pool  # noqa: E402
+from src.db.queries.daily import (  # noqa: E402
+    DIGEST_MAX_AGE_DAYS,
+    get_daily_digest,
+    resolve_digest_day,
+)
 from src.db.queries.summaries import (  # noqa: E402
     dashboard_token_known,
     get_dashboard_by_token,
@@ -47,7 +53,7 @@ from src.pipeline.workers import (  # noqa: E402
     summary_scheduler_loop,
     whisper_worker_loop,
 )
-from src.summary.builder import build_dashboard_html  # noqa: E402
+from src.summary.builder import build_daily_card, build_dashboard_html  # noqa: E402
 from src.summary.generator import generate_report  # noqa: E402
 
 log = get_logger(__name__)
@@ -406,11 +412,26 @@ async def get_dashboard(share_token: str, request: Request) -> Response:
             ),
             media_type="text/html",
         )
+    # Daily digest (first tab). Day from ?day= (default yesterday), clamped to 30d.
+    today = datetime.now(UTC).date()
+    day, _err = resolve_digest_day(request.query_params.get("day"), today)
+    if day is None:
+        day = today - timedelta(days=1)
+    day_start = datetime(day.year, day.month, day.day, tzinfo=UTC)
+    day_end = day_start + timedelta(days=1)
     async with acquire_connection() as conn:
         weekly_html = await get_latest_summary_html(conn, "weekly")
         monthly_html = await get_latest_summary_html(conn, "monthly")
+        digest = await get_daily_digest(conn, day_start, day_end)
+    daily_html = build_daily_card(
+        day=day.isoformat(),
+        digest=digest,
+        min_day=(today - timedelta(days=DIGEST_MAX_AGE_DAYS)).isoformat(),
+        max_day=today.isoformat(),
+        generated_at=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
+    )
     dashboard_html = build_dashboard_html(
-        weekly_html=weekly_html, monthly_html=monthly_html
+        weekly_html=weekly_html, monthly_html=monthly_html, daily_html=daily_html
     )
     return Response(content=dashboard_html, media_type="text/html")
 

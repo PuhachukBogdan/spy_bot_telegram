@@ -10,58 +10,128 @@ from uuid import UUID
 import asyncpg
 
 
-async def list_active_managers(conn: asyncpg.Connection) -> list[dict[str, Any]]:
-    """All enabled managers ordered by name, including those with zero events."""
-    rows = await conn.fetch(
-        """
-        SELECT id, full_name, aff_id, tg_username
-        FROM internal_users
-        WHERE role = 'manager' AND enabled = true
-        ORDER BY full_name
-        """
-    )
-    return [dict(r) for r in rows]
+async def list_active_chats(conn: asyncpg.Connection) -> list[dict[str, Any]]:
+    """All active monitored chat units, including those with zero risk events.
 
+    Each row is one monitored unit (group, forum topic, or business chat) from the
+    ``chats`` table with ``status='active'`` — this is what the report is keyed on.
+    ``manager_name`` is the human who authorised the chat
+    (``chats.authorized_by`` → ``internal_users.full_name``), falling back to
+    ``'unassigned'`` when that link is missing.
 
-async def risk_heatmap(
-    conn: asyncpg.Connection,
-    since: datetime,
-    until: datetime,
-) -> list[dict[str, Any]]:
-    """Count of risk events per (manager_id, risk_type) for the period.
-
-    Returns rows: manager_id UUID, risk_type TEXT, cnt INT.
+    NOTE: the report is NOT keyed on ``internal_users`` role=manager rows — those
+    are one-stub-per-affiliate (keyed on aff_id from the chat title), not the real
+    managing humans. The managing human surfaces here via ``manager_name`` instead.
     """
     rows = await conn.fetch(
         """
         SELECT
-            u.id          AS manager_id,
-            re.risk_type,
-            COUNT(*)::int AS cnt
-        FROM risk_events re
-        JOIN partners p ON p.id = re.partner_id
-        JOIN internal_users u ON u.id = p.owner_manager_id
-        WHERE re.created_at >= $1 AND re.created_at < $2
-          AND u.role = 'manager' AND u.enabled = true
-          -- events dismissed via Slack (False Positive / Suppress both write
-          -- status='false_positive') never appear in weekly/monthly reports
-          AND re.status IS DISTINCT FROM 'false_positive'
-        GROUP BY u.id, re.risk_type
-        """,
-        since,
-        until,
+            c.id,
+            c.chat_name,
+            c.topic_name,
+            c.is_test,
+            COALESCE(NULLIF(btrim(u.full_name), ''), 'unassigned') AS manager_name,
+            COALESCE(u.is_test, false) AS manager_is_test
+        FROM chats c
+        -- Only resolve the authoriser as a MANAGER; admins (e.g. the ops admin who
+        -- authorised a couple of chats) are NOT managers → they fall to 'unassigned'
+        -- and never appear in the manager column or the report's manager filter.
+        LEFT JOIN internal_users u
+               ON u.id = c.authorized_by AND u.role = 'manager'
+        WHERE c.status = 'active'
+        ORDER BY c.chat_name, c.topic_name
+        """
     )
     return [dict(r) for r in rows]
 
 
-async def list_events_for_report(
+async def count_proposals_by_chat(
+    conn: asyncpg.Connection,
+    since: datetime,
+    until: datetime,
+) -> dict[str, int]:
+    """Manager-proposal counts per chat_id within the period.
+
+    ``activity_signals`` rows with ``signal_type='manager_proposal'`` grouped by
+    chat. Returned as {chat_id_str: count} so the builder can badge each chat with
+    how many proposals its manager made in the reporting window.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT chat_id, COUNT(*)::int AS c
+        FROM activity_signals
+        WHERE signal_type = 'manager_proposal'
+          AND chat_id IS NOT NULL
+          AND created_at >= $1 AND created_at < $2
+        GROUP BY chat_id
+        """,
+        since,
+        until,
+    )
+    return {str(r["chat_id"]): int(r["c"]) for r in rows}
+
+
+async def count_chats_added(
+    conn: asyncpg.Connection,
+    since: datetime,
+    until: datetime,
+) -> int:
+    """Number of chats onboarded (authorised) within the report window.
+
+    Counts ``chats`` rows that are currently ``status='active'`` whose
+    ``authorized_at`` falls in [since, until). Surfaced as the "New chats" stat
+    (weekly = last 7 days, monthly = last 30 days).
+    """
+    val = await conn.fetchval(
+        """
+        SELECT COUNT(*)::int
+        FROM chats
+        WHERE status = 'active'
+          AND authorized_at >= $1 AND authorized_at < $2
+        """,
+        since,
+        until,
+    )
+    return int(val or 0)
+
+
+async def list_chat_added_dates(
+    conn: asyncpg.Connection,
+    since: datetime,
+    until: datetime,
+) -> list[datetime]:
+    """authorized_at timestamps of chats onboarded in the window (monthly filter).
+
+    Lets the client-side monthly date-range picker recompute the "New chats" count
+    for a sub-range, the same way proposal dates drive the proposals count.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT authorized_at
+        FROM chats
+        WHERE status = 'active'
+          AND authorized_at >= $1 AND authorized_at < $2
+        ORDER BY authorized_at
+        """,
+        since,
+        until,
+    )
+    return [r["authorized_at"] for r in rows]
+
+
+async def list_events_by_chat(
     conn: asyncpg.Connection,
     since: datetime,
     until: datetime,
 ) -> list[dict[str, Any]]:
-    """All risk events in the period with manager and partner attribution.
+    """All risk events in the period, attributed to their monitored chat unit.
 
-    Ordered by (manager, event time) for the per-manager timeline sections.
+    Ordered by (chat, event time) for the per-chat timeline sections. Uses the
+    direct ``risk_events.chat_id`` link (every event carries one), so events whose
+    ``partner_id`` is NULL — which the old partner→owner_manager JOIN silently
+    dropped — are still included. ``partner_name`` prefers the linked partner's
+    name, falling back to the chat title. Events dismissed via Slack
+    (status='false_positive') are excluded, as before.
     """
     rows = await conn.fetch(
         """
@@ -74,20 +144,20 @@ async def list_events_for_report(
             re.llm_explanation,
             re.status,
             re.created_at,
-            p.name AS partner_name,
-            u.id   AS manager_id,
+            re.chat_id,
+            COALESCE(p.name, c.chat_name) AS partner_name,
             msg.sender_name AS author_name,
             msg.sender_role AS author_role
         FROM risk_events re
-        JOIN partners p ON p.id = re.partner_id
-        JOIN internal_users u ON u.id = p.owner_manager_id
+        JOIN chats c ON c.id = re.chat_id
+        LEFT JOIN partners p ON p.id = re.partner_id
         LEFT JOIN messages msg ON msg.id = re.message_id
         WHERE re.created_at >= $1 AND re.created_at < $2
-          AND u.role = 'manager' AND u.enabled = true
+          AND c.status = 'active'
           -- events dismissed via Slack (False Positive / Suppress both write
           -- status='false_positive') never appear in weekly/monthly reports
           AND re.status IS DISTINCT FROM 'false_positive'
-        ORDER BY u.id, re.created_at
+        ORDER BY re.chat_id, re.created_at
         """,
         since,
         until,

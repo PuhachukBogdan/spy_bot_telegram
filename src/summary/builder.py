@@ -1,10 +1,14 @@
-"""HTML report builder for weekly/monthly manager-centric summaries. Phase 16.
+"""HTML report builder for weekly/monthly chat-centric summaries. Phase 16.
+
+The roster is one-per-monitored-chat (``chats`` where status='active'); each chat
+shows the human who authorised it (``manager_name``). It is NOT keyed on the
+per-affiliate ``internal_users`` role=manager stubs.
 
 Produces a single self-contained HTML page:
   - Header with period dates and generation time
-  - Navigation TOC (jump links per manager)
-  - Heat-map table: managers × 13 risk categories
-  - Per-manager timeline sections with color-coded event cards
+  - Navigation TOC (jump links per chat)
+  - Risk-by-category summary + per-chat cards
+  - Per-chat timeline sections with color-coded event cards
 
 No external CSS or JS — the output is a standalone file safe to serve directly.
 
@@ -22,6 +26,7 @@ from __future__ import annotations
 import re as _re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from html import escape as _hesc
 from typing import Any
 from uuid import UUID
 
@@ -57,16 +62,30 @@ def _risk_type_label(risk_type: str) -> str:
     return _RISK_TYPE_LABELS.get(risk_type, risk_type.replace("_", " ").title())
 
 
-def _slug(mgr: dict[str, Any], taken: set[str]) -> str:
-    """URL-safe handle for a manager's #hash deep-link.
+def _chat_name(chat: dict[str, Any]) -> str:
+    """Display name for a monitored chat unit.
 
-    Prefers aff_id (e.g. ``78516``), then tg_username, then a short id. Sanitised
-    to ``[a-z0-9-]`` and de-duplicated so two managers never collide on one hash.
+    The chat title (``chat_name``, e.g. ``78516 | Acme Media | Beton.Win``) is the
+    primary label; a forum topic appends ``/ {topic_name}`` so the two topics of
+    one group don't collide. Falls back to a short id when a title is missing.
     """
-    aff = (mgr.get("aff_id") or "").strip()
-    tg = (mgr.get("tg_username") or "").strip().lstrip("@")
-    raw = aff or tg or str(mgr.get("id") or "")[:8]
-    base = _re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-") or "mgr"
+    base = (chat.get("chat_name") or "").strip()
+    topic = (chat.get("topic_name") or "").strip()
+    if base and topic:
+        return f"{base} / {topic}"
+    if base:
+        return base
+    return f"chat {str(chat.get('id') or '')[:8]}" if chat.get("id") else "Unnamed chat"
+
+
+def _chat_slug(chat: dict[str, Any], taken: set[str]) -> str:
+    """URL-safe handle for a chat's #hash deep-link.
+
+    Derived from the chat title (+ topic), sanitised to ``[a-z0-9-]`` and
+    de-duplicated so two chats never collide on one hash.
+    """
+    raw = _chat_name(chat)
+    base = _re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-") or "chat"
     slug = base
     i = 2
     while slug in taken:
@@ -74,25 +93,6 @@ def _slug(mgr: dict[str, Any], taken: set[str]) -> str:
         i += 1
     taken.add(slug)
     return slug
-
-
-def _manager_label(mgr: dict[str, Any]) -> str:
-    """Format manager display name: "{aff_id} | @{tg_username}" or either alone.
-
-    tg_username is stored without @; we add it here. Falls back to full_name and
-    finally a literal placeholder so a manager missing BOTH aff_id and
-    tg_username never renders as a bare "@" (the pilot bug).
-    """
-    aff = (mgr.get("aff_id") or "").strip()
-    tg = (mgr.get("tg_username") or "").strip().lstrip("@")
-    if aff and tg:
-        return f"{aff} | @{tg}"
-    if aff:
-        return aff
-    if tg:
-        return f"@{tg}"
-    name = (mgr.get("full_name") or "").strip()
-    return name or "Unassigned"
 
 
 # ---------------------------------------------------------------------------
@@ -117,17 +117,21 @@ class EventData:
 
 
 @dataclass
-class ManagerData:
-    id: str          # UUID as string — the data-view / data-mgr nav key
-    slug: str        # URL-safe handle (aff_id / tg_username) for the #hash deep-link
-    name: str
+class ChatUnit:
+    id: str            # chat UUID as string — the data-view / data-mgr nav key
+    slug: str          # URL-safe handle (chat title) for the #hash deep-link
+    name: str          # chat display title (partner_name — derived from chat_name)
+    manager_name: str  # human who authorised the chat, or "unassigned"
+    is_test: bool          # test chat — hidden by default, toggled in the filter panel
+    manager_is_test: bool  # authorising manager is a test account
+    proposals: int         # manager_proposal signals in the period (0 = not shown)
     events: list[EventData]
-    heatmap: dict[str, int]   # risk_type → count
     total: int
     critical_count: int
     high_count: int
     medium_count: int
     low_count: int
+    cats: list[str]        # distinct risk_types present (for the category filter)
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +280,34 @@ a{color:inherit}
 :root[data-theme="dark"] .sb-crit{color:#1a0d0b}
 .sb-count{flex-shrink:0;font-family:var(--mono);font-size:11px;font-weight:600;color:var(--ink-3)}
 .sb-clean{flex-shrink:0;font-size:12px;color:var(--ok)}
+.sb-prop{flex-shrink:0;font-family:var(--mono);font-size:10px;font-weight:700;color:var(--ok);background:rgba(46,125,91,.12);border-radius:3px;padding:1px 5px;line-height:16px}
+
+/* ── Filter panel ──────────────────────────────────── */
+.sb-search-wrap{display:flex;gap:6px;align-items:center;padding:0 6px 12px}
+.sb-search-wrap .sb-search{flex:1}
+.sb-filter-btn{flex-shrink:0;width:34px;height:34px;display:flex;align-items:center;justify-content:center;font-size:14px;color:var(--ink-2);background:var(--surface-2);border:1px solid var(--line);border-radius:6px;cursor:pointer;transition:background .12s,color .12s,border-color .12s}
+.sb-filter-btn:hover,.sb-filter-btn.active{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
+.filter-panel{margin:0 6px 12px;padding:12px 12px 10px;background:var(--surface-2);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow)}
+.filter-panel[hidden]{display:none}
+.fp-sec{margin-bottom:12px}
+.fp-label{font-family:var(--mono);font-size:9.5px;font-weight:600;color:var(--ink-3);text-transform:uppercase;letter-spacing:.14em;margin-bottom:6px}
+.fp-check{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--ink-2);padding:3px 2px;cursor:pointer;line-height:1.3}
+.fp-check span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fp-check input{flex-shrink:0;accent-color:var(--accent);cursor:pointer}
+.fp-reset{width:100%;font-family:var(--mono);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-2);background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:7px;cursor:pointer;transition:background .12s,color .12s}
+.fp-reset:hover{background:var(--accent-soft);color:var(--accent)}
+.mc-prop{color:var(--ok);font-weight:600}
+.test-tag{background:var(--surface-2);border-color:var(--line);color:var(--ink-3);letter-spacing:.08em}
+.prop-tag{background:rgba(46,125,91,.10);border-color:transparent;color:var(--ok)}
+
+/* ── Daily: active-chats list (two columns) ────────── */
+.dc-list{display:grid;grid-template-columns:repeat(2,1fr);gap:2px 28px;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px 20px 16px;box-shadow:var(--shadow)}
+.dc-row{display:flex;align-items:center;gap:10px;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--line-2)}
+.dc-name{font-family:var(--mono);font-size:12.5px;color:var(--ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dc-count{flex-shrink:0;font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12px;font-weight:700;color:var(--ink)}
+.dc-head .dc-name,.dc-head .dc-count{font-size:10px;font-weight:600;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em}
+.dc-head{border-bottom:1px solid var(--line)}
+@media (max-width:820px){.dc-list{grid-template-columns:1fr}}
 
 /* ── Main ──────────────────────────────────────────── */
 .main{padding:38px 48px 72px;min-width:0;max-width:1200px}
@@ -324,6 +356,7 @@ a{color:inherit}
 .mc-bar .seg.high{background:var(--high)}
 .mc-bar .seg.med{background:var(--med)}
 .mc-bar .seg.low{background:var(--low)}
+.mc-mgr{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:-4px}
 
 /* ── Signal matrix (heat-map) — retained for transitional stored
       bodies embedded in the dashboard during the report expiry window;
@@ -348,6 +381,7 @@ a{color:inherit}
 .mgr-section{margin-bottom:52px;scroll-margin-top:20px}
 .mgr-header{display:flex;align-items:baseline;flex-wrap:wrap;gap:12px;margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--line)}
 .mgr-header h2{font-family:var(--mono);font-size:19px;font-weight:700;letter-spacing:-.015em;color:var(--ink)}
+.mgr-sub{font-family:var(--mono);font-size:12px;font-weight:500;color:var(--ink-2);background:var(--surface-2);border:1px solid var(--line);border-radius:5px;padding:3px 10px}
 .mgr-pills{display:contents}
 .pill{font-family:var(--mono);font-size:11px;font-weight:600;background:var(--surface-2);border:1px solid var(--line);border-radius:5px;padding:3px 10px;color:var(--ink-2)}
 .pill.crit{color:var(--crit);background:var(--crit-bg);border-color:var(--crit-line)}
@@ -508,19 +542,8 @@ _NAV_SCRIPT = """
       var el = e.target.closest ? e.target.closest('[data-view]') : null;
       if (el && root.contains(el)) { e.preventDefault(); show(el.getAttribute('data-view')); }
     });
-    if (search){
-      search.addEventListener('input', function(){
-        var q = search.value.trim().toLowerCase(), shown = 0;
-        root.querySelectorAll('.sidebar .sb-item[data-view]').forEach(function(b){
-          if (b.getAttribute('data-view') === 'all') { return; }
-          var name = (b.getAttribute('data-name') || b.textContent).toLowerCase();
-          var hit = name.indexOf(q) >= 0;
-          b.style.display = hit ? '' : 'none';
-          if (hit) { shown++; }
-        });
-        if (empty) { empty.style.display = shown ? 'none' : 'block'; }
-      });
-    }
+    // Search + faceted filtering are owned by the filter script (initFilters),
+    // so both write sidebar/card visibility through one code path.
     function fromHash(){
       var h = decodeURIComponent((location.hash || '').replace(/^#/, ''));
       return (h && slugToView[h]) ? slugToView[h] : 'all';
@@ -535,6 +558,72 @@ _NAV_SCRIPT = """
   var roots = document.querySelectorAll('[data-report]');
   var useHash = roots.length === 1;
   roots.forEach(function(r){ initReport(r, useHash); });
+})();
+</script>
+"""
+
+# Faceted filter panel (search + managers + risk categories + test toggles).
+# Single authority over sidebar-item and All-view card visibility (the nav
+# script deliberately no longer touches search). Test chats/managers are hidden
+# on first apply() (their toggles start unchecked). Exposes ``root.__applyFilters``
+# so the monthly date-range recompute can re-apply after it rebuilds the cards.
+_FILTER_SCRIPT = """
+<script>
+(function(){
+  function initFilters(root){
+    if(root.hasAttribute('data-flt-ready'))return;
+    root.setAttribute('data-flt-ready','1');
+    var search=root.querySelector('[data-search]');
+    var empty=root.querySelector('[data-empty]');
+    var panel=root.querySelector('[data-filter-panel]');
+    var toggle=root.querySelector('[data-filter-toggle]');
+    if(toggle&&panel){
+      toggle.addEventListener('click',function(){
+        if(panel.hasAttribute('hidden')){panel.removeAttribute('hidden');toggle.classList.add('active');}
+        else{panel.setAttribute('hidden','');toggle.classList.remove('active');}
+      });
+    }
+    function checkedVals(sel){var o={};root.querySelectorAll(sel).forEach(function(c){if(c.checked)o[c.value]=1;});return o;}
+    function anyUnchecked(sel){var u=false;root.querySelectorAll(sel).forEach(function(c){if(!c.checked)u=true;});return u;}
+    function passes(el){
+      var q=(search&&search.value.trim().toLowerCase())||'';
+      if(q){var hay=(el.getAttribute('data-filter')||el.getAttribute('data-name')||'').toLowerCase();if(hay.indexOf(q)<0)return false;}
+      var stc=root.querySelector('[data-show-test-chats]'),stm=root.querySelector('[data-show-test-mgr]');
+      if(el.getAttribute('data-test')==='1' && !(stc&&stc.checked))return false;
+      if(el.getAttribute('data-mgrtest')==='1' && !(stm&&stm.checked))return false;
+      if(el.getAttribute('data-mgrtest')!=='1'){
+        var boxes=root.querySelectorAll('[data-mgr-filter]');
+        if(boxes.length){var mc=checkedVals('[data-mgr-filter]');if(!mc[el.getAttribute('data-manager')||''])return false;}
+      }
+      if(anyUnchecked('[data-cat-filter]')){
+        var cc=checkedVals('[data-cat-filter]'),cats=(el.getAttribute('data-cats')||'').split(' ').filter(Boolean),hit=false;
+        for(var i=0;i<cats.length;i++){if(cc[cats[i]]){hit=true;break;}}
+        if(!hit)return false;
+      }
+      return true;
+    }
+    function apply(){
+      var shown=0;
+      root.querySelectorAll('.sidebar .sb-item[data-view]').forEach(function(b){
+        if(b.getAttribute('data-view')==='all')return;
+        var ok=passes(b);b.style.display=ok?'':'none';if(ok)shown++;
+      });
+      if(empty)empty.style.display=shown?'none':'block';
+      root.querySelectorAll('.mgr-cards .mgr-card[data-view]').forEach(function(c){c.style.display=passes(c)?'':'none';});
+    }
+    root.__applyFilters=apply;
+    if(search)search.addEventListener('input',apply);
+    root.querySelectorAll('[data-mgr-filter],[data-cat-filter],[data-show-test-chats],[data-show-test-mgr]').forEach(function(c){c.addEventListener('change',apply);});
+    var reset=root.querySelector('[data-filter-reset]');
+    if(reset)reset.addEventListener('click',function(){
+      root.querySelectorAll('[data-mgr-filter],[data-cat-filter]').forEach(function(c){c.checked=true;});
+      root.querySelectorAll('[data-show-test-chats],[data-show-test-mgr]').forEach(function(c){c.checked=false;});
+      if(search)search.value='';
+      apply();
+    });
+    apply();
+  }
+  document.querySelectorAll('[data-report]').forEach(initFilters);
 })();
 </script>
 """
@@ -587,22 +676,22 @@ _MONTH_FILTER_SCRIPT = """
       }).join('');
     }
     function cards(perMgr){
+      // Only chats with risk signals in the selected range (matches server render).
       return (D.managers||[]).map(function(m){
         var pm=perMgr[m.id]||{crit:0,high:0,med:0,low:0,total:0};
+        if(pm.total===0)return '';
         var head='<div class="mc-top"><span class="mc-name">'+esc(m.name)+'</span>'
-          +(pm.total===0?'<span class="mc-clean">\\u2713 clean</span>':'<span class="mc-total">'+pm.total+'</span>')+'</div>';
-        var body='';
-        if(pm.total>0){
-          var pills='';if(pm.crit)pills+='<span class="mc-pill crit">'+pm.crit+' crit</span>';
-          if(pm.high)pills+='<span class="mc-pill high">'+pm.high+' high</span>';
-          if(pm.med)pills+='<span class="mc-pill med">'+pm.med+' med</span>';
-          var bar='';if(pm.crit)bar+='<span class="seg crit" style="flex:'+pm.crit+'"></span>';
-          if(pm.high)bar+='<span class="seg high" style="flex:'+pm.high+'"></span>';
-          if(pm.med)bar+='<span class="seg med" style="flex:'+pm.med+'"></span>';
-          if(pm.low)bar+='<span class="seg low" style="flex:'+pm.low+'"></span>';
-          body='<div class="mc-pills">'+pills+'</div><div class="mc-bar">'+bar+'</div>';
-        }
-        return '<a href="#" class="mgr-card'+(pm.total===0?' is-clean':'')+'" data-view="'+esc(m.id)+'" data-slug="'+esc(m.slug)+'" data-name="'+esc(m.name)+'">'+head+body+'</a>';
+          +'<span class="mc-total">'+pm.total+'</span></div>'
+          +'<span class="mc-mgr">Manager: '+esc(m.managerName||'unassigned')+'</span>';
+        var pills='';if(pm.crit)pills+='<span class="mc-pill crit">'+pm.crit+' crit</span>';
+        if(pm.high)pills+='<span class="mc-pill high">'+pm.high+' high</span>';
+        if(pm.med)pills+='<span class="mc-pill med">'+pm.med+' med</span>';
+        var bar='';if(pm.crit)bar+='<span class="seg crit" style="flex:'+pm.crit+'"></span>';
+        if(pm.high)bar+='<span class="seg high" style="flex:'+pm.high+'"></span>';
+        if(pm.med)bar+='<span class="seg med" style="flex:'+pm.med+'"></span>';
+        if(pm.low)bar+='<span class="seg low" style="flex:'+pm.low+'"></span>';
+        var body='<div class="mc-pills">'+pills+'</div><div class="mc-bar">'+bar+'</div>';
+        return '<a href="#" class="mgr-card" data-view="'+esc(m.id)+'" data-slug="'+esc(m.slug)+'" data-name="'+esc(m.name)+'" data-manager="'+esc(m.managerName||'')+'" data-cats="'+esc((m.cats||[]).join(' '))+'" data-test="0" data-mgrtest="0">'+head+body+'</a>';
       }).join('');
     }
     function setStat(n,v){var el=root.querySelector('[data-stat="'+n+'"]');if(el)el.textContent=v;}
@@ -618,9 +707,10 @@ _MONTH_FILTER_SCRIPT = """
         if(e.lvl==='critical'||e.lvl==='high')c.hi++;else c.lo++;
       });
       var proposals=(D.proposalDates||[]).filter(function(d){return d&&inRange(d,lo,hi);}).length;
+      var chatsAdded=(D.chatsAddedDates||[]).filter(function(d){return d&&inRange(d,lo,hi);}).length;
       var mgrs=D.managers||[],flagged=0;mgrs.forEach(function(m){if(perMgr[m.id]&&perMgr[m.id].total>0)flagged++;});
       setStat('total',stats.total);setStat('critical',stats.critical);setStat('high',stats.high);
-      setStat('medium',stats.medium);setStat('proposals',proposals);setStat('flagged',flagged+'/'+mgrs.length);
+      setStat('medium',stats.medium);setStat('proposals',proposals);setStat('chatsadded',chatsAdded);setStat('flagged',flagged+'/'+mgrs.length);
       if(periodEl)periodEl.textContent=fmt(lo)+' \\u2013 '+fmt(hi);
       var allItem=root.querySelector('.sidebar [data-view="all"]');
       if(allItem)allItem.innerHTML='<span class="sb-name">All</span>'+badges(stats.total,stats.critical,true);
@@ -634,12 +724,12 @@ _MONTH_FILTER_SCRIPT = """
         if(stats.total===0){
           summary.innerHTML='<div class="portfolio-clean"><span class="pc-check">\\u2713</span><div>'
             +'<p class="pc-title">No risk signals in selected range</p>'
-            +'<p class="pc-sub">All '+mgrs.length+' monitored portfolio'+(mgrs.length!==1?'s':'')+' clean. '
+            +'<p class="pc-sub">All '+mgrs.length+' monitored chat'+(mgrs.length!==1?'s':'')+' clean. '
             +proposals+' manager proposal'+(proposals!==1?'s':'')+' logged.</p></div></div>';
         }else{
           summary.innerHTML='<p class="section-label">Risk by Category</p><div class="cat-list">'+catRows(cat)+'</div>'
             +'<div class="cat-legend"><span><i class="hi"></i>Critical / High</span><span><i class="lo"></i>Medium / Low</span></div>'
-            +'<p class="section-label">Managers</p><div class="mgr-cards">'+cards(perMgr)+'</div>';
+            +'<p class="section-label">Chats</p><div class="mgr-cards">'+cards(perMgr)+'</div>';
         }
       }
       mgrs.forEach(function(m){
@@ -655,6 +745,8 @@ _MONTH_FILTER_SCRIPT = """
         var note=sec.querySelector('[data-no-range]');
         if(note)note.style.display=(evcards.length>0&&vis===0)?'':'none';
       });
+      // Re-apply the faceted filters to the freshly-rebuilt cards/sidebar.
+      if(root.__applyFilters)root.__applyFilters();
     }
     function apply(){
       var lo=fromI.value||lo0,hi=toI.value||hi0;
@@ -714,6 +806,7 @@ def _page(title_html: str, body: str, *, extra_css: str = "") -> str:
         f"{_PRINT_BTN}\n"
         f"{body}\n"
         f"{_NAV_SCRIPT}\n"
+        f"{_FILTER_SCRIPT}\n"
         "</body>\n</html>\n"
     )
 
@@ -736,7 +829,8 @@ _REPORT_BODY = """\
     <div class="stat-cell"><span class="stat-num high" data-stat="high">{{ stats.high }}</span><span class="stat-lbl">High</span></div>
     <div class="stat-cell"><span class="stat-num" data-stat="medium">{{ stats.medium }}</span><span class="stat-lbl">Medium</span></div>
     <div class="stat-cell"><span class="stat-num" data-stat="proposals">{{ stats.proposals }}</span><span class="stat-lbl">Mgr proposals</span></div>
-    <div class="stat-cell"><span class="stat-num" data-stat="flagged">{{ stats.flagged }}/{{ stats.managers }}</span><span class="stat-lbl">Managers flagged</span></div>
+    <div class="stat-cell"><span class="stat-num" data-stat="chatsadded">{{ stats.chats_added }}</span><span class="stat-lbl">New chats</span></div>
+    <div class="stat-cell"><span class="stat-num" data-stat="flagged">{{ stats.flagged }}/{{ stats.chats }}</span><span class="stat-lbl">Chats flagged</span></div>
   </div>
 </header>
 {% if is_monthly %}
@@ -753,17 +847,43 @@ _REPORT_BODY = """\
 
 <aside class="sidebar">
   <div class="sb-search-wrap">
-    <input type="search" class="sb-search" data-search placeholder="Search AffID / manager…" aria-label="Search AffID or manager">
+    <input type="search" class="sb-search" data-search placeholder="Search chat / manager…" aria-label="Search chat or manager">
+    <button type="button" class="sb-filter-btn" data-filter-toggle aria-label="Filter" title="Filter">⚙</button>
+  </div>
+  <div class="filter-panel" data-filter-panel hidden>
+    {% if managers_filter %}
+    <div class="fp-sec">
+      <p class="fp-label">Managers</p>
+      {% for mg in managers_filter %}{% if not mg.is_test %}
+      <label class="fp-check"><input type="checkbox" data-mgr-filter value="{{ mg.name }}" checked><span>{{ mg.name }}</span></label>
+      {% endif %}{% endfor %}
+    </div>
+    {% endif %}
+    {% if present_cats %}
+    <div class="fp-sec">
+      <p class="fp-label">Risk categories</p>
+      {% for c in present_cats %}
+      <label class="fp-check"><input type="checkbox" data-cat-filter value="{{ c.key }}" checked><span>{{ c.label }}</span></label>
+      {% endfor %}
+    </div>
+    {% endif %}
+    <div class="fp-sec">
+      <p class="fp-label">Visibility</p>
+      <label class="fp-check"><input type="checkbox" data-show-test-chats><span>Show test chats</span></label>
+      <label class="fp-check"><input type="checkbox" data-show-test-mgr><span>Show test managers</span></label>
+    </div>
+    <button type="button" class="fp-reset" data-filter-reset>Reset filters</button>
   </div>
   <button type="button" class="sb-item sb-all active" data-view="all" data-name="all">
     <span class="sb-name">All</span>
     {% if stats.critical %}<span class="sb-crit">{{ stats.critical }}!</span>{% endif %}
     <span class="sb-count">{{ stats.total_events }}</span>
   </button>
-  <span class="sidebar-label">Managers</span>
-  {% for m in managers %}
-  <button type="button" class="sb-item" data-view="{{ m.id }}" data-slug="{{ m.slug }}" data-name="{{ m.name }}">
+  <span class="sidebar-label">Chats · {{ stats.chats }}</span>
+  {% for m in chats %}
+  <button type="button" class="sb-item" data-view="{{ m.id }}" data-slug="{{ m.slug }}" data-name="{{ m.name }}" data-filter="{{ m.name }} {{ m.manager_name }}" data-manager="{{ m.manager_name }}" data-cats="{{ m.cats|join(' ') }}" data-test="{{ '1' if m.is_test else '0' }}" data-mgrtest="{{ '1' if m.manager_is_test else '0' }}">
     <span class="sb-name">{{ m.name }}</span>
+    {% if m.proposals %}<span class="sb-prop" title="{{ m.proposals }} manager proposal(s)">◆{{ m.proposals }}</span>{% endif %}
     {% if m.total == 0 %}
       <span class="sb-clean">✓</span>
     {% else %}
@@ -784,7 +904,7 @@ _REPORT_BODY = """\
       <span class="pc-check">✓</span>
       <div>
         <p class="pc-title">No risk signals this period</p>
-        <p class="pc-sub">All {{ stats.managers }} monitored portfolio{{ 's' if stats.managers != 1 else '' }} clean. {{ stats.proposals }} manager proposal{{ 's' if stats.proposals != 1 else '' }} logged.</p>
+        <p class="pc-sub">All {{ stats.chats }} monitored chat{{ 's' if stats.chats != 1 else '' }} clean. {{ stats.proposals }} manager proposal{{ 's' if stats.proposals != 1 else '' }} logged.</p>
       </div>
     </div>
   {% else %}
@@ -800,15 +920,15 @@ _REPORT_BODY = """\
     </div>
     <div class="cat-legend"><span><i class="hi"></i>Critical / High</span><span><i class="lo"></i>Medium / Low</span></div>
 
-    <p class="section-label">Managers</p>
+    <p class="section-label">Chats with risk signals</p>
     <div class="mgr-cards">
-    {% for m in managers %}
-      <a href="#" class="mgr-card{{ ' is-clean' if m.total == 0 else '' }}" data-view="{{ m.id }}" data-slug="{{ m.slug }}" data-name="{{ m.name }}">
+    {% for m in chats %}{% if m.total > 0 %}
+      <a href="#" class="mgr-card" data-view="{{ m.id }}" data-slug="{{ m.slug }}" data-name="{{ m.name }}" data-manager="{{ m.manager_name }}" data-cats="{{ m.cats|join(' ') }}" data-test="{{ '1' if m.is_test else '0' }}" data-mgrtest="{{ '1' if m.manager_is_test else '0' }}">
         <div class="mc-top">
           <span class="mc-name">{{ m.name }}</span>
-          {% if m.total == 0 %}<span class="mc-clean">✓ clean</span>{% else %}<span class="mc-total">{{ m.total }}</span>{% endif %}
+          <span class="mc-total">{{ m.total }}</span>
         </div>
-        {% if m.total > 0 %}
+        <span class="mc-mgr">Manager: {{ m.manager_name }}{% if m.proposals %} · <span class="mc-prop">◆ {{ m.proposals }} proposal{{ 's' if m.proposals != 1 else '' }}</span>{% endif %}</span>
         <div class="mc-pills">
           {% if m.critical_count %}<span class="mc-pill crit">{{ m.critical_count }} crit</span>{% endif %}
           {% if m.high_count %}<span class="mc-pill high">{{ m.high_count }} high</span>{% endif %}
@@ -820,19 +940,21 @@ _REPORT_BODY = """\
           {% if m.medium_count %}<span class="seg med" style="flex:{{ m.medium_count }}"></span>{% endif %}
           {% if m.low_count %}<span class="seg low" style="flex:{{ m.low_count }}"></span>{% endif %}
         </div>
-        {% endif %}
       </a>
-    {% endfor %}
+    {% endif %}{% endfor %}
     </div>
   {% endif %}
   </div></div>
 
-  {# ── Per-AffID detail dossiers (shown one at a time in single view) ── #}
-  {% for m in managers %}
-  <section class="mgr-section" data-mgr="{{ m.id }}" data-slug="{{ m.slug }}">
+  {# ── Per-chat detail dossiers (shown one at a time in single view) ── #}
+  {% for m in chats %}
+  <section class="mgr-section" data-mgr="{{ m.id }}" data-slug="{{ m.slug }}" data-test="{{ '1' if m.is_test else '0' }}" data-mgrtest="{{ '1' if m.manager_is_test else '0' }}">
     <div class="mgr-header">
       <button type="button" class="mgr-back" data-view="all">← All</button>
       <h2>{{ m.name }}</h2>
+      <span class="mgr-sub">Manager: {{ m.manager_name }}</span>
+      {% if m.is_test or m.manager_is_test %}<span class="mgr-sub test-tag">TEST</span>{% endif %}
+      {% if m.proposals %}<span class="mgr-sub prop-tag">◆ {{ m.proposals }} proposal{{ 's' if m.proposals != 1 else '' }}</span>{% endif %}
       <span class="mgr-pills" data-mgr-pills>
         <span class="pill">{{ m.total }} event{{ 's' if m.total != 1 else '' }}</span>
         {% if m.critical_count %}<span class="pill crit">{{ m.critical_count }} critical</span>{% endif %}
@@ -856,7 +978,7 @@ _REPORT_BODY = """\
       </div>
       {% endfor %}
     {% else %}
-      <p class="no-events">No risk events in this period — clean portfolio.</p>
+      <p class="no-events">No risk events in this period — clean chat.</p>
     {% endif %}
     {% if is_monthly %}<p class="no-events" data-no-range style="display:none">No risk events in the selected range.</p>{% endif %}
   </section>
@@ -885,39 +1007,46 @@ def build_report_html(
     period_type: str,
     since: datetime,
     until: datetime,
-    managers: list[dict[str, Any]],
-    heatmap_rows: list[dict[str, Any]],
+    chats: list[dict[str, Any]],
     event_rows: list[dict[str, Any]],
     proposals_count: int = 0,
     proposal_dates: list[datetime] | None = None,
+    chats_added: int = 0,
+    chats_added_dates: list[datetime] | None = None,
+    proposals_by_chat: dict[str, int] | None = None,
 ) -> str:
     """Render a complete HTML report page and return the HTML string.
+
+    The report is CHAT-centric: the roster (left sidebar), the summary cards, and
+    the detail dossiers are all one-per-monitored-chat. Each chat carries the human
+    who authorised it (``manager_name``); events attach to their chat directly.
 
     Args:
         period_type: "weekly" or "monthly".
         since: UTC start of the period (inclusive).
         until: UTC end of the period (exclusive).
-        managers: rows from list_active_managers() — id, full_name.
-        heatmap_rows: rows from risk_heatmap() — manager_id, risk_type, cnt.
-        event_rows: rows from list_events_for_report() — full event + attribution.
+        chats: rows from list_active_chats() — id, chat_name, topic_name,
+            manager_name. One row per active monitored chat unit.
+        event_rows: rows from list_events_by_chat() — event fields + chat_id +
+            partner_name + author attribution.
         proposals_count: portfolio-wide count of manager proposals in the period
             (activity_signals) — a top-line summary metric, defaults to 0.
         proposal_dates: proposal timestamps for the period. Supplied for the
             MONTHLY report only, so the client-side date-range filter can
             recompute the proposals count for a sub-range. None → weekly (no
             filter, count stays the full-period figure).
+        chats_added: count of chats onboarded within the period (weekly=7d,
+            monthly=30d) — the "New chats" stat.
+        chats_added_dates: authorized_at dates for chats added in the period.
+            Supplied for the MONTHLY report only so the date-range filter can
+            recompute "New chats" for a sub-range.
     """
     _HI = ("critical", "high")
-    # Build heatmap index: manager_id → {risk_type: count}
-    heatmap_index: dict[UUID, dict[str, int]] = {}
-    for row in heatmap_rows:
-        mid = UUID(str(row["manager_id"]))
-        heatmap_index.setdefault(mid, {})[str(row["risk_type"])] = int(row["cnt"])
 
-    # Build event index: manager_id → list[EventData]
+    # Build event index: chat_id → list[EventData]
     events_index: dict[UUID, list[EventData]] = {}
     for row in event_rows:
-        mid = UUID(str(row["manager_id"]))
+        cid = UUID(str(row["chat_id"]))
         ts: datetime = row["created_at"]
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=UTC)
@@ -937,27 +1066,32 @@ def build_report_html(
             date_str=ts.strftime("%Y-%m-%d %H:%M"),
             date_iso=ts.strftime("%Y-%m-%d"),
         )
-        events_index.setdefault(mid, []).append(ev)
+        events_index.setdefault(cid, []).append(ev)
 
-    # Assemble ManagerData for each manager
-    manager_list: list[ManagerData] = []
+    # Assemble one ChatUnit per active chat
+    prop_by_chat = proposals_by_chat or {}
+    chat_list: list[ChatUnit] = []
     taken_slugs: set[str] = set()
-    for mgr in managers:
-        mid = UUID(str(mgr["id"]))
-        mid_str = str(mid)
-        evs = events_index.get(mid, [])
-        manager_list.append(
-            ManagerData(
-                id=mid_str,
-                slug=_slug(mgr, taken_slugs),
-                name=_manager_label(mgr),
+    for chat in chats:
+        cid = UUID(str(chat["id"]))
+        cid_str = str(cid)
+        evs = events_index.get(cid, [])
+        chat_list.append(
+            ChatUnit(
+                id=cid_str,
+                slug=_chat_slug(chat, taken_slugs),
+                name=_chat_name(chat),
+                manager_name=str(chat.get("manager_name") or "unassigned"),
+                is_test=bool(chat.get("is_test")),
+                manager_is_test=bool(chat.get("manager_is_test")),
+                proposals=int(prop_by_chat.get(cid_str, 0)),
                 events=evs,
-                heatmap=heatmap_index.get(mid, {}),
                 total=len(evs),
                 critical_count=sum(1 for e in evs if e.risk_level == "critical"),
                 high_count=sum(1 for e in evs if e.risk_level == "high"),
                 medium_count=sum(1 for e in evs if e.risk_level == "medium"),
                 low_count=sum(1 for e in evs if e.risk_level == "low"),
+                cats=sorted({e.risk_type for e in evs}),
             )
         )
 
@@ -966,7 +1100,11 @@ def build_report_html(
     period_label = f"{since.strftime('%d %b %Y')} – {until.strftime('%d %b %Y')}"
     generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
-    all_events = [e for m in manager_list for e in m.events]
+    # Headline stats + category summary exclude TEST chats (hidden by default);
+    # the filter panel can reveal test chats in the roster, but the top-line
+    # numbers always describe the real portfolio.
+    real_chats = [m for m in chat_list if not (m.is_test or m.manager_is_test)]
+    all_events = [e for m in real_chats for e in m.events]
     stats = {
         "total_events": len(all_events),
         "critical": sum(1 for e in all_events if e.risk_level == "critical"),
@@ -974,8 +1112,9 @@ def build_report_html(
         "medium": sum(1 for e in all_events if e.risk_level == "medium"),
         "low": sum(1 for e in all_events if e.risk_level == "low"),
         "proposals": proposals_count,
-        "managers": len(manager_list),
-        "flagged": sum(1 for m in manager_list if m.total > 0),
+        "chats": len(real_chats),
+        "flagged": sum(1 for m in real_chats if m.total > 0),
+        "chats_added": chats_added,
     }
 
     # Portfolio risk-by-category breakdown (replaces the wide manager×category
@@ -1018,30 +1157,59 @@ def build_report_html(
             "periodStart": since.strftime("%Y-%m-%d"),
             "periodEnd": until.strftime("%Y-%m-%d"),
             "categories": [[k, v] for k, v in RISK_CATEGORIES],
+            # "managers" is the client-side key for the per-unit list; here each
+            # unit is a chat, carrying its authorising manager's name for the card.
+            # Test chats are excluded (headline numbers describe the real portfolio).
             "managers": [
-                {"id": m.id, "slug": m.slug, "name": m.name} for m in manager_list
+                {
+                    "id": m.id,
+                    "slug": m.slug,
+                    "name": m.name,
+                    "managerName": m.manager_name,
+                    "cats": m.cats,
+                }
+                for m in real_chats
             ],
             "events": [
                 {"m": m.id, "d": ev.date_iso, "lvl": ev.risk_level, "type": ev.risk_type}
-                for m in manager_list
+                for m in real_chats
                 for ev in m.events
             ],
             "proposalDates": [d.strftime("%Y-%m-%d") for d in (proposal_dates or [])],
+            "chatsAddedDates": [
+                d.strftime("%Y-%m-%d") for d in (chats_added_dates or [])
+            ],
         }
         month_script = Markup(_MONTH_FILTER_SCRIPT)
+
+    # Distinct managers for the filter panel (test managers included so the
+    # "show test managers" toggle can reveal them), sorted, test last.
+    mgr_seen: dict[str, bool] = {}
+    for m in chat_list:
+        mgr_seen[m.manager_name] = mgr_seen.get(m.manager_name, False) or m.manager_is_test
+    managers_filter = [
+        {"name": name, "is_test": is_test}
+        for name, is_test in sorted(mgr_seen.items(), key=lambda kv: (kv[1], kv[0].lower()))
+    ]
+    # Categories actually present in this report (for the category filter list).
+    present_cats = [
+        {"key": c["key"], "label": c["label"]} for c in categories_summary
+    ]
 
     return str(
         _template.render(
             title=title,
             period_label=period_label,
             generated_at=generated_at,
-            managers=manager_list,
+            chats=chat_list,
             categories=RISK_CATEGORIES,
             categories_summary=categories_summary,
             stats=stats,
             is_monthly=is_monthly,
             month_data=month_data,
             month_script=month_script,
+            managers_filter=managers_filter,
+            present_cats=present_cats,
         )
     )
 
@@ -1066,11 +1234,16 @@ def _extract_body(html: str) -> str:
 _DASH_BODY = """\
 <div class="accent-bar"></div>
 <div class="dash-tabs">
-  <button class="tab-btn active" data-tab="weekly" onclick="showTab('weekly')">Weekly</button>
+  <button class="tab-btn active" data-tab="daily" onclick="showTab('daily')">Daily</button>
+  <button class="tab-btn" data-tab="weekly" onclick="showTab('weekly')">Weekly</button>
   <button class="tab-btn" data-tab="monthly" onclick="showTab('monthly')">Monthly</button>
 </div>
 
-<div id="panel-weekly" class="tab-panel active">
+<div id="panel-daily" class="tab-panel active">
+  {% if daily_body %}{{ daily_body }}{% else %}<p class="tab-empty">No daily data available.</p>{% endif %}
+</div>
+
+<div id="panel-weekly" class="tab-panel">
   {% if weekly_body %}{{ weekly_body }}{% else %}<p class="tab-empty">No weekly report available yet.</p>{% endif %}
 </div>
 
@@ -1093,10 +1266,96 @@ _dash_template = _env.from_string(
 )
 
 
-def build_dashboard_html(
-    *, weekly_html: str | None, monthly_html: str | None
+def build_daily_card(
+    *,
+    day: str,
+    digest: Any,
+    min_day: str,
+    max_day: str,
+    generated_at: str,
 ) -> str:
-    """Render a tabbed dashboard combining the latest weekly and monthly reports."""
+    """Render the Daily-digest panel body (embedded as the first dashboard tab).
+
+    ``digest`` is a ``db.queries.daily.DailyDigest`` (duck-typed). ``day`` /
+    ``min_day`` / ``max_day`` are ISO dates; picking a date auto-submits ``?day=``
+    to the dashboard route (no button), which re-renders this card for that day.
+    """
+    pct = round(digest.significant / digest.messages_total * 100) if digest.messages_total else 0
+    header = (
+        '<div class="accent-bar"></div>'
+        '<header class="page-header">'
+        "<h1>Daily Digest</h1>"
+        f'<p class="meta">Day: <strong>{day}</strong>&nbsp;&nbsp;·&nbsp;&nbsp;'
+        f"Generated: {generated_at}</p>"
+        '<form class="daterange" method="get">'
+        '<span class="dr-label">Pick a day</span>'
+        f'<input type="date" class="dr-input" name="day" value="{day}" '
+        f'min="{min_day}" max="{max_day}" onchange="this.form.submit()">'
+        "</form>"
+    )
+    if not digest.has_activity:
+        return (
+            header + "</header><main class=\"main\">"
+            '<div class="portfolio-clean"><span class="pc-check">✓</span><div>'
+            f'<p class="pc-title">No activity on {day}</p>'
+            '<p class="pc-sub">No messages, risk events, or onboarding recorded '
+            "for this day.</p></div></div></main>"
+        )
+
+    def cell(num: str, lbl: str, cls: str = "") -> str:
+        return (
+            f'<div class="stat-cell"><span class="stat-num {cls}">{num}</span>'
+            f'<span class="stat-lbl">{lbl}</span></div>'
+        )
+
+    strip = (
+        '<div class="stat-strip">'
+        + cell(f"{digest.messages_total:,}", "Messages")
+        + cell(f"{digest.significant:,} ({pct}%)", "Significant")
+        + cell(f"{digest.active_chats}/{digest.total_active_chats}", "Active chats")
+        + cell(str(digest.active_managers), "Active managers")
+        + cell(str(digest.new_chats), "New chats")
+        + cell(str(digest.new_partners), "New partners")
+        + "</div></header>"
+    )
+
+    risk = (
+        '<main class="main"><p class="section-label">Risk events</p>'
+        '<div class="mgr-header" style="border:none;margin-bottom:8px">'
+        f'<span class="pill crit">{digest.risk_critical} critical</span>'
+        f'<span class="pill high">{digest.risk_high} high</span>'
+        f'<span class="pill med">{digest.risk_medium} medium</span>'
+        f'<span class="pill">{digest.risk_low} low</span>'
+        "</div>"
+    )
+    rows = getattr(digest, "active_chat_rows", []) or []
+    if rows:
+        # One header cell per column so "Chat / Message count" labels both columns.
+        head = (
+            '<div class="dc-row dc-head"><span class="dc-name">Chat</span>'
+            '<span class="dc-count">Message count</span></div>'
+        )
+        items = "".join(
+            '<div class="dc-row"><span class="dc-name">'
+            f"{_hesc(name)}</span><span class=\"dc-count\">{count}</span></div>"
+            for name, count in rows
+        )
+        risk += (
+            f'<p class="section-label">Active chats · {len(rows)}</p>'
+            f'<div class="dc-list">{head}{head}{items}</div>'
+        )
+    risk += "</main>"
+    return header + strip + risk
+
+
+def build_dashboard_html(
+    *,
+    weekly_html: str | None,
+    monthly_html: str | None,
+    daily_html: str | None = None,
+) -> str:
+    """Render a tabbed dashboard: Daily (first) + latest weekly and monthly."""
     wb = Markup(_extract_body(weekly_html)) if weekly_html else None
     mb = Markup(_extract_body(monthly_html)) if monthly_html else None
-    return str(_dash_template.render(weekly_body=wb, monthly_body=mb))
+    db = Markup(daily_html) if daily_html else None
+    return str(_dash_template.render(weekly_body=wb, monthly_body=mb, daily_body=db))
