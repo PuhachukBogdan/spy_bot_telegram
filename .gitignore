@@ -63,6 +63,7 @@ scripts/gen_test_guide.py
 
 # Internal spec docs — kept local for now; may become docs/README later
 *.docx
+Reports overview.pdf
 
 # Handoff / ops spec docs — generated local-only (no secrets, but intentionally
 # not committed; see scripts/gen_handoff_docs.py)
