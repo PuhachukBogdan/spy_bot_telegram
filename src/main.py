@@ -383,6 +383,31 @@ async def post_report_auth(
     return redirect
 
 
+async def _render_daily_panel(day_arg: str | None) -> str:
+    """Render the Daily-digest panel body for ``?day=`` (default: the current day).
+
+    Shared by the full dashboard and the hourly-refresh fragment route so the
+    two can never drift. The digest is computed live from aggregate SQL (no LLM,
+    nothing cached), so every call reflects the DB as of right now; an invalid
+    or out-of-range ``day`` silently falls back to today.
+    """
+    today = datetime.now(UTC).date()
+    day, _err = resolve_digest_day(day_arg, today)
+    if day is None:
+        day = today
+    day_start = datetime(day.year, day.month, day.day, tzinfo=UTC)
+    day_end = day_start + timedelta(days=1)
+    async with acquire_connection() as conn:
+        digest = await get_daily_digest(conn, day_start, day_end)
+    return build_daily_card(
+        day=day.isoformat(),
+        digest=digest,
+        min_day=(today - timedelta(days=DIGEST_MAX_AGE_DAYS)).isoformat(),
+        max_day=today.isoformat(),
+        generated_at=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
+    )
+
+
 @app.get("/dashboard/{share_token}")
 async def get_dashboard(share_token: str, request: Request) -> Response:
     """Serve the tabbed dashboard with the latest weekly and monthly reports.
@@ -412,28 +437,36 @@ async def get_dashboard(share_token: str, request: Request) -> Response:
             ),
             media_type="text/html",
         )
-    # Daily digest (first tab). Day from ?day= (default yesterday), clamped to 30d.
-    today = datetime.now(UTC).date()
-    day, _err = resolve_digest_day(request.query_params.get("day"), today)
-    if day is None:
-        day = today - timedelta(days=1)
-    day_start = datetime(day.year, day.month, day.day, tzinfo=UTC)
-    day_end = day_start + timedelta(days=1)
     async with acquire_connection() as conn:
         weekly_html = await get_latest_summary_html(conn, "weekly")
         monthly_html = await get_latest_summary_html(conn, "monthly")
-        digest = await get_daily_digest(conn, day_start, day_end)
-    daily_html = build_daily_card(
-        day=day.isoformat(),
-        digest=digest,
-        min_day=(today - timedelta(days=DIGEST_MAX_AGE_DAYS)).isoformat(),
-        max_day=today.isoformat(),
-        generated_at=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
-    )
+    daily_html = await _render_daily_panel(request.query_params.get("day"))
     dashboard_html = build_dashboard_html(
         weekly_html=weekly_html, monthly_html=monthly_html, daily_html=daily_html
     )
     return Response(content=dashboard_html, media_type="text/html")
+
+
+@app.get("/dashboard/{share_token}/daily")
+async def get_dashboard_daily(share_token: str, request: Request) -> Response:
+    """Daily-digest panel fragment — polled once an hour by an open dashboard.
+
+    Returns the panel HTML only (no page shell), so the browser swaps it in
+    place instead of reloading: the active tab and scroll position survive.
+    Same cookie gate as the dashboard itself; a retired token 404s, which stops
+    the polling.
+    """
+    async with acquire_connection() as conn:
+        dash = await get_dashboard_by_token(conn, share_token)
+    if dash is None:
+        return Response(status_code=404)
+    if request.cookies.get(_auth_cookie("d", share_token)) != "1":
+        return Response(status_code=401)
+    return Response(
+        content=await _render_daily_panel(request.query_params.get("day")),
+        media_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/dashboard/{share_token}")

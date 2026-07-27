@@ -939,3 +939,70 @@ def test_build_daily_card_no_activity() -> None:
         max_day="2026-07-21", generated_at="x",
     )
     assert "No activity on 2026-07-19" in html
+
+
+# ---------------------------------------------------------------------------
+# Daily digest: hourly auto-refresh of the CURRENT day
+# ---------------------------------------------------------------------------
+
+
+class _LiveD:
+    """Minimal digest stand-in for the auto-refresh marker tests."""
+
+    messages_total = 12
+    significant = 3
+    active_chats = 2
+    total_active_chats = 159
+    active_managers = 1
+    risk_low = risk_medium = risk_high = risk_critical = 0
+    new_chats = new_partners = 0
+    active_chat_rows: list[tuple[str, int]] = []
+    has_activity = True
+
+
+def test_daily_card_marks_current_day_live() -> None:
+    from src.summary.builder import build_daily_card
+
+    html = build_daily_card(
+        day="2026-07-21", digest=_LiveD(), min_day="2026-06-21",
+        max_day="2026-07-21", generated_at="2026-07-21 12:00 UTC",
+    )
+    assert "data-daily-live" in html
+    assert "refreshes hourly" in html
+
+
+def test_daily_card_past_day_is_not_live() -> None:
+    from src.summary.builder import build_daily_card
+
+    html = build_daily_card(
+        day="2026-07-18", digest=_LiveD(), min_day="2026-06-21",
+        max_day="2026-07-21", generated_at="2026-07-21 12:00 UTC",
+    )
+    assert "data-daily-live" not in html
+
+
+def test_daily_card_live_marker_survives_empty_day() -> None:
+    # A quiet current day takes the early "no activity" return — it must still
+    # carry the marker, else the panel would stop refreshing until a reload.
+    from src.summary.builder import build_daily_card
+
+    class _Empty(_LiveD):
+        messages_total = significant = 0
+        has_activity = False
+
+    html = build_daily_card(
+        day="2026-07-21", digest=_Empty(), min_day="2026-06-21",
+        max_day="2026-07-21", generated_at="x",
+    )
+    assert "No activity on 2026-07-21" in html
+    assert "data-daily-live" in html
+
+
+def test_dashboard_polls_daily_fragment_hourly() -> None:
+    from src.summary.builder import build_dashboard_html
+
+    html = build_dashboard_html(weekly_html=None, monthly_html=None, daily_html="<p>hi</p>")
+    assert "/daily?day=today" in html  # fragment URL, always the current day
+    assert "3600000" in html  # one-hour cadence
+    assert "data-daily-live" in html  # gated on the live marker
+    assert "location.reload" not in html  # swap in place, never a full reload

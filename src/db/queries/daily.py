@@ -1,9 +1,12 @@
-"""DB queries for the on-demand ``/daily`` admin digest.
+"""DB queries for the daily digest — the first tab of the reports dashboard.
 
 Direct aggregate SQL (no LLM — fast + cheap) over messages / risk_events / chats /
-partners for a single UTC calendar-day window ``[day_start, day_end)``. The digest
-is ADMIN-ONLY (it carries risk-event counts); managers never reach this code —
-``/daily`` is gated by ``@require_role('admin')`` in the handler.
+partners for a single UTC calendar-day window ``[day_start, day_end)``. Nothing is
+cached or stored: every call re-aggregates, which is what lets the current-day
+panel be re-fetched hourly by an open dashboard.
+
+The digest carries risk-event counts, so it lives behind the password-gated
+``/dashboard/{token}`` surface (there is no Telegram ``/daily`` command).
 """
 
 from __future__ import annotations
@@ -19,15 +22,17 @@ DIGEST_MAX_AGE_DAYS = 30
 def resolve_digest_day(arg: str | None, today: date) -> tuple[date | None, str | None]:
     """Resolve + validate a daily-digest day argument. Returns (day, error).
 
-    "" / "yesterday" → yesterday, "today" → today, ``YYYY-MM-DD`` → that date.
-    Rejects unparseable args, future dates, and anything older than 30 days.
-    Shared by the web daily view (``?day=`` query param).
+    "" / "today" → today, "yesterday" → yesterday, ``YYYY-MM-DD`` → that date.
+    The default is the CURRENT day: the digest is a live view that the open
+    dashboard re-fetches once an hour, so today's numbers are what a viewer
+    wants by default. Rejects unparseable args, future dates, and anything
+    older than 30 days. Shared by the web daily view (``?day=`` query param).
     """
     a = (arg or "").strip().lower()
-    if a in ("", "yesterday"):
-        day = today - timedelta(days=1)
-    elif a == "today":
+    if a in ("", "today"):
         day = today
+    elif a == "yesterday":
+        day = today - timedelta(days=1)
     else:
         try:
             day = date.fromisoformat(a)

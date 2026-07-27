@@ -16,10 +16,13 @@ _TODAY = date(2026, 7, 21)
 # ---------------------------------------------------------------------------
 
 
-def test_default_is_yesterday() -> None:
+def test_default_is_today() -> None:
+    # The digest is a live current-day view (refreshed hourly by the dashboard),
+    # so an absent/empty ?day= means today — not yesterday.
     day, err = resolve_digest_day(None, _TODAY)
     assert err is None
-    assert day == date(2026, 7, 20)
+    assert day == _TODAY
+    assert resolve_digest_day("", _TODAY) == (_TODAY, None)
 
 
 def test_yesterday_keyword() -> None:

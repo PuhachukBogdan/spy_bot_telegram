@@ -308,6 +308,11 @@ a{color:inherit}
 .dc-head .dc-name,.dc-head .dc-count{font-size:10px;font-weight:600;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em}
 .dc-head{border-bottom:1px solid var(--line)}
 @media (max-width:820px){.dc-list{grid-template-columns:1fr}}
+/* Live badge on the current-day digest (hourly auto-refresh). */
+.dr-note{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:10px;font-weight:600;color:var(--ok);text-transform:uppercase;letter-spacing:.1em}
+.dr-dot{width:6px;height:6px;border-radius:50%;background:var(--ok);animation:dr-pulse 2.4s ease-in-out infinite}
+@keyframes dr-pulse{0%,100%{opacity:1}50%{opacity:.25}}
+@media (prefers-reduced-motion:reduce){.dr-dot{animation:none}}
 
 /* ── Main ──────────────────────────────────────────── */
 .main{padding:38px 48px 72px;min-width:0;max-width:1200px}
@@ -1258,6 +1263,35 @@ function showTab(name) {
   document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
   document.querySelector('[data-tab="' + name + '"]').classList.add('active');
 }
+
+/* Daily tab = live view of the CURRENT day: re-fetch that panel every hour, on
+   the hour, so a dashboard left open never shows stale numbers. Only the daily
+   fragment is refetched (never a page reload), so the active tab, the scroll
+   position and the weekly/monthly panels are all untouched. Skipped while the
+   viewer is looking at a past day (no [data-daily-live] marker) — that day is
+   closed — and re-armed either way so switching back resumes it. */
+(function() {
+  var HOUR = 3600000;
+  function msToNextHour() {
+    var n = new Date();
+    var into = n.getMinutes() * 60000 + n.getSeconds() * 1000 + n.getMilliseconds();
+    return HOUR - into + 5000;  // +5s so the hour has definitely turned over
+  }
+  function arm() { setTimeout(tick, msToNextHour()); }
+  function tick() {
+    var panel = document.getElementById('panel-daily');
+    if (!panel || !panel.querySelector('[data-daily-live]')) { arm(); return; }
+    /* day=today, not the rendered date — an open tab crossing UTC midnight
+       must roll onto the new day rather than freeze on the old one. */
+    var url = location.pathname.replace(/\\/+$/, '') + '/daily?day=today';
+    fetch(url, { credentials: 'same-origin', cache: 'no-store' })
+      .then(function(r) { return r.ok ? r.text() : null; })
+      .then(function(html) { if (html) panel.innerHTML = html; })
+      .catch(function() {})
+      .then(arm);
+  }
+  arm();
+})();
 </script>
 """
 
@@ -1279,7 +1313,13 @@ def build_daily_card(
     ``digest`` is a ``db.queries.daily.DailyDigest`` (duck-typed). ``day`` /
     ``min_day`` / ``max_day`` are ISO dates; picking a date auto-submits ``?day=``
     to the dashboard route (no button), which re-renders this card for that day.
+
+    When ``day`` is the current day (``== max_day``) the card carries a
+    ``data-daily-live`` marker: the dashboard shell polls the panel fragment
+    once an hour so an open tab keeps showing fresh numbers. A past day is a
+    closed book — no marker, no polling.
     """
+    live = day == max_day
     pct = round(digest.significant / digest.messages_total * 100) if digest.messages_total else 0
     header = (
         '<div class="accent-bar"></div>'
@@ -1291,7 +1331,13 @@ def build_daily_card(
         '<span class="dr-label">Pick a day</span>'
         f'<input type="date" class="dr-input" name="day" value="{day}" '
         f'min="{min_day}" max="{max_day}" onchange="this.form.submit()">'
-        "</form>"
+        + (
+            '<span class="dr-note" data-daily-live>'
+            "<span class=\"dr-dot\"></span>Live · refreshes hourly</span>"
+            if live
+            else ""
+        )
+        + "</form>"
     )
     if not digest.has_activity:
         return (
