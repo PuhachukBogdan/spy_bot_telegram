@@ -84,8 +84,8 @@ def _group(tg_id: int) -> SimpleNamespace:
 def _incident(incident_id: str = "INC1", status: str = "In progress") -> Incident:
     return Incident(
         incident_id=incident_id,
-        country="Chile",
-        provider="Webpay",
+        country="Argentina",
+        provider="Galicia",
         issue="Timeouts",
         link=f"https://x/incidents/{incident_id}",
         details="line1\nIn progress - foo",
@@ -118,14 +118,14 @@ def test_extract_latest_status_unknown() -> None:
 
 def test_parse_incidents_keeps_target_provider() -> None:
     entries = [{
-        "title": "Chile - Webpay - Timeouts",
+        "title": "Argentina - Galicia - Timeouts",
         "link": "https://x/incidents/abc",
         "summary": "<p><strong>In progress</strong> - 12:00</p>",
     }]
     out = parse_incidents(entries)
     assert len(out) == 1
-    assert out[0].country == "Chile"
-    assert out[0].provider == "Webpay"
+    assert out[0].country == "Argentina"
+    assert out[0].provider == "Galicia"
     assert out[0].incident_id == "abc"
     assert out[0].status == "In progress"
 
@@ -139,9 +139,28 @@ def test_parse_incidents_drops_other_country() -> None:
     assert parse_incidents(entries) == []
 
 
+def test_parse_incidents_drops_chile() -> None:
+    """Chile was dropped from the targets (2026-07-27) — Argentina only.
+
+    Guards the whole chain: an unmatched country never becomes an Incident, so it
+    can't be inserted, broadcast, or recovered. Every Chilean provider that used
+    to be a target must now be filtered out.
+    """
+    for provider in (
+        "Webpay", "Banco Estado", "BCI", "Falabella", "Santander",
+        "Itaú", "MercadoPago", "Bank Transfer", "Banco de Chile", "Scotiabank",
+    ):
+        entries = [{
+            "title": f"Chile - {provider} - Timeouts",
+            "link": "https://x/incidents/cl1",
+            "summary": "<p><strong>In progress</strong> - 12:00</p>",
+        }]
+        assert parse_incidents(entries) == [], f"Chile/{provider} must be filtered out"
+
+
 def test_parse_incidents_drops_unmatched_provider() -> None:
     entries = [{
-        "title": "Chile - SomeRandomBank - Down",
+        "title": "Argentina - SomeRandomBank - Down",
         "link": "https://x/incidents/zzz",
         "summary": "\nIn progress - 12:00",
     }]
@@ -149,9 +168,9 @@ def test_parse_incidents_drops_unmatched_provider() -> None:
 
 
 def test_parse_incidents_substring_match() -> None:
-    # "MercadoPago Chile" contains target "MercadoPago".
+    # "Mercado Pago Argentina" contains target "Mercado Pago".
     entries = [{
-        "title": "Chile - MercadoPago Chile - Slow",
+        "title": "Argentina - Mercado Pago Argentina - Slow",
         "link": "https://x/incidents/q1",
         "summary": "\nIn progress - 12:00",
     }]
@@ -209,7 +228,7 @@ def test_templates_escape_html() -> None:
     # The only free-text field the minimal templates render is the country;
     # everything from the feed's body (issue / status / details) is dropped.
     inc = Incident(
-        incident_id="i1", country="Chile <b>x</b>", provider="Webpay",
+        incident_id="i1", country="Argentina <b>x</b>", provider="Galicia",
         issue="<b>x</b>", link="https://x/i1", details="a & b <script>alert(1)</script>",
         status="In progress", iso_date=None,
     )
@@ -225,7 +244,7 @@ def test_templates_escape_html() -> None:
 def test_incident_templates_do_not_leak_source() -> None:
     """The feed's status-page URL / incident id must never reach a partner group."""
     inc = Incident(
-        incident_id="kcl0h1z62jjs", country="Chile", provider="Santander",
+        incident_id="kcl0h1z62jjs", country="Argentina", provider="BBVA",
         issue="Decrease in Conversion Rates",
         link="https://status.d24.com/incidents/kcl0h1z62jjs",
         details='<p>Resolved - see <a href="https://status.d24.com/x">status</a></p>',
@@ -237,7 +256,7 @@ def test_incident_templates_do_not_leak_source() -> None:
         assert "d24" not in out.lower()        # no source-provider name
         assert "http" not in out.lower()       # no link rendered at all
         assert inc.incident_id not in out      # no internal incident id
-        assert "santander" not in out.lower()  # payment provider name never shown
+        assert "bbva" not in out.lower()       # payment provider name never shown
         assert "provider" not in out.lower()   # no Provider: field at all
         assert "conversion" not in out.lower()  # feed issue text never shown
 
@@ -245,7 +264,7 @@ def test_incident_templates_do_not_leak_source() -> None:
 def test_format_new_incident_is_minimal() -> None:
     out = format_new_incident(_incident(), last_update="2026-07-03 01:05 UTC")
     assert "PSP alert" in out
-    assert "Chile" in out
+    assert "Argentina" in out
     assert "2026-07-03 01:05 UTC" in out
     assert "click2reg" in out and "reg2dep" in out
 
@@ -253,7 +272,7 @@ def test_format_new_incident_is_minimal() -> None:
 def test_format_recovery_header_and_country() -> None:
     out = format_recovery(_incident(), last_update="2026-07-03 01:05 UTC")
     assert "PSP recovered" in out
-    assert "Chile" in out
+    assert "Argentina" in out
     assert "2026-07-03 01:05 UTC" in out
 
 
@@ -553,7 +572,7 @@ _SAMPLE_RSS = """\
 <?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel><title>D24</title>
   <item>
-    <title>Chile - Webpay - Timeouts</title>
+    <title>Argentina - Galicia - Timeouts</title>
     <link>https://status.d24.com/incidents/abc123</link>
     <description>&#10;In progress - 12:00</description>
   </item>
@@ -586,8 +605,8 @@ async def test_fetch_incidents_parses_valid_rss(monkeypatch: pytest.MonkeyPatch)
     result = await fetch_incidents("http://fake", retries=1, retry_delay_seconds=0)
     assert len(result) == 1
     assert result[0].incident_id == "abc123"
-    assert result[0].country == "Chile"
-    assert result[0].provider == "Webpay"
+    assert result[0].country == "Argentina"
+    assert result[0].provider == "Galicia"
 
 
 async def test_fetch_incidents_sets_follow_redirects(monkeypatch: pytest.MonkeyPatch) -> None:

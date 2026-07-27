@@ -32,11 +32,12 @@ RESOLVED_STATUSES = {"Resolved", "Completed"}
 
 # Target providers per country. A feed provider matches if any target is a
 # case-sensitive substring of it (spec: provider.includes(target)).
+#
+# Argentina only (2026-07-27, management call). Chile was dropped: a country
+# absent from this map matches nothing, so Chilean entries are filtered out here
+# and never reach the DB or a partner group. Re-adding a country is a one-line
+# change — the rest of the pipeline is country-agnostic.
 TARGET_PROVIDERS: dict[str, list[str]] = {
-    "Chile": [
-        "Webpay", "Banco Estado", "BCI", "Falabella", "Santander",
-        "Itaú", "MercadoPago", "Bank Transfer", "Banco de Chile", "Scotiabank",
-    ],
     "Argentina": [
         "BBVA", "Galicia", "Mercado Pago",
     ],
