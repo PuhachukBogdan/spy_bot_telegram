@@ -148,12 +148,6 @@ export default function App({ data }: { data: ReportData }) {
         <ModeSwitch />
       </div>
 
-      <div className="mb-5 border-l-[3px] border-primary bg-secondary px-3 py-2 text-[13px]">
-        <b>Preview stand.</b> Separate link, rendered live on each request. Stores
-        nothing, posts nothing to Slack, and shares no code or tables with the live
-        weekly/monthly report — that report is untouched.
-      </div>
-
       <Tabs value={tab} onValueChange={setTab}>
         <TabsList className="mb-4">
           <TabsTrigger value="overview">Overview</TabsTrigger>

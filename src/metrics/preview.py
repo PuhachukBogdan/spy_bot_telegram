@@ -1,13 +1,15 @@
-"""The Phase 2 preview stand: collect the metrics and render them standalone.
+"""The Team summary page: collect the manager metrics and render them standalone.
 
-Deliberately isolated from ``src/summary``. The live weekly/monthly report keeps
-running exactly as it does today — this module reads the same database and writes
-a page of its own, sharing no code path, no table, and no token with it. Nothing
-here can change what the production report shows.
+Born as the Phase 2 preview stand; released to production on 2026-08-25 — the
+same page now fronts the live ``/dashboard/{token}`` (with the classic risk
+report as its second mode) while remaining available on the ``/preview`` stand.
+Deliberately isolated from ``src/summary``: it reads the same database but
+shares no code path and no table with the stored weekly/monthly reports, so it
+cannot alter what an issued ``/r/{token}`` snapshot shows.
 
 The page is rendered live on every request and stored nowhere, so there is no
 snapshot to go stale and no publish step: reload the link and you see current
-numbers. It is a review surface, not a deliverable.
+numbers.
 """
 
 from __future__ import annotations

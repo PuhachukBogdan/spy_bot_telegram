@@ -425,13 +425,15 @@ async def _render_daily_panel(day_arg: str | None) -> str:
     )
 
 
-@app.get("/dashboard/{share_token}")
-async def get_dashboard(share_token: str, request: Request) -> Response:
-    """Serve the tabbed dashboard with the latest weekly and monthly reports.
+async def _dashboard_gate(
+    share_token: str, request: Request
+) -> Response | None:
+    """Shared access check for every /dashboard/{token} page.
 
-    Password-gated: POST /dashboard/{token} verifies the password and sets an
-    auth cookie; subsequent GET requests in the same browser session bypass the
-    form. A fresh tab (no cookie) always shows the password prompt.
+    Returns a Response to short-circuit with (superseded notice, 404, or the
+    password form), or ``None`` when the caller may serve content. POST
+    /dashboard/{token} verifies the password and sets the auth cookie; a fresh
+    tab (no cookie) always sees the prompt.
     """
     async with acquire_connection() as conn:
         dash = await get_dashboard_by_token(conn, share_token)
@@ -445,8 +447,7 @@ async def get_dashboard(share_token: str, request: Request) -> Response:
         if known:
             return Response(content=_superseded_page(), media_type="text/html")
         return Response(status_code=404)
-    cookie = _auth_cookie("d", share_token)
-    if request.cookies.get(cookie) != "1":
+    if request.cookies.get(_auth_cookie("d", share_token)) != "1":
         return Response(
             content=_pw_form(
                 title="Risk Reports Dashboard",
@@ -454,24 +455,59 @@ async def get_dashboard(share_token: str, request: Request) -> Response:
             ),
             media_type="text/html",
         )
-    async with acquire_connection() as conn:
-        weekly_html = await get_latest_summary_html(conn, "weekly")
-        monthly_html = await get_latest_summary_html(conn, "monthly")
-    daily_html = await _render_daily_panel(request.query_params.get("day"))
-    dashboard_html = build_dashboard_html(
-        weekly_html=weekly_html, monthly_html=monthly_html, daily_html=daily_html
+    return None
+
+
+@app.get("/dashboard/{share_token}")
+async def get_dashboard(share_token: str, request: Request) -> Response:
+    """The Team summary — the dashboard link's front page since 2026-08-25.
+
+    The Phase 2 stand's layout released to production: the link already posted
+    to Slack keeps working, but now opens the manager metrics page (rendered
+    live, period-driven, React shell) with the classic risk report one segment
+    away at /dashboard/{token}/risk. Same token, same password, same cookie.
+    """
+    gate = await _dashboard_gate(share_token, request)
+    if gate is not None:
+        return gate
+    fresh = request.query_params.get("fresh") == "1"
+    return Response(content=await build_preview(fresh=fresh), media_type="text/html")
+
+
+@app.get("/dashboard/{share_token}/risk")
+async def get_dashboard_risk(share_token: str, request: Request) -> Response:
+    """The classic risk report — weekly/monthly tabs + live daily digest.
+
+    Exactly what the dashboard root served before 2026-08-25, now skinned and
+    headed as the second mode of the page (system fonts, mirrored mode switch).
+    """
+    gate = await _dashboard_gate(share_token, request)
+    if gate is not None:
+        return gate
+    day_arg = request.query_params.get("day")
+    page = await _render_risk_report(
+        day_arg,
+        team_url=f"/dashboard/{share_token}",
+        subtitle="weekly &middot; monthly &middot; daily",
+        # Token-specific key: the page embeds team_url, and serving one token's
+        # cached page to another token's viewer would leak the other URL.
+        cache_key=f"risk:dash:{share_token}:{day_arg or 'today'}",
+        fresh=request.query_params.get("fresh") == "1",
     )
-    return Response(content=dashboard_html, media_type="text/html")
+    return Response(content=page, media_type="text/html")
 
 
 @app.get("/dashboard/{share_token}/daily")
+@app.get("/dashboard/{share_token}/risk/daily")
 async def get_dashboard_daily(share_token: str, request: Request) -> Response:
     """Daily-digest panel fragment — polled once an hour by an open dashboard.
 
     Returns the panel HTML only (no page shell), so the browser swaps it in
     place instead of reloading: the active tab and scroll position survive.
     Same cookie gate as the dashboard itself; a retired token 404s, which stops
-    the polling.
+    the polling. Registered on both paths because the polling URL is built
+    path-relative (``location.pathname + '/daily'``) and the risk report now
+    lives one segment deeper.
     """
     async with acquire_connection() as conn:
         dash = await get_dashboard_by_token(conn, share_token)
@@ -650,13 +686,16 @@ async def get_preview(token: str, request: Request) -> Response:
     return Response(content=await build_preview(fresh=fresh), media_type="text/html")
 
 
-def _stand_header(token: str) -> str:
+def _stand_header(team_url: str, subtitle: str) -> str:
     """A header strip mirroring the Team summary's, injected above the tabs.
 
     Same skeleton on both pages — title top-left (display font, 27px), the mode
     switch top-right IN THE FLOW at the same offsets — so toggling modes moves
     nothing. The active segment is CRIT RED here and teal on the Team summary:
     the switch's colour says where you are without reading.
+
+    ``team_url`` is where the Team summary segment points — the stand's
+    ``/preview/{token}`` or the production ``/dashboard/{token}``.
     """
     return (
         '<div style="max-width:1180px;margin:0 auto;padding:30px 24px 0;display:flex;'
@@ -665,7 +704,7 @@ def _stand_header(token: str) -> str:
         "<div style=\"font-family:var(--display);font-size:27px;font-weight:800;"
         'letter-spacing:-.025em;line-height:1.2">Risk report</div>'
         "<div style=\"font-family:var(--mono);font-size:12px;color:var(--ink-3);"
-        'margin:2px 0 14px">production report &middot; live copy on the stand</div>'
+        f'margin:2px 0 14px">{subtitle}</div>'
         "</div>"
         # Box metrics copied from the Team summary's switch (text-[11px],
         # tracking-wider, px-3 py-1.5, rounded-md) so the control is the same
@@ -674,16 +713,16 @@ def _stand_header(token: str) -> str:
         "overflow:hidden;font-family:var(--mono);font-size:11px;font-weight:400;"
         'letter-spacing:.05em;text-transform:uppercase;line-height:1.5">'
         '<span style="background:#B42318;color:#FBEEEC;padding:6px 12px">Risk report</span>'
-        f'<a href="/preview/{token}" style="background:var(--surface);color:var(--ink-2);'
+        f'<a href="{team_url}" style="background:var(--surface);color:var(--ink-2);'
         'padding:6px 12px;text-decoration:none">Team summary</a></div></div>'
     )
 
 
-# Stand-only visual alignment: the shadcn component idiom laid over the risk
-# report's EXISTING markup. Purely cosmetic by construction — a stylesheet can
-# rename nothing, remove nothing and rewire nothing, so every filter, tab,
-# date-range and data object behaves exactly as in production. Injected only by
-# the preview route; the production /dashboard never sees it.
+# Visual alignment of the two modes: the shadcn component idiom laid over the
+# risk report's EXISTING markup. Purely cosmetic by construction — a stylesheet
+# can rename nothing, remove nothing and rewire nothing, so every filter, tab,
+# date-range and data object behaves exactly as before. Originally stand-only;
+# released to the production /dashboard risk mode on 2026-08-25.
 _STAND_SKIN = """<style id="stand-skin">
 /* tab bar -> the same segmented control the Team summary uses, centred on the
    same 1180px column and out of the sticky layer, so the two headers align */
@@ -719,41 +758,29 @@ _STAND_SKIN = """<style id="stand-skin">
 
 #: Google Fonts tags served with the stored report bodies. The Team summary shell
 #: ships no webfonts and falls back to the system stack — which the operator
-#: prefers — so the stand strips these to make BOTH modes render with the same
-#: faces. Production /dashboard keeps its webfonts untouched.
+#: prefers — so the risk mode strips these to make BOTH modes render with the
+#: same faces. Frozen /r/{token} snapshot links keep their webfonts untouched.
 _FONT_LINK_RE = re.compile(r'<link[^>]*fonts\.g(?:oogleapis|static)\.com[^>]*>')
 
 
-@app.get("/preview/{token}/risk")
-async def get_preview_risk(token: str, request: Request) -> Response:
-    """The CURRENT production report, served read-only on the preview stand.
+async def _render_risk_report(
+    day_arg: str | None, *, team_url: str, subtitle: str, cache_key: str, fresh: bool
+) -> str:
+    """The classic risk report, skinned and headed as one mode of a two-mode page.
 
-    Renders exactly what the live dashboard renders — latest stored weekly and
-    monthly plus a live daily panel — without touching the ``dashboards`` token
-    machinery, so nothing here can retire, rotate or otherwise disturb the link
-    already posted to Slack. One known difference: the daily tab's hourly
-    self-refresh polls the production token and stops here; content is as of
-    page load.
+    Renders the latest stored weekly and monthly plus a live daily panel, strips
+    the webfonts, lays the alignment skin over the markup and injects the
+    mirrored mode-switch header pointing back at ``team_url``. Touches none of
+    the ``dashboards`` token machinery.
+
+    TTL-cached under ``cache_key``: mode switching re-requests this page, and
+    re-reading two ~250 KB stored reports per toggle is what made the switch
+    feel slow. ``fresh=True`` bypasses.
     """
-    credentials = _preview_credentials()
-    if credentials is None:
-        return Response(status_code=404)
-    expected_token, _ = credentials
-    if not hmac.compare_digest(token, expected_token):
-        return Response(status_code=404)
-    if request.cookies.get(_auth_cookie("preview", token)) != "1":
-        # The password form lives on the main preview URL; one gate, one cookie.
-        return RedirectResponse(url=f"/preview/{token}", status_code=303)
-
-    # Same TTL cache as the team summary: mode switching re-requests this page,
-    # and re-reading two ~250 KB stored reports per toggle is what made the
-    # switch feel slow. ?fresh=1 bypasses.
-    day_arg = request.query_params.get("day")
-    cache_key = f"risk:{day_arg or 'today'}"
-    if request.query_params.get("fresh") != "1":
+    if not fresh:
         cached = preview_cache.get(cache_key)
         if cached is not None:
-            return Response(content=cached, media_type="text/html")
+            return cached
 
     async def _latest(period: str) -> str | None:
         async with acquire_connection() as conn:
@@ -766,25 +793,55 @@ async def get_preview_risk(token: str, request: Request) -> Response:
     page = build_dashboard_html(
         weekly_html=weekly_html, monthly_html=monthly_html, daily_html=daily_html
     )
-    # Same font faces as the Team summary: drop the webfont tags (stand only).
+    # Same font faces as the Team summary: drop the webfont tags.
     page = _FONT_LINK_RE.sub("", page)
     # The visual-alignment skin goes last in <head> so it wins the cascade.
     head_at = page.find("</head>")
     if head_at != -1:
         page = page[:head_at] + _STAND_SKIN + page[head_at:]
     # The mirrored header strip goes below the red accent bar, above the tabs.
+    header = _stand_header(team_url, subtitle)
     bar = '<div class="accent-bar"></div>'
     bar_at = page.find(bar)
     if bar_at != -1:
         insert_at = bar_at + len(bar)
-        page = page[:insert_at] + _stand_header(token) + page[insert_at:]
+        page = page[:insert_at] + header + page[insert_at:]
     else:  # unexpected markup — fall back to right after <body>
         body_at = page.find("<body")
         if body_at != -1:
             body_end = page.find(">", body_at)
             if body_end != -1:
-                page = page[: body_end + 1] + _stand_header(token) + page[body_end + 1 :]
+                page = page[: body_end + 1] + header + page[body_end + 1 :]
     preview_cache.put(cache_key, page)
+    return page
+
+
+@app.get("/preview/{token}/risk")
+async def get_preview_risk(token: str, request: Request) -> Response:
+    """The production risk report, served read-only on the preview stand.
+
+    One known difference from the production risk mode: the daily tab's hourly
+    self-refresh polls ``/preview/{token}/risk/daily``, which does not exist —
+    content is as of page load.
+    """
+    credentials = _preview_credentials()
+    if credentials is None:
+        return Response(status_code=404)
+    expected_token, _ = credentials
+    if not hmac.compare_digest(token, expected_token):
+        return Response(status_code=404)
+    if request.cookies.get(_auth_cookie("preview", token)) != "1":
+        # The password form lives on the main preview URL; one gate, one cookie.
+        return RedirectResponse(url=f"/preview/{token}", status_code=303)
+
+    day_arg = request.query_params.get("day")
+    page = await _render_risk_report(
+        day_arg,
+        team_url=f"/preview/{token}",
+        subtitle="production report &middot; live copy on the stand",
+        cache_key=f"risk:preview:{day_arg or 'today'}",
+        fresh=request.query_params.get("fresh") == "1",
+    )
     return Response(content=page, media_type="text/html")
 
 
