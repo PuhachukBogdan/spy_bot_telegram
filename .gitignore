@@ -84,3 +84,25 @@ red_flag_dictionary*.json
 # Approved Tier-1 dictionary (leadership-approved data, loaded into the DB; never committed)
 red_flag_patterns_dictionary*.txt
 red_flag_patterns_dictionary*.json
+
+# Partner-chat archive export: the raw Telegram Desktop HTML dump of 241 partner
+# chats — ~106 MB, 12 746 files, real customer conversations plus their photos and
+# documents. Imported into the DB by scripts/import_archive.py; the corpus itself
+# must never enter git. Without these lines `git add -A` stages 26 738 paths and
+# publishes the lot to all three remotes, including the shared team repo — and a
+# push cannot be un-published. `__MACOSX/` is the resource-fork junk the zip
+# expands alongside it.
+AFFS_CHATS/
+AFFS_CHATS*.zip
+__MACOSX/
+
+# Local copies of the archive risk review (scripts/analyze_archive.py --report):
+# real findings quoting partner messages verbatim. The review is meant to be read
+# over the password-gated /archive/{token} link, not carried around as a file. No
+# .html is tracked anywhere in this repo, so ignoring root-level HTML keeps any
+# generated report out by default.
+/*.html
+
+# Claude Code machine-local settings (permissions etc.). A shared
+# .claude/settings.json may still be committed deliberately.
+.claude/settings.local.json
