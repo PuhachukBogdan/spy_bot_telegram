@@ -60,15 +60,23 @@ CLAUDE.md
 scripts/gen_docs.py
 scripts/gen_ops_guide.py
 scripts/gen_test_guide.py
+# Same reason as the three above, plus two of its own: reportlab is NOT a
+# declared dependency in pyproject.toml (it only happens to be installed), and
+# the script hardcodes C:/Windows/Fonts for Cyrillic glyphs, so it is
+# Windows-only. gen_handoff_docs.py IS committed by contrast, because
+# python-docx is a declared dep with a mypy override.
+scripts/gen_phase2_pdf.py
 
 # Internal spec docs — kept local for now; may become docs/README later
 *.docx
 Reports overview.pdf
+Phase 2 - Manager KPI.pdf
 
 # Handoff / ops spec docs — generated local-only (no secrets, but intentionally
 # not committed; see scripts/gen_handoff_docs.py)
 OPS_ALERTS.md
 PUBLIC_LAYER.md
+PHASE2_MANAGER_KPI.md
 
 # Ops workspace — Claude's deployment runbook, scripts, local notes (no secrets,
 # but intentionally local-only; fly.toml in root IS committed).
@@ -106,3 +114,9 @@ __MACOSX/
 # Claude Code machine-local settings (permissions etc.). A shared
 # .claude/settings.json may still be committed deliberately.
 .claude/settings.local.json
+
+# Report shell build artifact (produced by the Docker node stage, or a local
+# `npm run build` copied here). Source lives in frontend/.
+/static/
+PHASE2_ANALYTICS_SUMMARY.md
+Phase 2 Analytics - Summary.pdf

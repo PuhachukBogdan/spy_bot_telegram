@@ -1,0 +1,64 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* shadcn's semantic token layer, with Signal Desk values.
+ *
+ * This mapping is the whole trick to adopting shadcn here: its primitives are
+ * written against semantic names (--card, --primary, --border), so pointing
+ * those names at the report's existing palette makes stock components come out
+ * looking like the product, with no component edited. Take the structure, not
+ * the library's colours.
+ *
+ * Values mirror `_BASE_CSS` in src/summary/builder.py, converted to the HSL
+ * triplets shadcn expects. If the report palette moves, move it here too.
+ *
+ * Light only, on purpose: the report hard-sets data-theme="light" because it is
+ * a printed-briefing surface, not an app that follows the OS. */
+@layer base {
+  :root {
+    --background: 42 21% 91%; /* paper   #ECE9E2 */
+    --foreground: 223 14% 10%; /* ink     #15171C */
+    --card: 43 30% 95%; /* surface #F7F5F0 */
+    --card-foreground: 223 14% 10%;
+    --popover: 43 30% 95%;
+    --popover-foreground: 223 14% 10%;
+    --primary: 203 56% 27%; /* accent  #1E4D6B */
+    --primary-foreground: 43 30% 95%;
+    --secondary: 40 26% 91%; /* surface-2 #EEEAE2 */
+    --secondary-foreground: 223 14% 10%;
+    --muted: 40 26% 91%;
+    --muted-foreground: 221 10% 37%; /* ink-2 #565C69 */
+    --accent: 40 26% 91%;
+    --accent-foreground: 203 56% 27%;
+    --destructive: 4 76% 40%; /* crit    #B42318 */
+    --destructive-foreground: 43 30% 95%;
+    --border: 39 20% 84%; /* line    #DED8CD */
+    --input: 39 20% 84%;
+    --ring: 203 56% 27%;
+    --radius: 0.5rem;
+
+    /* Categorical chart slots. Assigned in fixed order and never cycled: colour
+     * follows the entity, so a filter that removes a series must not repaint the
+     * survivors. Kept distinct from the severity scale, which is reserved. */
+    --chart-1: 203 56% 27%;
+    --chart-2: 158 46% 33%;
+    --chart-3: 28 65% 37%;
+    --chart-4: 221 10% 37%;
+    --chart-5: 4 76% 40%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans text-[14px] leading-relaxed antialiased;
+  }
+
+  /* Data is monospace with tabular figures — the Signal Desk rule that keeps
+     columns of numbers aligned and comparable down the page. */
+  .num {
+    @apply font-mono tabular-nums tracking-tight;
+  }
+}

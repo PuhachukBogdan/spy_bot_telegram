@@ -96,6 +96,40 @@ async def get_internal_user_by_telegram_id_any(
     return InternalUser.from_record(row) if row is not None else None
 
 
+async def list_real_managers(conn: asyncpg.Connection) -> list[InternalUser]:
+    """Managers who are actual PEOPLE, not aff_id stubs. Phase 2 metrics axis.
+
+    ``internal_users`` holds two very different kinds of row under
+    ``role='manager'``. A handful are real staff. The rest — the large majority —
+    are stubs minted by onboarding from the numeric token in a chat title
+    (:func:`get_or_create_manager_by_aff_id`), one per affiliate. That mix is why
+    the 2026-07-21 rework re-keyed the report onto chats: a managers x categories
+    matrix was mostly a grid of stubs.
+
+    The discriminator is a **non-empty ``telegram_accounts``**. A stub is born from
+    text in a chat title and never has a Telegram account attached; a real person
+    is only ever recorded with one. This is the same signal ``activity_signals``
+    already uses to attribute proposals, so the two agree by construction.
+
+    Also drops disabled staff (offboarded) and ``is_test`` accounts. Note this is
+    deliberately NOT the enabled-agnostic lookup used for ``sender_role`` — there,
+    conflating "may use the bot" with "is staff" corrupted risk analysis; here we
+    genuinely want only people currently being measured.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT *
+        FROM internal_users
+        WHERE role = 'manager'
+          AND enabled = true
+          AND COALESCE(is_test, false) = false
+          AND jsonb_array_length(COALESCE(telegram_accounts, '[]'::jsonb)) > 0
+        ORDER BY full_name
+        """
+    )
+    return [InternalUser.from_record(row) for row in rows]
+
+
 async def create_internal_user(
     conn: asyncpg.Connection,
     *,

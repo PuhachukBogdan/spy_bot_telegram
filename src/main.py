@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import hmac
 import html as _html
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -46,6 +47,8 @@ from src.importer.retro_report import (  # noqa: E402
     load_run_summary,
     render_report,
 )
+from src.metrics.cache import preview_cache  # noqa: E402
+from src.metrics.preview import build_preview  # noqa: E402
 from src.pipeline.ops_alerts.scheduler import start_ops_alerts, stop_ops_alerts  # noqa: E402
 from src.pipeline.tier1 import pattern_cache  # noqa: E402
 from src.pipeline.workers import (  # noqa: E402
@@ -598,6 +601,212 @@ async def post_archive_auth(token: str, pw: str = Form("")) -> Response:
     redirect = RedirectResponse(url=f"/archive/{token}", status_code=303)
     redirect.set_cookie(
         key=_auth_cookie("archive", token),
+        value="1",
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=_COOKIE_MAX_AGE,
+    )
+    return redirect
+
+
+# --- Phase 2 preview stand ----------------------------------------------------
+# A separate link for reviewing the new manager metrics while the live
+# weekly/monthly report keeps running untouched. Same shape as the archive link:
+# fixed token + password, fail-closed, rendered live on request. It writes
+# nothing, posts nothing to Slack, and shares no table or token with `summaries`
+# / `dashboards`, so it cannot disturb the report already in production.
+
+
+def _preview_credentials() -> tuple[str, str] | None:
+    """``(token, password)`` if the preview stand is enabled, else ``None``."""
+    token = settings.PREVIEW_REPORT_TOKEN
+    password = settings.PREVIEW_REPORT_PASSWORD
+    if token is None or password is None:
+        return None
+    token_value = token.get_secret_value()
+    password_value = password.get_secret_value()
+    if not token_value or not password_value:
+        return None
+    return token_value, password_value
+
+
+@app.get("/preview/{token}")
+async def get_preview(token: str, request: Request) -> Response:
+    """Serve the Phase 2 metrics preview, rendered live from the database."""
+    credentials = _preview_credentials()
+    if credentials is None:
+        return Response(status_code=404)
+    expected_token, _ = credentials
+    if not hmac.compare_digest(token, expected_token):
+        return Response(status_code=404)
+
+    if request.cookies.get(_auth_cookie("preview", token)) != "1":
+        return Response(
+            content=_pw_form(title="Phase 2 Preview", action=f"/preview/{token}"),
+            media_type="text/html",
+        )
+    fresh = request.query_params.get("fresh") == "1"
+    return Response(content=await build_preview(fresh=fresh), media_type="text/html")
+
+
+def _stand_header(token: str) -> str:
+    """A header strip mirroring the Team summary's, injected above the tabs.
+
+    Same skeleton on both pages — title top-left (display font, 27px), the mode
+    switch top-right IN THE FLOW at the same offsets — so toggling modes moves
+    nothing. The active segment is CRIT RED here and teal on the Team summary:
+    the switch's colour says where you are without reading.
+    """
+    return (
+        '<div style="max-width:1180px;margin:0 auto;padding:30px 24px 0;display:flex;'
+        'flex-wrap:wrap;justify-content:space-between;align-items:flex-start;gap:12px">'
+        "<div>"
+        "<div style=\"font-family:var(--display);font-size:27px;font-weight:800;"
+        'letter-spacing:-.025em;line-height:1.2">Risk report</div>'
+        "<div style=\"font-family:var(--mono);font-size:12px;color:var(--ink-3);"
+        'margin:2px 0 14px">production report &middot; live copy on the stand</div>'
+        "</div>"
+        # Box metrics copied from the Team summary's switch (text-[11px],
+        # tracking-wider, px-3 py-1.5, rounded-md) so the control is the same
+        # size on both pages — only the active colour differs.
+        '<div style="display:flex;border:1px solid var(--line);border-radius:6px;'
+        "overflow:hidden;font-family:var(--mono);font-size:11px;font-weight:400;"
+        'letter-spacing:.05em;text-transform:uppercase;line-height:1.5">'
+        '<span style="background:#B42318;color:#FBEEEC;padding:6px 12px">Risk report</span>'
+        f'<a href="/preview/{token}" style="background:var(--surface);color:var(--ink-2);'
+        'padding:6px 12px;text-decoration:none">Team summary</a></div></div>'
+    )
+
+
+# Stand-only visual alignment: the shadcn component idiom laid over the risk
+# report's EXISTING markup. Purely cosmetic by construction — a stylesheet can
+# rename nothing, remove nothing and rewire nothing, so every filter, tab,
+# date-range and data object behaves exactly as in production. Injected only by
+# the preview route; the production /dashboard never sees it.
+_STAND_SKIN = """<style id="stand-skin">
+/* tab bar -> the same segmented control the Team summary uses, centred on the
+   same 1180px column and out of the sticky layer, so the two headers align */
+.dash-tabs{gap:0;position:static;height:auto;background:transparent;
+  border-bottom:none;max-width:1180px;margin:0 auto;padding:6px 24px 10px}
+.tab-btn{border:1px solid var(--line);border-radius:0;margin-left:-1px;
+  background:var(--surface-2);padding:6px 14px}
+.tab-btn:first-of-type{border-radius:6px 0 0 6px;margin-left:0}
+.tab-btn:last-of-type{border-radius:0 6px 6px 0}
+.tab-btn:hover{background:var(--surface)}
+/* risk identity is RED here — the teal active state belongs to Team summary */
+.tab-btn.active{background:var(--crit);color:#FBEEEC;border-color:var(--crit)}
+.accent-bar{background:var(--crit)}
+.tab-panel .sidebar{top:0;height:100vh}
+/* the inner per-report heading steps down: the page title is the injected one */
+.page-header h1{font-size:22px}
+/* the injected header already carries the accent strip's job; the copies baked
+   into each stored report body would stack up as duplicate bars */
+.tab-panel .accent-bar{display:none}
+/* header stat readouts -> the Team summary's tile cards. Weekly/monthly only:
+   the daily digest has ~11 readouts and as cards they wrap into a wall — its
+   compact strip layout is the correct form for that many. */
+#panel-weekly .stat-strip,#panel-monthly .stat-strip{gap:12px;padding-bottom:22px}
+#panel-weekly .stat-cell,#panel-monthly .stat-cell{background:var(--surface);
+  border:1px solid var(--line);border-radius:8px;padding:13px 17px 14px;
+  box-shadow:var(--shadow);min-width:128px}
+#panel-weekly .stat-cell:first-child,#panel-monthly .stat-cell:first-child{
+  padding-left:17px;border-left:1px solid var(--line)}
+/* one corner radius across both modes */
+.mgr-card,.cat-list,.dc-list,.portfolio-clean,.filter-panel{border-radius:8px}
+</style>"""
+
+
+#: Google Fonts tags served with the stored report bodies. The Team summary shell
+#: ships no webfonts and falls back to the system stack — which the operator
+#: prefers — so the stand strips these to make BOTH modes render with the same
+#: faces. Production /dashboard keeps its webfonts untouched.
+_FONT_LINK_RE = re.compile(r'<link[^>]*fonts\.g(?:oogleapis|static)\.com[^>]*>')
+
+
+@app.get("/preview/{token}/risk")
+async def get_preview_risk(token: str, request: Request) -> Response:
+    """The CURRENT production report, served read-only on the preview stand.
+
+    Renders exactly what the live dashboard renders — latest stored weekly and
+    monthly plus a live daily panel — without touching the ``dashboards`` token
+    machinery, so nothing here can retire, rotate or otherwise disturb the link
+    already posted to Slack. One known difference: the daily tab's hourly
+    self-refresh polls the production token and stops here; content is as of
+    page load.
+    """
+    credentials = _preview_credentials()
+    if credentials is None:
+        return Response(status_code=404)
+    expected_token, _ = credentials
+    if not hmac.compare_digest(token, expected_token):
+        return Response(status_code=404)
+    if request.cookies.get(_auth_cookie("preview", token)) != "1":
+        # The password form lives on the main preview URL; one gate, one cookie.
+        return RedirectResponse(url=f"/preview/{token}", status_code=303)
+
+    # Same TTL cache as the team summary: mode switching re-requests this page,
+    # and re-reading two ~250 KB stored reports per toggle is what made the
+    # switch feel slow. ?fresh=1 bypasses.
+    day_arg = request.query_params.get("day")
+    cache_key = f"risk:{day_arg or 'today'}"
+    if request.query_params.get("fresh") != "1":
+        cached = preview_cache.get(cache_key)
+        if cached is not None:
+            return Response(content=cached, media_type="text/html")
+
+    async def _latest(period: str) -> str | None:
+        async with acquire_connection() as conn:
+            return await get_latest_summary_html(conn, period)
+
+    # Three independent reads — fan out instead of three sequential round trips.
+    weekly_html, monthly_html, daily_html = await asyncio.gather(
+        _latest("weekly"), _latest("monthly"), _render_daily_panel(day_arg)
+    )
+    page = build_dashboard_html(
+        weekly_html=weekly_html, monthly_html=monthly_html, daily_html=daily_html
+    )
+    # Same font faces as the Team summary: drop the webfont tags (stand only).
+    page = _FONT_LINK_RE.sub("", page)
+    # The visual-alignment skin goes last in <head> so it wins the cascade.
+    head_at = page.find("</head>")
+    if head_at != -1:
+        page = page[:head_at] + _STAND_SKIN + page[head_at:]
+    # The mirrored header strip goes below the red accent bar, above the tabs.
+    bar = '<div class="accent-bar"></div>'
+    bar_at = page.find(bar)
+    if bar_at != -1:
+        insert_at = bar_at + len(bar)
+        page = page[:insert_at] + _stand_header(token) + page[insert_at:]
+    else:  # unexpected markup — fall back to right after <body>
+        body_at = page.find("<body")
+        if body_at != -1:
+            body_end = page.find(">", body_at)
+            if body_end != -1:
+                page = page[: body_end + 1] + _stand_header(token) + page[body_end + 1 :]
+    preview_cache.put(cache_key, page)
+    return Response(content=page, media_type="text/html")
+
+
+@app.post("/preview/{token}")
+async def post_preview_auth(token: str, pw: str = Form("")) -> Response:
+    """Verify the preview password; on success set the cookie and redirect to GET."""
+    credentials = _preview_credentials()
+    if credentials is None:
+        return Response(status_code=404)
+    expected_token, expected_pw = credentials
+    if not hmac.compare_digest(token, expected_token):
+        return Response(status_code=404)
+    if not pw or not hmac.compare_digest(pw, expected_pw):
+        return Response(
+            content=_pw_form(
+                title="Phase 2 Preview", action=f"/preview/{token}", error=True
+            ),
+            media_type="text/html",
+        )
+    redirect = RedirectResponse(url=f"/preview/{token}", status_code=303)
+    redirect.set_cookie(
+        key=_auth_cookie("preview", token),
         value="1",
         httponly=True,
         secure=True,

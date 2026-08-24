@@ -79,6 +79,10 @@ class InternalUser(_ORMModel):
     tg_username: str | None = None
     # Migration 0015: Slack identity linked via /register OTP flow.
     slack_user_id: str | None = None
+    # Migration 0022: test accounts, hidden from reports and excluded from metrics.
+    # Seeded BY NAME, so a rename silently unflags — never treat it as authoritative
+    # for anything but display/aggregation filtering.
+    is_test: bool = False
     created_at: datetime
 
     @property

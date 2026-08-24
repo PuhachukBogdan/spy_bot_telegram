@@ -6,6 +6,7 @@ Single source of truth for all runtime configuration. Import the module-level
 
 from __future__ import annotations
 
+from datetime import date, time
 from decimal import Decimal
 from typing import Literal
 
@@ -168,12 +169,27 @@ class Settings(BaseSettings):
     STALE_TASK_TIMEOUT_SECONDS: int = 600   # 10 minutes
     STALE_TASK_REAPER_INTERVAL_SECONDS: int = 300  # run every 5 minutes
 
-    # === SLA (operational_sla track — time-based, no LLM) ===
-    # A partner message with no internal reply for this many WORK minutes (counted
-    # against the owning manager's work hours, migration 0008) raises an
-    # operational_sla risk. The job lands in a later phase; the threshold lives in
-    # config now so the value is fixed in one place.
-    SLA_RESPONSE_THRESHOLD_MINUTES: int = 20
+    # === SLA (response time — pure arithmetic, no LLM) ===
+    # A message from anyone-but-staff starts a timer; the manager's first reply
+    # stops it. Timers only START inside working hours (weekends and holidays
+    # excluded), so plain wall-clock seconds are the measure — no cross-day
+    # work-minute accumulation is needed.
+    #
+    # Four bands, in order of application (see src/metrics/sla.py):
+    #   answered within THRESHOLD                      -> met
+    #   slower, but the reply was SUBSTANTIVE, <= GRACE -> met (a real answer
+    #                                                      takes longer to type
+    #                                                      than "ок")
+    #   anything else still inside OFFLINE_AFTER        -> missed
+    #   nothing for OFFLINE_AFTER                       -> not slow, ABSENT;
+    #                                                      counted separately and
+    #                                                      never folded into the %
+    SLA_RESPONSE_THRESHOLD_SECONDS: int = 120
+    SLA_SUBSTANTIVE_GRACE_SECONDS: int = 300
+    # ~2-3 sentences of Russian business chat. Sentences run 60-90 chars here, so
+    # three land near 200; above that the manager was writing, not idling.
+    SLA_SUBSTANTIVE_REPLY_CHARS: int = 200
+    SLA_OFFLINE_AFTER_SECONDS: int = 1200
 
     # === Summary / HTML report (Phase 16) ===
     # Shared bearer token for POST /summary/generate and GET /reports/...
@@ -187,6 +203,57 @@ class Settings(BaseSettings):
     # at local midnight too. DST is handled by zoneinfo, so the UTC instant
     # shifts with the season (Kyiv: 21:00 UTC in summer, 22:00 in winter).
     REPORT_TIMEZONE: str = "Europe/Kyiv"
+
+    # === Phase 2 manager metrics (SLA %, active-chat KPI, tone of voice) ===
+    # Hard floor for EVERY metrics window. Phase 2 KPIs count forward from the day
+    # the code went to prod; nothing is computed retroactively (backfilling history
+    # is a separate, later job).
+    #
+    # Set once at deploy, then left alone. Moving it forward discards accumulated
+    # comparison history; moving it back lets the 56 329 imported archive messages
+    # into the windows — they carry ORIGINAL timestamps running to 2026-08-03, so
+    # they land squarely in the "previous period" of any period-over-period delta
+    # and would make every manager look like they collapsed. Queries additionally
+    # filter ``source <> 'imported'`` so that protection survives the backfill,
+    # when windows start reaching back past this floor.
+    #
+    # None = no floor. Only correct before Phase 2 ships.
+    METRICS_EPOCH_DATE: date | None = None
+
+    # The bot's first two weeks in production (live from 2026-05-29) were spent
+    # onboarding and testing — traffic from that stretch describes the rollout,
+    # not the managers. Trend buckets that START before this date are flagged
+    # ``test`` and drawn muted/labelled in charts, rather than silently mixed
+    # into the same series as real work. None disables the marking.
+    METRICS_TEST_PERIOD_UNTIL: date | None = date(2026, 6, 12)
+
+    # Fallback working window, used ONLY for managers who have not set their own
+    # via /set_hours. Measured 2026-08-15: 1 of 4 real managers had hours set, so
+    # without this the other three would be measured around the clock and score
+    # near zero against a 2-minute threshold — producing a ranking that reflects
+    # who filled in a form, not who answers partners.
+    #
+    # Personal hours always win; this only fills the gap. Which of the two was
+    # used is carried on every result (WorkHoursSource) and shown in the report,
+    # so a number computed against an ASSUMED schedule is never presented as if
+    # the manager had confirmed it.
+    METRICS_DEFAULT_WORK_HOURS_START: time = time(9, 0)
+    METRICS_DEFAULT_WORK_HOURS_END: time = time(18, 0)
+    METRICS_DEFAULT_WORK_TIMEZONE: str = "Europe/Kyiv"
+
+    # A chat counts as "active" for the coverage KPI at this many messages in the
+    # reporting month. Low on purpose for now — the point is to separate live
+    # chats from dead ones, not to set a performance bar.
+    ACTIVE_CHAT_MIN_MESSAGES: int = 10
+
+    # === Phase 2 preview stand ===
+    # A SEPARATE link for reviewing the new metrics while the live weekly/monthly
+    # report keeps running untouched. Same fail-closed pattern as the archive
+    # link: both must be set or the route 404s. Renders live from the DB — it
+    # stores nothing and touches none of the `summaries` / `dashboards` token
+    # machinery, so it cannot disturb the report that is already in production.
+    PREVIEW_REPORT_TOKEN: SecretStr | None = None
+    PREVIEW_REPORT_PASSWORD: SecretStr | None = None
 
     # === Ops Alerts (payment-provider incidents + Argentina holidays) ===
     # Master kill-switch: when false neither ops-alerts worker runs.
