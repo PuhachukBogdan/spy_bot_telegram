@@ -159,3 +159,44 @@ async def test_get_daily_digest_no_active_chats() -> None:
     )
     assert d.active_chat_rows == []
     assert d.active_chats == 0
+
+
+# ---------------------------------------------------------------------------
+# Imported archive history must not reach the daily digest
+# ---------------------------------------------------------------------------
+
+
+class _RecordingConn(_FakeConn):
+    """Delegates to the canned fake but keeps every SQL string it was handed."""
+
+    def __init__(self) -> None:
+        self.sql: list[str] = []
+
+    async def fetchval(self, sql: str, *args: Any) -> int:
+        self.sql.append(" ".join(sql.split()))
+        return await super().fetchval(sql, *args)
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        self.sql.append(" ".join(sql.split()))
+        return await super().fetch(sql, *args)
+
+
+async def test_digest_counts_exclude_imported_archive_rows() -> None:
+    """The digest reports a day of *monitoring*, not everything bearing that date.
+
+    Imported rows carry the original conversation's timestamps — 131 of them fall in
+    August 2026 — so without this guard, opening the digest for a day inside the
+    archive's range mixes backfilled history into "messages today" with nothing to
+    explain the jump.
+    """
+    conn = _RecordingConn()
+    await get_daily_digest(
+        conn,  # type: ignore[arg-type]
+        datetime(2026, 8, 3, tzinfo=UTC),
+        datetime(2026, 8, 4, tzinfo=UTC),
+    )
+
+    message_queries = [s for s in conn.sql if "messages" in s]
+    assert message_queries, "digest ran no message query"
+    for sql in message_queries:
+        assert "source <> 'imported'" in sql, f"unguarded digest query: {sql}"

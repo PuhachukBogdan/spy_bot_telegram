@@ -52,6 +52,25 @@ class Settings(BaseSettings):
     OPENROUTER_API_KEY: SecretStr
     LLM_MODEL_TIER2: str = "anthropic/claude-haiku-4-5"
     LLM_MODEL_SUMMARY: str = "anthropic/claude-sonnet-4-6"
+    # One-off retrospective pass over imported archive history. Deliberately a
+    # stronger model than the live Tier-2 default: that pass is judged on precision
+    # by a human reading a management report, and the whole archive costs single-
+    # digit dollars to analyse, so there is nothing to save by going cheaper.
+    LLM_MODEL_RETRO: str = "anthropic/claude-sonnet-4-6"
+    # Hard ceiling for one retro run, checked against OpenRouter's reported spend
+    # before each call. Separate from DAILY_LLM_BUDGET_USD, which guards the live
+    # pipeline's circuit breaker and must not be consumed by a one-off backfill.
+    RETRO_BUDGET_USD: float = 25.0
+    # The archive review is published on a PERMANENT link, deliberately outside the
+    # weekly/monthly report machinery: those rotate their token on every generation
+    # and revoke the previous one, which is exactly what must not happen here.
+    #
+    # Both values are required for the route to answer at all — it 404s unless each
+    # is set. That is fail-closed on purpose: a link that never rotates and never
+    # expires, carrying risk findings, is the highest-exposure artefact in the
+    # system, so enabling it has to be a deliberate act rather than a default.
+    ARCHIVE_REPORT_TOKEN: SecretStr | None = None
+    ARCHIVE_REPORT_PASSWORD: SecretStr | None = None
 
     # === Whisper (OpenAI Audio API, separate from OpenRouter) ===
     OPENAI_API_KEY: SecretStr
@@ -162,6 +181,12 @@ class Settings(BaseSettings):
     SUMMARY_ACCESS_TOKEN: SecretStr = SecretStr("change-me-before-deploy")
     # Public base URL of this server, used to build the report link posted to Slack.
     SERVER_BASE_URL: str = "http://localhost:8080"
+    # Timezone the reports live in. The weekly/monthly scheduler fires at 00:00
+    # LOCAL time in this zone (not 08:00 UTC as before), the report window snaps
+    # to that local midnight, and the daily-digest tab's calendar day rolls over
+    # at local midnight too. DST is handled by zoneinfo, so the UTC instant
+    # shifts with the season (Kyiv: 21:00 UTC in summer, 22:00 in winter).
+    REPORT_TIMEZONE: str = "Europe/Kyiv"
 
     # === Ops Alerts (payment-provider incidents + Argentina holidays) ===
     # Master kill-switch: when false neither ops-alerts worker runs.

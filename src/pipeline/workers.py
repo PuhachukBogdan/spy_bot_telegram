@@ -12,7 +12,7 @@ on shutdown.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from decimal import Decimal
 
 from aiogram import Bot
@@ -49,8 +49,9 @@ from src.pipeline.batch_processor import process_analysis_task
 from src.pipeline.file_processor import process_file_task
 from src.pipeline.tier1 import pattern_cache
 from src.pipeline.transcription import process_whisper_task
-from src.summary.generator import generate_report
+from src.summary.generator import generate_report, refresh_report
 from src.utils.logging import get_logger
+from src.utils.workhours import resolve_timezone
 
 log = get_logger(__name__)
 
@@ -68,11 +69,14 @@ _SUMMARY_SCHEDULER_INTERVAL_SECONDS = 900
 # old. Covers a short outage spanning the slot, without blasting a stale report
 # on a fresh deploy days later.
 _SUMMARY_CATCHUP_WINDOW_SECONDS = 21600  # 6h
-# Weekly: Monday 08:00 UTC (n8n cron "0 8 * * 1").
+# Both slots fire at LOCAL midnight in settings.REPORT_TIMEZONE (Kyiv), so a
+# report is waiting at the start of the working day and its window covers whole
+# local days. Weekly: Monday 00:00 local. Monthly: 1st of month 00:00 local.
 _WEEKLY_DOW = 0  # Monday (datetime.weekday(): Monday == 0)
-_WEEKLY_HOUR = 8
-# Monthly: 1st of month 08:00 UTC (n8n cron "0 8 1 * *").
-_MONTHLY_HOUR = 8
+_WEEKLY_HOUR = 0
+_MONTHLY_HOUR = 0
+# Daily content refresh (no Slack post, no new link) at the same local midnight.
+_DAILY_HOUR = 0
 
 
 async def run_abandoned_chat_sweep(bot: Bot) -> int:
@@ -512,31 +516,76 @@ async def storage_monitor_loop(
         await asyncio.sleep(interval)
 
 
+def report_timezone() -> tzinfo:
+    """The zone reports are scheduled and dated in (``REPORT_TIMEZONE``).
+
+    Falls back to UTC if the configured name is unknown, so a typo in ``.env``
+    degrades to the old behaviour instead of crashing the scheduler.
+    """
+    tz = resolve_timezone(settings.REPORT_TIMEZONE)
+    if tz is None:
+        log.warning("summary.bad_timezone", name=settings.REPORT_TIMEZONE)
+        return UTC
+    return tz
+
+
 def _last_weekly_occurrence(now: datetime) -> datetime:
-    """Most recent Monday 08:00 UTC at or before ``now``."""
-    occ = now.replace(hour=_WEEKLY_HOUR, minute=0, second=0, microsecond=0)
-    occ -= timedelta(days=(now.weekday() - _WEEKLY_DOW) % 7)
-    if occ > now:  # earlier today than 08:00 on this week's Monday → last week
+    """Most recent Monday 00:00 REPORT_TIMEZONE at or before ``now``, as UTC.
+
+    The arithmetic is done on the LOCAL wall clock and only then converted, so
+    the slot stays at local midnight across a DST change rather than drifting an
+    hour twice a year.
+    """
+    local = now.astimezone(report_timezone())
+    occ = local.replace(hour=_WEEKLY_HOUR, minute=0, second=0, microsecond=0)
+    occ -= timedelta(days=(local.weekday() - _WEEKLY_DOW) % 7)
+    if occ > local:  # this week's Monday hasn't struck midnight yet → last week
         occ -= timedelta(days=7)
-    return occ
+    return occ.astimezone(UTC)
+
+
+def _last_daily_occurrence(now: datetime) -> datetime:
+    """Today's 00:00 in REPORT_TIMEZONE, as UTC — the daily content-refresh slot."""
+    local = now.astimezone(report_timezone())
+    occ = local.replace(hour=_DAILY_HOUR, minute=0, second=0, microsecond=0)
+    return occ.astimezone(UTC)
 
 
 def _last_monthly_occurrence(now: datetime) -> datetime:
-    """Most recent 1st-of-month 08:00 UTC at or before ``now``."""
-    occ = now.replace(day=1, hour=_MONTHLY_HOUR, minute=0, second=0, microsecond=0)
-    if occ > now:  # before the 1st @ 08:00 → step into previous month
+    """Most recent 1st-of-month 00:00 REPORT_TIMEZONE at or before ``now``, as UTC."""
+    local = now.astimezone(report_timezone())
+    occ = local.replace(day=1, hour=_MONTHLY_HOUR, minute=0, second=0, microsecond=0)
+    if occ > local:  # before the 1st @ local midnight → step into previous month
         occ = (occ - timedelta(days=1)).replace(
             day=1, hour=_MONTHLY_HOUR, minute=0, second=0, microsecond=0
         )
-    return occ
+    return occ.astimezone(UTC)
 
 
 async def run_summary_scheduler_tick() -> list[str]:
-    """One scheduler pass: fire any due, not-yet-generated report.
+    """One scheduler pass: release any due report, then refresh today's content.
 
-    Returns the period types fired this tick (for tests/observability). A slot
-    fires only if its scheduled instant is within the catch-up window AND no
-    summary of that type was generated since that instant (restart-safe dedup).
+    Two kinds of work, both at 00:00 local (``REPORT_TIMEZONE``):
+
+    * **Release** (Monday / 1st of month) — full :func:`generate_report`: new
+      dashboard link, Slack post, old links retired.
+    * **Daily refresh** (every day) — :func:`refresh_report`: re-renders weekly
+      and monthly content for the current rolling window and stores it, with NO
+      Slack post and NO link rotation. The dashboard renders the newest summary
+      of each type, so the link already in Slack starts showing it. Without this
+      a risk event detected after Monday morning stayed invisible in the weekly
+      report until the following Monday.
+
+    Returns what fired this tick (for tests/observability): ``"weekly"`` for a
+    release, ``"weekly:refresh"`` for a content refresh. A slot fires only if its
+    scheduled instant is within the catch-up window AND the DB says it hasn't
+    been handled yet (restart-safe dedup).
+
+    The window END is the SCHEDULED instant, not ``now()``: the tick can run up
+    to one interval late, and pinning the window to the slot keeps consecutive
+    reports exactly contiguous. With ``now()`` the tick jitter opened a gap of a
+    few minutes between one window's end and the next one's start, and any event
+    landing in that gap appeared in no report at all.
     """
     now = datetime.now(UTC)
     schedule = (
@@ -548,14 +597,16 @@ async def run_summary_scheduler_tick() -> list[str]:
         if (now - occ).total_seconds() > _SUMMARY_CATCHUP_WINDOW_SECONDS:
             continue  # missed slot too old — wait for the next occurrence
         async with acquire_connection() as conn:
-            if await summary_exists_since(conn, period_type, occ):
+            # delivered_only: a daily refresh row must NOT count as "released",
+            # or the Monday Slack post would stop firing.
+            if await summary_exists_since(conn, period_type, occ, delivered_only=True):
                 continue  # already handled this slot
         log.info(
             "worker.summary_scheduler.fire",
             period_type=period_type,
             scheduled_for=occ.isoformat(),
         )
-        result = await generate_report(period_type=period_type)  # type: ignore[arg-type]
+        result = await generate_report(period_type=period_type, until=occ)  # type: ignore[arg-type]
         fired.append(period_type)
         log.info(
             "worker.summary_scheduler.done",
@@ -563,6 +614,28 @@ async def run_summary_scheduler_tick() -> list[str]:
             url=result.url,
             event_count=result.event_count,
             slack_delivered=result.slack_delivered,
+        )
+
+    daily_occ = _last_daily_occurrence(now)
+    if (now - daily_occ).total_seconds() > _SUMMARY_CATCHUP_WINDOW_SECONDS:
+        return fired  # today's midnight is long past (late start) — skip the refresh
+    for period_type in ("weekly", "monthly"):
+        # A release this tick already wrote fresh content for that type — and on a
+        # Monday its window start is the SAME instant a weekly refresh would use,
+        # so refreshing anyway would upsert the just-released row back to
+        # 'pending' and undo the release.
+        if period_type in fired:
+            continue
+        async with acquire_connection() as conn:
+            if await summary_exists_since(conn, period_type, daily_occ):
+                continue  # content already refreshed (or released) since midnight
+        count = await refresh_report(period_type=period_type, until=daily_occ)  # type: ignore[arg-type]
+        fired.append(f"{period_type}:refresh")
+        log.info(
+            "worker.summary_scheduler.refreshed",
+            period_type=period_type,
+            scheduled_for=daily_occ.isoformat(),
+            event_count=count,
         )
     return fired
 
@@ -572,7 +645,10 @@ async def summary_scheduler_loop(
 ) -> None:
     """Fire weekly/monthly summary reports on schedule — replaces the n8n cron.
 
-    Weekly: Monday 08:00 UTC. Monthly: 1st of month 08:00 UTC. Checks every
+    Weekly release: Monday 00:00 in ``REPORT_TIMEZONE``. Monthly release: 1st of
+    month 00:00 in the same zone (Kyiv by default — 21:00/22:00 UTC the day
+    before). Report CONTENT is refreshed daily at the same local midnight
+    (no Slack post). Checks every
     ``interval_seconds``; the per-slot DB dedup (``summary_exists_since``) makes
     firing idempotent across restarts and overlapping ticks. Per-iteration errors
     are logged and swallowed so one bad run doesn't kill the loop; cancellation

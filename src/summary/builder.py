@@ -1281,8 +1281,9 @@ function showTab(name) {
   function tick() {
     var panel = document.getElementById('panel-daily');
     if (!panel || !panel.querySelector('[data-daily-live]')) { arm(); return; }
-    /* day=today, not the rendered date — an open tab crossing UTC midnight
-       must roll onto the new day rather than freeze on the old one. */
+    /* day=today, not the rendered date — an open tab crossing local midnight
+       (REPORT_TIMEZONE, resolved server-side) must roll onto the new day rather
+       than freeze on the old one. */
     var url = location.pathname.replace(/\\/+$/, '') + '/daily?day=today';
     fetch(url, { credentials: 'same-origin', cache: 'no-store' })
       .then(function(r) { return r.ok ? r.text() : null; })

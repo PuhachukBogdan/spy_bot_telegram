@@ -28,7 +28,7 @@ from aiogram.types import (
 from src.config import settings
 from src.db.client import acquire_connection
 from src.db.models import Chat
-from src.db.queries.etc import find_internal_user_by_telegram_id
+from src.db.queries.etc import get_internal_user_by_telegram_id_any
 from src.db.queries.messages import insert_message, update_message_triggers
 from src.db.queries.queue import enqueue_chat_analysis, enqueue_task
 from src.pipeline.tier1 import MatchResult, pattern_cache
@@ -215,16 +215,25 @@ def _sender_name(message: Message) -> str | None:
 async def _resolve_sender_role(conn: asyncpg.Connection, message: Message) -> str:
     """Classify the sender as internal / partner / anonymous_admin / unknown.
 
-    A real user is ``internal`` if their Telegram id maps to an enabled
-    ``internal_users`` row, else ``partner``; other bots are ``unknown``. A
-    ``sender_chat`` equal to the chat itself is an ``anonymous_admin`` posting on
-    the group's behalf (CLAUDE.md 11.8); any other ``sender_chat`` (e.g. a linked
-    channel) is ``unknown``.
+    A real user is ``internal`` if their Telegram id maps to ANY ``internal_users``
+    row, else ``partner``; other bots are ``unknown``. A ``sender_chat`` equal to
+    the chat itself is an ``anonymous_admin`` posting on the group's behalf
+    (CLAUDE.md 11.8); any other ``sender_chat`` (e.g. a linked channel) is
+    ``unknown``.
+
+    Deliberately uses the enabled-*agnostic* lookup, unlike the access gate. Being
+    staff and being allowed to use the bot are different facts, and conflating them
+    corrupts risk analysis: when an employee is disabled (offboarded, suspended),
+    the enabled-only lookup silently reclassifies their messages as ``partner``, and
+    the Tier-2 contract then reasons from a false premise — a real farewell message
+    from an internal manager was analysed as "Partner announces their last day at
+    Beton.win" and fired five bogus ``partner_churn`` findings. Role attribution
+    must reflect who someone *is*; ``enabled`` stays the access decision only.
     """
     if message.from_user is not None:
         if message.from_user.is_bot:
             return "unknown"
-        internal = await find_internal_user_by_telegram_id(conn, message.from_user.id)
+        internal = await get_internal_user_by_telegram_id_any(conn, message.from_user.id)
         return "internal" if internal is not None else "partner"
     if message.sender_chat is not None:
         if message.sender_chat.id == message.chat.id:

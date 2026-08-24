@@ -13,7 +13,7 @@ import hmac
 import html as _html
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Literal
 
 from aiogram.types import Update
@@ -40,6 +40,12 @@ from src.db.queries.summaries import (  # noqa: E402
     get_latest_summary_html,
     get_summary_by_share_token,
 )
+from src.importer.retro_report import (  # noqa: E402
+    load_findings,
+    load_latest_run_id,
+    load_run_summary,
+    render_report,
+)
 from src.pipeline.ops_alerts.scheduler import start_ops_alerts, stop_ops_alerts  # noqa: E402
 from src.pipeline.tier1 import pattern_cache  # noqa: E402
 from src.pipeline.workers import (  # noqa: E402
@@ -48,6 +54,7 @@ from src.pipeline.workers import (  # noqa: E402
     failed_alert_retry_loop,
     file_analysis_worker_loop,
     pattern_reload_loop,
+    report_timezone,
     stale_task_reaper_loop,
     storage_monitor_loop,
     summary_scheduler_loop,
@@ -390,12 +397,19 @@ async def _render_daily_panel(day_arg: str | None) -> str:
     two can never drift. The digest is computed live from aggregate SQL (no LLM,
     nothing cached), so every call reflects the DB as of right now; an invalid
     or out-of-range ``day`` silently falls back to today.
+
+    "Today" and the day boundaries are LOCAL to ``REPORT_TIMEZONE`` (Kyiv), the
+    same zone the weekly/monthly slots fire in — so every date shown anywhere in
+    the dashboard means the same calendar day. The window is still one 24h span,
+    just aligned to local midnight instead of UTC midnight.
     """
-    today = datetime.now(UTC).date()
+    tz = report_timezone()
+    now_local = datetime.now(tz)
+    today = now_local.date()
     day, _err = resolve_digest_day(day_arg, today)
     if day is None:
         day = today
-    day_start = datetime(day.year, day.month, day.day, tzinfo=UTC)
+    day_start = datetime(day.year, day.month, day.day, tzinfo=tz)
     day_end = day_start + timedelta(days=1)
     async with acquire_connection() as conn:
         digest = await get_daily_digest(conn, day_start, day_end)
@@ -404,7 +418,7 @@ async def _render_daily_panel(day_arg: str | None) -> str:
         digest=digest,
         min_day=(today - timedelta(days=DIGEST_MAX_AGE_DAYS)).isoformat(),
         max_day=today.isoformat(),
-        generated_at=datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC"),
+        generated_at=now_local.strftime(f"%Y-%m-%d %H:%M {now_local.tzname() or ''}").strip(),
     )
 
 
@@ -490,6 +504,100 @@ async def post_dashboard_auth(
     redirect = RedirectResponse(url=f"/dashboard/{share_token}", status_code=303)
     redirect.set_cookie(
         key=_auth_cookie("d", share_token),
+        value="1",
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=_COOKIE_MAX_AGE,
+    )
+    return redirect
+
+
+# --- archive review: one permanent link, outside the report rotation -----------
+# The weekly/monthly dashboard mints a new token on every generation and revokes the
+# previous one, so its URL is deliberately short-lived. The archive review is the
+# opposite: one link, fixed forever, that always renders the newest retro run. It
+# therefore lives on its own route with its own credentials and touches none of the
+# `summaries` / `dashboards` token machinery.
+
+
+def _archive_credentials() -> tuple[str, str] | None:
+    """``(token, password)`` if the permanent link is enabled, else ``None``."""
+    token = settings.ARCHIVE_REPORT_TOKEN
+    password = settings.ARCHIVE_REPORT_PASSWORD
+    if token is None or password is None:
+        return None
+    token_value = token.get_secret_value()
+    password_value = password.get_secret_value()
+    if not token_value or not password_value:
+        return None
+    return token_value, password_value
+
+
+async def _render_archive_review() -> str | None:
+    """Render the newest retro run, or ``None`` when no run has completed."""
+    async with acquire_connection() as conn:
+        run_id = await load_latest_run_id(conn)
+        if run_id is None:
+            return None
+        summary = await load_run_summary(conn, run_id)
+        findings = await load_findings(conn, run_id)
+    return render_report(summary, findings)
+
+
+@app.get("/archive/{token}")
+async def get_archive_review(token: str, request: Request) -> Response:
+    """Serve the archive risk review on its permanent link.
+
+    Rendered live from ``archive_retro_findings`` rather than served from a stored
+    snapshot, so a finding a human later marks reviewed is reflected the next time
+    the link is opened — a fixed URL that showed a frozen copy would drift away from
+    the data it claims to report.
+    """
+    credentials = _archive_credentials()
+    if credentials is None:
+        return Response(status_code=404)
+    expected_token, _ = credentials
+    # Constant-time: the token is the only thing guarding a permanent URL.
+    if not hmac.compare_digest(token, expected_token):
+        return Response(status_code=404)
+
+    if request.cookies.get(_auth_cookie("archive", token)) != "1":
+        return Response(
+            content=_pw_form(title="Archive Risk Review", action=f"/archive/{token}"),
+            media_type="text/html",
+        )
+
+    html = await _render_archive_review()
+    if html is None:
+        return Response(
+            content=_pw_form(title="Archive Risk Review — not yet generated",
+                             action=f"/archive/{token}"),
+            media_type="text/html",
+            status_code=404,
+        )
+    return Response(content=html, media_type="text/html")
+
+
+@app.post("/archive/{token}")
+async def post_archive_auth(token: str, pw: str = Form("")) -> Response:
+    """Verify the archive password; on success set the cookie and redirect to GET."""
+    credentials = _archive_credentials()
+    if credentials is None:
+        return Response(status_code=404)
+    expected_token, expected_pw = credentials
+    if not hmac.compare_digest(token, expected_token):
+        return Response(status_code=404)
+    if not pw or not hmac.compare_digest(pw, expected_pw):
+        return Response(
+            content=_pw_form(
+                title="Archive Risk Review", action=f"/archive/{token}", error=True
+            ),
+            media_type="text/html",
+        )
+    redirect = RedirectResponse(url=f"/archive/{token}", status_code=303)
+    redirect.set_cookie(
+        key=_auth_cookie("archive", token),
         value="1",
         httponly=True,
         secure=True,

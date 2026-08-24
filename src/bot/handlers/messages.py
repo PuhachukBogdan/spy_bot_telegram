@@ -22,7 +22,7 @@ from aiogram.types import Message
 from src.bot.topics import effective_topic_id
 from src.db.client import acquire_connection
 from src.db.queries.chat_events import insert_chat_event
-from src.db.queries.chats import get_chat_unit, update_chat_telegram_id
+from src.db.queries.chats import get_chat_unit, migrate_chat_telegram_id
 from src.pipeline.ingest import ingest_message
 from src.utils.logging import get_logger
 
@@ -41,12 +41,18 @@ async def on_migration(message: Message) -> None:
     The service message arrives in the OLD chat (still active), carrying the new
     supergroup id. We record a ``migration`` event, then move the chat's
     ``telegram_chat_id`` so messages under the new id keep resolving.
+
+    Event and repoint share ONE transaction. They used to be separate autocommits,
+    which is how the prod failure stayed invisible: the event committed, the
+    repoint then raised on the unique constraint (see
+    ``migrate_chat_telegram_id``), and the surviving evidence — a ``migration``
+    event on a unit that never moved — read like a successful migration.
     """
     new_id = message.migrate_to_chat_id
     if new_id is None:  # guarded by the filter; defensive for the type checker
         return
     old_id = message.chat.id
-    async with acquire_connection() as conn:
+    async with acquire_connection() as conn, conn.transaction():
         # Migration is group-level: record against the group-level unit, then
         # move every topic unit of the supergroup to the new id.
         chat = await get_chat_unit(conn, old_id, None)
@@ -57,8 +63,21 @@ async def on_migration(message: Message) -> None:
                 event_type="migration",
                 payload={"old_chat_id": old_id, "new_chat_id": new_id},
             )
-        moved = await update_chat_telegram_id(conn, old_id, new_id)
-    log.info("chat.migrated", old_chat_id=old_id, new_chat_id=new_id, units_moved=moved)
+        outcome = await migrate_chat_telegram_id(conn, old_id, new_id)
+    log.info(
+        "chat.migrated",
+        old_chat_id=old_id,
+        new_chat_id=new_id,
+        units_moved=outcome.units_moved,
+        duplicates_parked=outcome.units_parked,
+    )
+    if outcome.units_moved == 0:
+        # Nothing to repoint means we never tracked the old id — worth surfacing,
+        # because the alternative reading (a migration we silently failed to apply)
+        # is exactly the bug this handler had.
+        log.warning(
+            "chat.migrated.no_units", old_chat_id=old_id, new_chat_id=new_id
+        )
 
 
 @router.message(F.new_chat_members)

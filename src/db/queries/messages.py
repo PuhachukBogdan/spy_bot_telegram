@@ -250,6 +250,21 @@ async def get_chat_analysis_window(
     strictly older than the first new one, for the LLM to read the lead-up.
     Soft-deleted messages (``deleted_at`` set) are excluded. Returns ``([], [])``
     when there is nothing new.
+
+    **Imported rows are excluded from both lists** (``source <> 'imported'``). The
+    archive import loads ~57k historical messages, and the watermark alone does not
+    contain them: ``since`` is NULL for a chat that has never been analysed (16
+    active chats, plus every unit the importer creates), which makes *every* message
+    in it "new" and would push the whole archive through Tier-2 — blowing the daily
+    budget and firing alerts about conversations from 2025. Historical analysis is a
+    deliberate, separately-prompted one-off pass, never the live path.
+
+    The predicate excludes the one non-live value rather than listing the live ones.
+    ``source`` records *how* a message arrived — ``live_group`` / ``live_topic`` /
+    ``business``, plus ``live`` on a handful of pre-0006 rows — so an allow-list
+    would silently drop whole delivery paths (matching on ``'live'`` alone would
+    have hidden 3 421 of the 3 427 real messages) and would need editing every time
+    a new unit type appears.
     """
     new_rows = await conn.fetch(
         """
@@ -257,6 +272,7 @@ async def get_chat_analysis_window(
         WHERE chat_id = $1
           AND ($2::timestamptz IS NULL OR created_at > $2)
           AND deleted_at IS NULL
+          AND source <> 'imported'
         ORDER BY created_at ASC
         LIMIT $3
         """,
@@ -272,6 +288,7 @@ async def get_chat_analysis_window(
         """
         SELECT * FROM messages
         WHERE chat_id = $1 AND created_at < $2 AND deleted_at IS NULL
+          AND source <> 'imported'
         ORDER BY created_at DESC
         LIMIT $3
         """,

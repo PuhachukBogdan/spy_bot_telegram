@@ -248,6 +248,8 @@ async def summary_exists_since(
     conn: asyncpg.Connection,
     period_type: str,
     since: datetime,
+    *,
+    delivered_only: bool = False,
 ) -> bool:
     """True if a summary of this period_type was generated at/after ``since``.
 
@@ -256,11 +258,21 @@ async def summary_exists_since(
     means that slot was already handled, so the loop must not re-generate or
     re-post it. Keyed on ``created_at`` (not ``period_start``, which the rolling
     window varies per run).
+
+    ``delivered_only`` selects which question is being asked:
+
+    * ``True`` — "was a report RELEASED since the slot?" (guards the weekly /
+      monthly Slack post + link rotation). Only ``delivery_status='delivered'``
+      rows count, so a daily content refresh — which deliberately leaves its row
+      ``'pending'`` — cannot silently suppress the Monday release.
+    * ``False`` — "is the stored content already fresh since the slot?" (guards
+      the daily refresh). Any row counts, including a release that just ran.
     """
+    clause = " AND delivery_status = 'delivered'" if delivered_only else ""
     row = await conn.fetchrow(
-        """
+        f"""
         SELECT 1 FROM summaries
-        WHERE period_type = $1 AND created_at >= $2
+        WHERE period_type = $1 AND created_at >= $2{clause}
         LIMIT 1
         """,
         period_type,

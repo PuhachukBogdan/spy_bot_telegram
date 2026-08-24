@@ -23,7 +23,9 @@ that would reveal the monitoring layer to a manager (cover posture).
 from __future__ import annotations
 
 import re
+from uuid import UUID
 
+import asyncpg
 from aiogram import Bot, Router
 from aiogram.enums import ChatType
 from aiogram.filters import JOIN_TRANSITION, LEAVE_TRANSITION, ChatMemberUpdatedFilter
@@ -31,6 +33,10 @@ from aiogram.types import ChatMemberUpdated
 
 from src.bot.notify import format_auto_active_notice, notify_admins, notify_admins_pending
 from src.db.client import acquire_connection
+from src.db.queries.archive import (
+    attach_archived_history,
+    find_archived_unit_for_aff_ids,
+)
 from src.db.queries.audit import insert_audit_log
 from src.db.queries.chats import bind_partner_to_chat, create_active_chat, create_pending_chat
 from src.db.queries.etc import (
@@ -51,6 +57,68 @@ router = Router(name="onboarding")
 # maps to the owner manager (internal_users.aff_id), and is optional. Whatever
 # remains is the partner name.
 _BRAND_RE = re.compile(r"beton\.?win", re.IGNORECASE)
+
+# Every 4–6 digit id in a title, not just the first. `_parse_chat_title` keeps only
+# the leading one (that is all the owner-manager lookup needs), but a chat can serve
+# several affiliates — "LEGENDS | Betonwin | 58329 | 71862 | 74849" — and its
+# imported history may be filed under any of them.
+_AFF_ID_RE = re.compile(r"\b(\d{4,6})\b")
+
+
+def _title_aff_ids(title: str | None) -> list[str]:
+    """All affiliate ids in a chat title, in order, de-duplicated."""
+    return list(dict.fromkeys(_AFF_ID_RE.findall(title or "")))
+
+
+async def _attach_archive_history(
+    conn: asyncpg.Connection, title: str | None, chat_id: UUID, actor_id: int | None
+) -> None:
+    """Move any imported history for this title onto the freshly-created unit.
+
+    Best-effort by design: the bot has just been added to a partner chat and that
+    must succeed whether or not an archive happens to exist. A failure here is
+    logged and swallowed, because losing the onboarding over a history merge would
+    be a far worse outcome than a chat that starts without its backlog — the merge
+    is idempotent and can simply be re-run.
+    """
+    aff_ids = _title_aff_ids(title)
+    if not aff_ids:
+        return
+    try:
+        unit = await find_archived_unit_for_aff_ids(conn, aff_ids)
+        if unit is None:
+            return
+        result = await attach_archived_history(
+            conn, source_chat_id=unit.id, target_chat_id=chat_id
+        )
+        await insert_audit_log(
+            conn,
+            action="archive_history_attached",
+            actor_user_id=actor_id,
+            target_entity="chat",
+            target_id=chat_id,
+            payload={
+                "from_archive_unit": str(unit.id),
+                "import_aff_id": unit.import_aff_id,
+                "messages_moved": result.messages_moved,
+                "messages_left": result.messages_left,
+                "events_moved": result.events_moved,
+            },
+        )
+        log.info(
+            "onboarding.archive_attached",
+            chat_id=str(chat_id),
+            aff_id=unit.import_aff_id,
+            moved=result.messages_moved,
+            left=result.messages_left,
+        )
+    except asyncpg.PostgresError as exc:
+        log.warning(
+            "onboarding.archive_attach_failed",
+            chat_id=str(chat_id),
+            aff_ids=aff_ids,
+            error=str(exc),
+        )
 
 
 def _parse_chat_title(title: str | None) -> tuple[str, str] | None:
@@ -175,6 +243,12 @@ async def on_bot_added(event: ChatMemberUpdated, bot: Bot) -> None:
             if created is None:
                 log.info("onboarding.already_known", chat_id=chat.id)
                 return
+
+        # Whether the unit went active or pending, its imported backlog belongs to
+        # it now — otherwise the chat starts empty and months of context stay
+        # stranded in a placeholder no report reads.
+        await _attach_archive_history(conn, chat.title, created.id, actor_id)
+
         admins = await list_admin_users(conn)
 
     if adder is not None:

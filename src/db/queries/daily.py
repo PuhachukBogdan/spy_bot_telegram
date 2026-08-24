@@ -1,9 +1,12 @@
 """DB queries for the daily digest — the first tab of the reports dashboard.
 
 Direct aggregate SQL (no LLM — fast + cheap) over messages / risk_events / chats /
-partners for a single UTC calendar-day window ``[day_start, day_end)``. Nothing is
-cached or stored: every call re-aggregates, which is what lets the current-day
-panel be re-fetched hourly by an open dashboard.
+partners for a single calendar-day window ``[day_start, day_end)``. The caller
+supplies the bounds as aware timestamps — ``main._render_daily_panel`` builds them
+from local midnight in ``REPORT_TIMEZONE`` (Kyiv), matching the zone the
+weekly/monthly slots fire in. Nothing is cached or stored: every call
+re-aggregates, which is what lets the current-day panel be re-fetched hourly by
+an open dashboard.
 
 The digest carries risk-event counts, so it lives behind the password-gated
 ``/dashboard/{token}`` surface (there is no Telegram ``/daily`` command).
@@ -81,15 +84,23 @@ async def get_daily_digest(
     day_start: datetime,
     day_end: datetime,
 ) -> DailyDigest:
-    """Aggregate one UTC day's activity into a :class:`DailyDigest`.
+    """Aggregate one calendar day's activity into a :class:`DailyDigest`.
 
     ``active_managers`` counts the DISTINCT humans who authorised chats that saw
     traffic that day (``chats.authorized_by`` → the real managing people), NOT the
     per-affiliate ``internal_users`` role=manager stubs.
+
+    Every count excludes ``source = 'imported'``. This is a report on what the
+    monitoring observed on a given day, and imported archive rows carry the
+    timestamps of the original conversation — 131 of them fall in August 2026 — so
+    without the guard, opening the digest for a day inside the archive's range would
+    silently mix backfilled history into "messages today" with nothing to explain
+    the jump.
     """
     messages_total = (
         await conn.fetchval(
-            "SELECT COUNT(*)::int FROM messages WHERE created_at >= $1 AND created_at < $2",
+            "SELECT COUNT(*)::int FROM messages "
+            "WHERE created_at >= $1 AND created_at < $2 AND source <> 'imported'",
             day_start,
             day_end,
         )
@@ -97,7 +108,8 @@ async def get_daily_digest(
     significant = (
         await conn.fetchval(
             "SELECT COUNT(*)::int FROM messages "
-            "WHERE created_at >= $1 AND created_at < $2 AND is_significant = true",
+            "WHERE created_at >= $1 AND created_at < $2 AND is_significant = true "
+            "AND source <> 'imported'",
             day_start,
             day_end,
         )
@@ -113,6 +125,7 @@ async def get_daily_digest(
             JOIN chats c ON c.id = m.chat_id
             JOIN internal_users u ON u.id = c.authorized_by AND u.role = 'manager'
             WHERE m.created_at >= $1 AND m.created_at < $2
+              AND m.source <> 'imported'
             """,
             day_start,
             day_end,
@@ -154,6 +167,7 @@ async def get_daily_digest(
         FROM messages m
         JOIN chats c ON c.id = m.chat_id
         WHERE m.created_at >= $1 AND m.created_at < $2
+          AND m.source <> 'imported'
         GROUP BY c.id, c.chat_name
         ORDER BY n DESC, c.chat_name
         """,

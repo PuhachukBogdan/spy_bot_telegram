@@ -65,19 +65,17 @@ class ReportResult:
     dashboard_password: str | None = field(default=None)
 
 
-async def generate_report(
-    *, period_type: Literal["weekly", "monthly"]
-) -> ReportResult:
-    """Build, persist, and announce one summary report.
+async def _collect_and_build(
+    period_type: Literal["weekly", "monthly"],
+    since: datetime,
+    until: datetime,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Query the window and render the report HTML. Returns (html, event_rows).
 
-    Returns a :class:`ReportResult` describing the dashboard URL, access
-    password, and whether the Slack announcement actually went out.
+    Shared by :func:`generate_report` (full release) and :func:`refresh_report`
+    (daily content refresh) so the two can never render different reports from
+    the same window.
     """
-    span = timedelta(days=7 if period_type == "weekly" else 30)
-    until = datetime.now(UTC)
-    since = until - span
-    expires_at = until + span
-
     async with acquire_connection() as conn:
         chats = await list_active_chats(conn)
         event_rows = await list_events_by_chat(conn, since, until)
@@ -106,6 +104,81 @@ async def generate_report(
         chats_added_dates=chats_added_dates,
         proposals_by_chat=proposals_by_chat,
     )
+    return html, event_rows
+
+
+async def refresh_report(
+    *,
+    period_type: Literal["weekly", "monthly"],
+    until: datetime | None = None,
+) -> int:
+    """Re-render the report for the current rolling window WITHOUT announcing it.
+
+    The daily counterpart to :func:`generate_report`: it stores a fresh summary
+    row and nothing else — no dashboard row, no Slack post, no link rotation, no
+    ``mark_summary_delivered``. ``/dashboard/{token}`` always renders the NEWEST
+    non-expired summary of each type, so the link already advertised in Slack
+    starts showing this content on the next page load. That is what lets a risk
+    event from yesterday evening be visible in the morning instead of waiting
+    for the next Monday release.
+
+    The row is left ``delivery_status='pending'``, which is precisely how
+    ``summary_exists_since`` tells a refresh from a release: a refresh must never
+    satisfy the release dedup, or the Monday Slack post would stop firing.
+    Already-released rows are never mutated, so an issued ``/r/{token}`` link
+    keeps serving the exact snapshot it was issued for.
+
+    Returns the number of risk events in the refreshed window.
+    """
+    span = timedelta(days=7 if period_type == "weekly" else 30)
+    until = until or datetime.now(UTC)
+    since = until - span
+
+    html, event_rows = await _collect_and_build(period_type, since, until)
+    async with acquire_connection() as conn:
+        await save_summary(
+            conn,
+            period_type=period_type,
+            period_start=since,
+            period_end=until,
+            rendered_html=html,
+            event_count=len(event_rows),
+            share_token=secrets.token_hex(32),
+            expires_at=until + span,
+            access_password=_gen_password(),
+        )
+    log.info(
+        "summary.refreshed",
+        period_type=period_type,
+        since=since.isoformat(),
+        until=until.isoformat(),
+        event_count=len(event_rows),
+    )
+    return len(event_rows)
+
+
+async def generate_report(
+    *,
+    period_type: Literal["weekly", "monthly"],
+    until: datetime | None = None,
+) -> ReportResult:
+    """Build, persist, and announce one summary report.
+
+    ``until`` is the exclusive end of the reporting window. The scheduler passes
+    the SCHEDULED slot instant (local midnight in ``REPORT_TIMEZONE``) so
+    consecutive windows are exactly contiguous — a tick that runs a few minutes
+    late must not leave a gap that no report covers. On-demand callers omit it
+    and get a window ending now.
+
+    Returns a :class:`ReportResult` describing the dashboard URL, access
+    password, and whether the Slack announcement actually went out.
+    """
+    span = timedelta(days=7 if period_type == "weekly" else 30)
+    until = until or datetime.now(UTC)
+    since = until - span
+    expires_at = until + span
+
+    html, event_rows = await _collect_and_build(period_type, since, until)
 
     report_pw = _gen_password()
     share_token = secrets.token_hex(32)

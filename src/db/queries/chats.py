@@ -13,7 +13,7 @@ controls the pool/transaction boundary.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import cast
+from typing import NamedTuple, cast
 from uuid import UUID
 
 import asyncpg
@@ -29,9 +29,16 @@ async def list_chats_overview(
 ) -> list[ChatOverview]:
     """List units with partner name + last activity for ``/chats``.
 
-    ``status`` filters by unit status (``None`` = all). ``owner_id`` restricts to
-    units of one manager's partners (admins pass ``None``). ``last_activity`` is
-    the latest message timestamp for the unit.
+    ``status`` filters by unit status (``None`` = all *monitored* units). ``owner_id``
+    restricts to units of one manager's partners (admins pass ``None``).
+    ``last_activity`` is the latest message timestamp for the unit.
+
+    With no ``status``, archive units are hidden. The archive importer creates ~116
+    ``archived`` placeholders for exports the bot was never added to, so listing
+    every status would nearly double ``/chats`` with rows that are not monitored
+    chats at all. An explicit ``status='archived'`` still returns them, so the
+    history stays reachable — it just is not the default answer to "show me the
+    chats".
     """
     rows = await conn.fetch(
         """
@@ -42,6 +49,7 @@ async def list_chats_overview(
         LEFT JOIN partners p ON p.id = c.partner_id
         LEFT JOIN messages m ON m.chat_id = c.id
         WHERE ($1::text IS NULL OR c.status = $1)
+          AND ($1::text IS NOT NULL OR c.status NOT IN ('archived', 'merged'))
           AND ($2::uuid IS NULL
                OR c.partner_id IN (
                    SELECT id FROM partners WHERE owner_manager_id = $2))
@@ -591,23 +599,107 @@ async def mark_chat_abandoned(
     return Chat.from_record(row) if row is not None else None
 
 
-async def update_chat_telegram_id(
+class ChatMigration(NamedTuple):
+    """Outcome of repointing a supergroup after a Telegram id migration."""
+
+    units_moved: int
+    #: Duplicate units that occupied the new id and were pushed aside as 'merged'.
+    units_parked: int
+
+
+async def migrate_chat_telegram_id(
     conn: asyncpg.Connection, old_telegram_chat_id: int, new_telegram_chat_id: int
-) -> int:
+) -> ChatMigration:
     """Repoint every unit of a supergroup to its new id after a migration.
 
     Telegram assigns a fresh chat id on group->supergroup migration; without this
     the old rows orphan and the new id looks unknown (CLAUDE.md 11.6). All topic
-    units of the supergroup move together (``topic_key`` is unchanged, so the new
-    ``(telegram_chat_id, topic_key)`` pairs stay unique). Returns the row count.
+    units of the supergroup move together (``topic_key`` is unchanged).
+
+    **Why this is not a bare UPDATE.** A migration produces two Telegram updates,
+    and they race: `my_chat_member` for the *new* supergroup usually arrives before
+    the `migrate_to_chat_id` service message in the *old* chat. `on_bot_added` then
+    creates a unit at the new id first — attributed to whoever triggered the
+    migration, i.e. normally the partner who owns the group, so it lands `pending`.
+    The later repoint then hits `UNIQUE (telegram_chat_id, topic_key)` and raises,
+    leaving the authoritative unit stranded on an id Telegram no longer routes to.
+    Observed in prod on **all three** migrations to date: the old unit kept reading
+    `active` while receiving nothing, the duplicate was swept to `abandoned` after
+    ``ABANDONED_CHAT_TIMEOUT_HOURS``, and the bot left the chat — so the partner
+    was silently unmonitored while every surface still showed a healthy chat.
+
+    So any unit already sitting at the new id with a `topic_key` we are about to
+    occupy is **parked onto the now-vacated old id and marked `'merged'`**. The
+    surviving row keeps its authorization, partner binding, watermark and history;
+    the duplicate stays queryable for audit (and `merged` is already hidden from
+    ``/chats``) instead of being deleted, which would trip the FKs that ten tables
+    hold on ``chats(id)``.
+
+    A unit at the new id whose `topic_key` does *not* collide is a genuinely new
+    forum topic and is left alone. Returns ``(0, 0)`` and touches nothing when the
+    old id holds no live units, which makes a repeat delivery of the service
+    message a no-op rather than a way to park a legitimate unit.
+
+    ``'merged'`` rows are excluded from *both* the survivor scan and the repoint.
+    They are the duplicates this function parked on a previous run, and counting
+    them as survivors inverts the whole thing: the old id would look occupied, so a
+    redelivered service message would park the freshly-migrated live unit and
+    re-create the outage. (Telegram retries webhooks, so that path is not
+    hypothetical — it is covered in ``tests/test_chat_migration.py``.)
+
+    Caller must supply a transaction: the park and the repoint have to commit
+    together or not at all.
     """
+    survivors = await conn.fetch(
+        "SELECT topic_key FROM chats "
+        "WHERE telegram_chat_id = $1 AND status <> 'merged'",
+        old_telegram_chat_id,
+    )
+    if not survivors:
+        return ChatMigration(0, 0)
+    survivor_topics = {row["topic_key"] for row in survivors}
+
+    colliding = [
+        row
+        for row in await conn.fetch(
+            "SELECT id, topic_key FROM chats WHERE telegram_chat_id = $1 "
+            "ORDER BY created_at",
+            new_telegram_chat_id,
+        )
+        if row["topic_key"] in survivor_topics
+    ]
+
+    # Park in two hops. The duplicates cannot go straight to the old id while the
+    # survivors still occupy it, and UNIQUE here is not DEFERRABLE, so a one-shot
+    # swap would transiently violate it. Hop 1 lands below every id in the table,
+    # which is guaranteed free; hop 2 lands on the old id once it is vacated.
+    if colliding:
+        floor = await conn.fetchval("SELECT min(telegram_chat_id) FROM chats")
+        parking = int(floor) if floor is not None else 0
+        for offset, row in enumerate(colliding, start=1):
+            await conn.execute(
+                "UPDATE chats SET telegram_chat_id = $2, status = 'merged' WHERE id = $1",
+                row["id"],
+                parking - offset,
+            )
+
     result = await conn.execute(
-        "UPDATE chats SET telegram_chat_id = $2 WHERE telegram_chat_id = $1",
+        "UPDATE chats SET telegram_chat_id = $2 "
+        "WHERE telegram_chat_id = $1 AND status <> 'merged'",
         old_telegram_chat_id,
         new_telegram_chat_id,
     )
     # asyncpg execute returns a tag like "UPDATE 3"; take the trailing count.
-    return int(result.split()[-1]) if result else 0
+    moved = int(result.split()[-1]) if result else 0
+
+    for row in colliding:
+        await conn.execute(
+            "UPDATE chats SET telegram_chat_id = $2 WHERE id = $1",
+            row["id"],
+            old_telegram_chat_id,
+        )
+
+    return ChatMigration(moved, len(colliding))
 
 
 # --- Admin panel (oversight: who connected which chats) ----------------------

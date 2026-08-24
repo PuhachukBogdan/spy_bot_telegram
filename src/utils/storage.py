@@ -50,3 +50,40 @@ async def upload_text(
     except httpx.HTTPError as exc:
         log.warning("storage.upload_error", path=path, error=str(exc))
         return False
+
+
+async def upload_bytes(
+    path: str,
+    data: bytes,
+    *,
+    content_type: str = "application/octet-stream",
+    timeout_s: float = 30.0,
+) -> bool:
+    """Upsert binary ``data`` to ``<bucket>/<path>``; ``True`` on success.
+
+    Same best-effort contract as :func:`upload_text` — never raises. Used by the
+    archive importer for the export's photos and documents, which are larger than
+    audit blobs, hence the longer default timeout.
+    """
+    base = settings.SUPABASE_URL.rstrip("/")
+    bucket = settings.SUPABASE_STORAGE_BUCKET
+    url = f"{base}/storage/v1/object/{bucket}/{path}"
+    key = settings.SUPABASE_SERVICE_KEY.get_secret_value()
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "apikey": key,
+        "Content-Type": content_type,
+        "x-upsert": "true",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            resp = await client.post(url, content=data, headers=headers)
+        if resp.status_code >= 300:
+            log.warning(
+                "storage.upload_failed", path=path, status=resp.status_code, bytes=len(data)
+            )
+            return False
+        return True
+    except httpx.HTTPError as exc:
+        log.warning("storage.upload_error", path=path, error=str(exc))
+        return False

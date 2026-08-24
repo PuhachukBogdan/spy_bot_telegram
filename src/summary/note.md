@@ -22,7 +22,10 @@ Alerts (real-time Slack dispatch) are unaffected — Phase 11 format stays as-is
 ## Delivery
 
 - Format: capability-URL link posted to Slack (SLACK_CHANNEL_REPORTS)
-- Trigger: in-process scheduler `workers.summary_scheduler_loop` (weekly Monday 08:00 UTC; monthly 1st of month 08:00 UTC). On-demand via POST /summary/generate.
+- Trigger: in-process scheduler `workers.summary_scheduler_loop`, all slots at **00:00 local time in `REPORT_TIMEZONE`** (Kyiv; = 21:00/22:00 UTC the day before, DST-dependent):
+  - release (Slack post + new link): weekly Monday, monthly 1st of month → `generate_report`
+  - content refresh (no Slack, no new link): every day → `refresh_report`, which stores a `'pending'` row that the dashboard picks up as the newest summary of its type
+- The window ends at the scheduled slot, not at tick time, so consecutive reports are exactly contiguous. On-demand via POST /summary/generate (window ends now).
 - LLM narrative (optional per-manager paragraph): model = LLM_MODEL_SUMMARY (claude-sonnet)
 
 ## This module (src/summary/)

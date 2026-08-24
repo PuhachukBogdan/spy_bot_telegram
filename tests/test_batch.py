@@ -13,6 +13,7 @@ from typing import Any
 from uuid import uuid4
 
 from src.config import settings
+from src.db.queries.messages import get_chat_analysis_window
 from src.db.queries.queue import enqueue_chat_analysis
 from src.llm.schemas import RiskAnalysis, RiskFinding
 from src.pipeline.batch_processor import prepare_scored_findings, should_defer_batch
@@ -157,3 +158,71 @@ def test_no_defer_when_nothing_significant() -> None:
     mk = Make()
     new = [mk.message_row(is_significant=False, text="")]
     assert should_defer_batch(new, now=datetime.now(UTC)) is False
+
+
+# --- imported history must never reach the live analysis window ---------------
+
+
+class _WindowConn:
+    """Records the SQL of every fetch so the window's filters can be asserted."""
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+        self.queries.append(query)
+        return []
+
+
+async def test_analysis_window_selects_live_rows_only() -> None:
+    """The archive import lockout, guarded structurally.
+
+    ~57k imported messages live in ``messages``. The watermark does not hold them
+    back: ``since`` is NULL for a never-analysed chat, which makes every row in it
+    "new". If this filter is dropped, the whole archive goes to Tier-2 — daily
+    budget gone, alerts raised about 2025 conversations. There is no cheap
+    behavioural test for raw SQL under the no-real-DB rule, so the guard is pinned
+    on the query text itself.
+
+    The predicate must EXCLUDE the archive value, not allow-list live ones:
+    ``source`` records the delivery path ('live_group' / 'live_topic' / 'business',
+    plus bare 'live' on a few pre-0006 rows), so ``source = 'live'`` would hide
+    3 421 of the 3 427 real messages and silently disable risk analysis outright.
+    """
+    conn = _WindowConn()
+    await get_chat_analysis_window(
+        conn,  # type: ignore[arg-type]
+        uuid4(),
+        since=None,
+        limit=50,
+        context_before=5,
+    )
+
+    assert conn.queries, "the window ran no query"
+    assert "source <> 'imported'" in conn.queries[0], (
+        "the 'new' selection must exclude imported history"
+    )
+    assert "source = 'live'" not in conn.queries[0], (
+        "an allow-list on 'live' drops live_group/live_topic/business entirely"
+    )
+
+
+async def test_analysis_window_context_excludes_imported_rows() -> None:
+    """Context must be live-only too, so a finding can never anchor on archive data."""
+    class _CtxConn(_WindowConn):
+        async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
+            self.queries.append(query)
+            # Return one row for the first ('new') query so the context query runs.
+            return [dict(Make().message_row().model_dump())] if len(self.queries) == 1 else []
+
+    conn = _CtxConn()
+    await get_chat_analysis_window(
+        conn,  # type: ignore[arg-type]
+        uuid4(),
+        since=None,
+        limit=50,
+        context_before=5,
+    )
+
+    assert len(conn.queries) == 2, "context query did not run"
+    assert "source <> 'imported'" in conn.queries[1]

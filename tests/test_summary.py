@@ -6,7 +6,7 @@ tested with monkeypatched collaborators.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -650,6 +650,7 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "revoked_keep": [],
         "superseded": [],
         "prev_dash": None,
+        "window": None,
     }
 
     chat_id = uuid4()
@@ -687,6 +688,7 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
                         share_token: Any, expires_at: Any,
                         access_password: Any) -> Any:
         rec["saved_html"] = rendered_html
+        rec["window"] = (period_start, period_end)
         return uuid4()
 
     async def fake_deliver(conn: Any, summary_id: Any) -> None:
@@ -754,6 +756,48 @@ async def test_generate_report_saves_html_and_returns_url(
     assert len(patched_generator["delivered"]) == 1
     assert result.dashboard_password is not None
     assert len(result.dashboard_password) == 8
+
+
+async def test_generate_report_window_pinned_to_explicit_until(
+    patched_generator: dict[str, Any],
+) -> None:
+    """The scheduler passes its slot instant; the window must end exactly there
+    (not at now()) so consecutive reports leave no uncovered gap."""
+    slot = datetime(2026, 6, 21, 21, 0, tzinfo=UTC)  # Mon 00:00 Kyiv
+    await gen_mod.generate_report(period_type="weekly", until=slot)
+    start, end = patched_generator["window"]
+    assert end == slot
+    assert start == slot - timedelta(days=7)
+
+
+async def test_refresh_report_stores_content_without_announcing(
+    patched_generator: dict[str, Any],
+) -> None:
+    """The daily refresh re-renders and saves, and does NOTHING else: no Slack
+    post, no new dashboard link, no revoke of the live one, no delivered stamp."""
+    slot = datetime(2026, 8, 3, 21, 0, tzinfo=UTC)  # 4 Aug 00:00 Kyiv
+    count = await gen_mod.refresh_report(period_type="weekly", until=slot)
+    assert count == 0  # fake_events returns no rows
+    assert patched_generator["saved_html"] is not None
+    assert "Weekly Risk Report" in patched_generator["saved_html"]
+    assert patched_generator["window"] == (slot - timedelta(days=7), slot)
+    # Nothing announced or rotated.
+    assert patched_generator["slack_posts"] == []
+    assert patched_generator["dashboard_pw"] is None
+    assert patched_generator["revoked_keep"] == []
+    assert patched_generator["superseded"] == []
+    # Left 'pending' on purpose — a refresh must not satisfy the release dedup.
+    assert patched_generator["delivered"] == []
+
+
+async def test_generate_report_window_defaults_to_now(
+    patched_generator: dict[str, Any],
+) -> None:
+    before = datetime.now(UTC)
+    await gen_mod.generate_report(period_type="monthly")
+    start, end = patched_generator["window"]
+    assert before <= end <= datetime.now(UTC)
+    assert end - start == timedelta(days=30)
 
 
 async def test_generate_report_revokes_old_links(
