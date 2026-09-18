@@ -105,6 +105,7 @@ from src.db.queries.partners import (
     update_partner_status,
 )
 from src.db.queries.patterns import load_enabled_patterns
+from src.metrics.scope import DASHBOARD_ROLES
 from src.utils.logging import get_logger
 from src.utils.session import issue_login_token
 from src.utils.workhours import parse_work_hours
@@ -239,13 +240,24 @@ def _help_for(role: str | None, *, full: bool = False) -> str:
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
-    """Greet the caller. Admins get the honest intro; everyone else the cover."""
+async def cmd_start(message: Message, command: CommandObject, **kwargs: Any) -> None:
+    """Greet the caller. Admins get the honest intro; everyone else the cover.
+
+    ``/start dashboard`` — what the sign-in page's button sends through the
+    ``t.me/<bot>?start=dashboard`` deep link — answers a report reader with a
+    one-time sign-in link, exactly like ``/dashboard``. For anyone else the
+    payload changes nothing: they get the same intro as a bare ``/start``, so
+    the cover holds and the page's button leaks nothing.
+    """
     user = message.from_user
     internal: InternalUser | None = None
     if user is not None:
         async with acquire_connection() as conn:
             internal = await find_internal_user_by_telegram_id(conn, user.id)
+    payload = (command.args or "").strip().lower()
+    if payload == "dashboard" and internal is not None and internal.role in DASHBOARD_ROLES:
+        await _send_dashboard_link(message, internal)
+        return
     is_admin = internal is not None and internal.role == "admin"
     await message.answer(_START_ADMIN if is_admin else _START_COVER)
 
@@ -1921,18 +1933,8 @@ def _parse_int(token: str | None) -> int | None:
 # non-admin can learn the report exists.
 
 
-@router.message(Command("dashboard"))
-@require_role("admin", "head")
-async def cmd_dashboard(message: Message, actor: InternalUser, **kwargs: Any) -> None:
-    """DM a one-time sign-in link for the report page.
-
-    The link carries a single-use token (15 minutes); opening it sets a 90-day
-    session cookie on that device, so this is a once-per-device errand rather
-    than a password to keep. Sending the command again simply issues another.
-
-    ``@require_role`` means a manager or viewer gets "Command not found." — the
-    cover holds: only people who may read the report learn it is there.
-    """
+async def _send_dashboard_link(message: Message, actor: InternalUser) -> None:
+    """DM ``actor`` a one-time sign-in link — shared by /dashboard and /start dashboard."""
     token = issue_login_token(actor.id)
     url = f"{settings.SERVER_BASE_URL.rstrip('/')}/auth/link/{token}"
     scope_note = (
@@ -1949,6 +1951,21 @@ async def cmd_dashboard(message: Message, actor: InternalUser, **kwargs: Any) ->
         disable_web_page_preview=True,
     )
     log.info("dm.dashboard_link", user=str(actor.id)[:8], role=actor.role)
+
+
+@router.message(Command("dashboard"))
+@require_role("admin", "head")
+async def cmd_dashboard(message: Message, actor: InternalUser, **kwargs: Any) -> None:
+    """DM a one-time sign-in link for the report page.
+
+    The link carries a single-use token (15 minutes); opening it sets a 90-day
+    session cookie on that device, so this is a once-per-device errand rather
+    than a password to keep. Sending the command again simply issues another.
+
+    ``@require_role`` means a manager or viewer gets "Command not found." — the
+    cover holds: only people who may read the report learn it is there.
+    """
+    await _send_dashboard_link(message, actor)
 
 
 @router.message(Command("set_role"))

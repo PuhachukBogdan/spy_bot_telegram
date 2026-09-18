@@ -268,6 +268,13 @@ class Settings(BaseSettings):
     # stop opening. Revocation does not wait for it — /disable_user and
     # /set_role take effect on the viewer's next request.
     DASHBOARD_SESSION_DAYS: int = 90
+    # The Telegram Login Widget on the sign-in page works only after the bot's
+    # owner has run /setdomain in BotFather for SERVER_BASE_URL's host; until
+    # then it renders "Bot domain invalid". Off by default, so the page leads
+    # with the route that needs nothing configured on Telegram's side — the
+    # deep link t.me/<bot>?start=dashboard, answered by the bot with a one-time
+    # sign-in link — and the widget is an addition, never a dependency.
+    DASHBOARD_TELEGRAM_WIDGET: bool = False
 
     # Slack member ID -> role, applied ONCE when that Slack account finishes
     # /register. The dashboard is for two or three people who are not going to

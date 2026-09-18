@@ -441,8 +441,9 @@ _bot_username: str | None = None
 async def _login_widget_username() -> str | None:
     """The bot's @username, or ``None`` when Telegram cannot be reached.
 
-    The widget is optional furniture: if this fails the login page still offers
-    the bot-link route, which is the path most people take anyway.
+    Used for the sign-in page's deep link (``t.me/<bot>?start=dashboard``) and,
+    when enabled, the Login Widget. If it fails the page still tells the reader
+    to open the bot and send ``/dashboard``.
     """
     global _bot_username
     if _bot_username is None:
@@ -456,18 +457,40 @@ async def _login_widget_username() -> str | None:
 
 
 def _login_page(bot_username: str | None, *, error: str | None = None) -> str:
-    """The sign-in page. Two ways in, both landing on the same session cookie."""
+    """The sign-in page: one route that always works, one that is optional.
+
+    The primary button is a Telegram deep link, ``t.me/<bot>?start=dashboard``.
+    It opens the bot, which answers ``/start dashboard`` with a one-time sign-in
+    link — exactly what ``/dashboard`` does — so a reader who lands here from the
+    weekly DM or the Slack post is two taps from the page, and nothing has to be
+    configured on Telegram's side for that to hold. The Login Widget is rendered
+    only when ``DASHBOARD_TELEGRAM_WIDGET`` is on: it depends on the bot owner
+    having run /setdomain in BotFather and otherwise shows "Bot domain invalid".
+    """
+    base = settings.SERVER_BASE_URL.rstrip("/")
+    if bot_username:
+        handle = _html.escape(bot_username)
+        primary = (
+            f'<a class="btn" href="https://t.me/{handle}?start=dashboard">'
+            "Sign in via Telegram</a>"
+            f'<p class="muted">Opens @{handle} in Telegram; it replies with a link '
+            "that signs you in on this device.</p>"
+        )
+        fallback = f"<p>Or open a chat with @{handle} and send <code>/dashboard</code>.</p>"
+    else:
+        primary = ""
+        fallback = (
+            "<p>Open a chat with the bot and send <code>/dashboard</code> — it replies "
+            "with a link that signs you in on this device.</p>"
+        )
     widget = (
+        '<hr class="sep">'
         '<script async src="https://telegram.org/js/telegram-widget.js?22" '
         f'data-telegram-login="{_html.escape(bot_username)}" data-size="large" '
-        f'data-auth-url="{_html.escape(settings.SERVER_BASE_URL.rstrip("/"))}'
-        '/auth/telegram" data-request-access="write"></script>'
-        if bot_username
-        else '<p class="muted">Telegram login is unavailable right now — '
-        "use the bot link below.</p>"
-    )
-    bot_hint = (
-        f"@{_html.escape(bot_username)}" if bot_username else "the monitoring bot"
+        f'data-auth-url="{_html.escape(base)}/auth/telegram" '
+        'data-request-access="write"></script>'
+        if bot_username and settings.DASHBOARD_TELEGRAM_WIDGET
+        else ""
     )
     err = f'<p class="err">{_html.escape(error)}</p>' if error else ""
     return (
@@ -483,17 +506,17 @@ def _login_page(bot_username: str | None, *, error: str | None = None) -> str:
         "h1{font-size:18px;font-weight:700;margin:0 0 6px;color:#0f172a}"
         "p{color:#64748b;font-size:13.5px;line-height:1.6;margin:0 0 14px}"
         ".muted{color:#94a3b8;font-size:12.5px}"
+        ".btn{display:block;text-align:center;background:#229ed9;color:#fff;"
+        "text-decoration:none;font-weight:600;font-size:14.5px;padding:12px 16px;"
+        "border-radius:8px;margin:14px 0 8px}"
+        ".btn:hover{background:#1d8bc1}"
         ".sep{border:0;border-top:1px solid #e2e8f0;margin:20px 0}"
         "code{background:#f1f5f9;padding:2px 6px;border-radius:5px;font-size:12.5px}"
         ".err{color:#b91c1c;font-size:12.5px}"
         "</style></head><body>"
         '<div class="card"><h1>Team summary</h1>'
         "<p>Sign in with the Telegram account you use at work.</p>"
-        f"{widget}"
-        '<hr class="sep">'
-        f"<p>Or open a chat with {bot_hint} and send <code>/dashboard</code> — "
-        "it replies with a link that signs you in on this device.</p>"
-        f"{err}"
+        f"{primary}{fallback}{widget}{err}"
         "</div></body></html>"
     )
 
