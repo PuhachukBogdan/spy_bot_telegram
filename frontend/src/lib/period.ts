@@ -38,6 +38,31 @@ export interface MetricSource {
   truncated: boolean
 }
 
+/** Offline waits as a share of ALL waits that started in the period.
+ *
+ * Every wait ends in exactly one of two places: rated (answered in-window, on
+ * time or late) or offline (nobody answered inside the offline threshold). So
+ * `offline + slaRated` is every wait there was, and this share answers "how
+ * many percent of the hundred" — which the bare count never could.
+ *
+ * It is deliberately NOT the SLA percentage's complement: SLA divides by the
+ * rated waits only, because absence is not slowness. The two denominators
+ * differ on purpose and the page says so.
+ */
+export function offlineShareOf(offline: number, slaRated: number): number | null {
+  const waits = offline + slaRated
+  return waits > 0 ? Math.round((1000 * offline) / waits) / 10 : null
+}
+
+export function offlineShare(p: MetricSource): number | null {
+  return offlineShareOf(p.offline, p.slaRated)
+}
+
+/** Total waits that started in the period — the denominator of offlineShare. */
+export function totalWaits(p: MetricSource): number {
+  return p.offline + p.slaRated
+}
+
 /* ── ISO-date helpers (dates compare lexicographically, so strings suffice) ── */
 export function addDays(iso: string, days: number): string {
   const d = new Date(`${iso}T00:00:00Z`)
@@ -166,13 +191,17 @@ export function computeRange(
  * must render correctly with no stored value — every access is wrapped. */
 const COLLAPSE_KEY = 'preview.sections.v1'
 
-export type SectionId = 'risks' | 'chats'
+export type SectionId = 'risks' | 'chats' | 'tone' | 'howto'
 
 /** Sections closed by default on first visit: the chat list is the longest
- * block on the dossier, so it starts collapsed until the viewer opens it. */
+ * block on the dossier, so it starts collapsed until the viewer opens it. The
+ * reading guide starts open — a first-time viewer needs it; a returning one
+ * folds it once and the choice sticks. */
 const DEFAULT_COLLAPSED: Record<SectionId, boolean> = {
   risks: false,
   chats: true,
+  tone: true,
+  howto: false,
 }
 
 export function loadCollapsed(): Record<SectionId, boolean> {
@@ -188,9 +217,14 @@ export function loadCollapsed(): Record<SectionId, boolean> {
   return { ...DEFAULT_COLLAPSED }
 }
 
-export function saveCollapsed(state: Record<SectionId, boolean>): void {
+/** Persist ONE section's state, merged onto what is stored. Two components
+ * (the dossier, the reading guide) each hold their own copy of the record, so
+ * writing a whole snapshot from either would clobber the other's latest
+ * toggle with a stale value. */
+export function persistCollapsed(id: SectionId, value: boolean): void {
   try {
-    localStorage.setItem(COLLAPSE_KEY, JSON.stringify(state))
+    const stored = loadCollapsed()
+    localStorage.setItem(COLLAPSE_KEY, JSON.stringify({ ...stored, [id]: value }))
   } catch {
     /* storage unavailable — the toggle still works for this visit */
   }

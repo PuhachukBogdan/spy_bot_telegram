@@ -1,6 +1,47 @@
+import type { ReactNode } from 'react'
+
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import type { UnitType, WorkHours } from '@/data'
+
+/** A section header that folds its body. The longest blocks (risk cards, the
+ * chat table, the reading guide) hide behind these so the page opens readable;
+ * the chosen state persists across visits via localStorage (best-effort — a
+ * blocked store just means defaults). The header keeps its count, so a folded
+ * section still says how much it is hiding. */
+export function FoldableTitle({
+  open,
+  onToggle,
+  className = 'mb-2 mt-6 text-[12px]',
+  children,
+}: {
+  open: boolean
+  onToggle: () => void
+  /** Spacing + size overrides; the default is the dossier section header. */
+  className?: string
+  children: ReactNode
+}) {
+  return (
+    <button
+      onClick={onToggle}
+      aria-expanded={open}
+      className={`flex w-full items-center gap-1.5 text-left font-display uppercase tracking-widest text-primary transition-colors hover:text-foreground ${className}`}
+    >
+      <span
+        aria-hidden="true"
+        className={`inline-block text-[10px] transition-transform ${open ? 'rotate-90' : ''}`}
+      >
+        ▶
+      </span>
+      <span>{children}</span>
+      {!open ? (
+        <span className="ml-1 font-mono text-[9px] normal-case tracking-wider text-muted-foreground">
+          — click to expand
+        </span>
+      ) : null}
+    </button>
+  )
+}
 
 /** A percentage, or an explicit dash — never 0, which would read as failure. */
 export function Pct({ value }: { value: number | null }) {

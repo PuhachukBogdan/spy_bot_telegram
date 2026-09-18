@@ -30,14 +30,17 @@ from src.alerts.slack_callbacks import handle_slack_action, verify_slack_signatu
 from src.bot.instance import bot, dp  # noqa: E402  (after setup_logging on purpose)
 from src.config import settings  # noqa: E402
 from src.db.client import acquire_connection, close_pool, get_pool  # noqa: E402
+from src.db.models import InternalUser  # noqa: E402
 from src.db.queries.daily import (  # noqa: E402
     DIGEST_MAX_AGE_DAYS,
     get_daily_digest,
     resolve_digest_day,
 )
+from src.db.queries.etc import (  # noqa: E402
+    find_internal_user_by_telegram_id,
+    get_internal_user_by_id,
+)
 from src.db.queries.summaries import (  # noqa: E402
-    dashboard_token_known,
-    get_dashboard_by_token,
     get_latest_summary_html,
     get_summary_by_share_token,
 )
@@ -49,6 +52,7 @@ from src.importer.retro_report import (  # noqa: E402
 )
 from src.metrics.cache import preview_cache  # noqa: E402
 from src.metrics.preview import build_preview  # noqa: E402
+from src.metrics.scope import DASHBOARD_ROLES, scope_for  # noqa: E402
 from src.pipeline.ops_alerts.scheduler import start_ops_alerts, stop_ops_alerts  # noqa: E402
 from src.pipeline.tier1 import pattern_cache  # noqa: E402
 from src.pipeline.workers import (  # noqa: E402
@@ -61,10 +65,18 @@ from src.pipeline.workers import (  # noqa: E402
     stale_task_reaper_loop,
     storage_monitor_loop,
     summary_scheduler_loop,
+    tone_worker_loop,
     whisper_worker_loop,
 )
 from src.summary.builder import build_daily_card, build_dashboard_html  # noqa: E402
 from src.summary.generator import generate_report  # noqa: E402
+from src.utils.session import (  # noqa: E402
+    SESSION_COOKIE,
+    consume_login_token,
+    sign_session,
+    verify_session,
+    verify_telegram_login,
+)
 
 log = get_logger(__name__)
 
@@ -145,13 +157,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stale_task_reaper_loop(), name="stale_task_reaper"
     )
     summary_task = asyncio.create_task(
-        summary_scheduler_loop(), name="summary_scheduler"
+        summary_scheduler_loop(bot), name="summary_scheduler"
     )
     failed_alert_task = asyncio.create_task(
         failed_alert_retry_loop(bot), name="failed_alert_retry"
     )
     storage_task = asyncio.create_task(
         storage_monitor_loop(bot), name="storage_monitor"
+    )
+    tone_task = asyncio.create_task(
+        tone_worker_loop(bot), name="tone_worker"
     )
     ops_alerts_tasks = start_ops_alerts(bot)
     log.info("startup.whisper.worker", enabled=settings.WHISPER_ENABLED)
@@ -163,6 +178,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         threshold_pct=settings.STORAGE_ALERT_THRESHOLD_PERCENT,
     )
     log.info("startup.ops_alerts.worker", enabled=settings.OPS_ALERTS_ENABLED)
+    log.info(
+        "startup.tone.worker",
+        enabled=settings.TONE_ANALYSIS_ENABLED,
+        model=settings.LLM_MODEL_TONE,
+    )
 
     try:
         yield
@@ -171,7 +191,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         bg_tasks = (
             cleanup_task, pattern_task, whisper_task, analysis_task,
             file_task, reaper_task, summary_task, failed_alert_task,
-            storage_task,
+            storage_task, tone_task,
         )
         for task in bg_tasks:
             task.cancel()
@@ -321,28 +341,6 @@ def _pw_form(*, title: str, action: str, error: bool = False) -> str:
     )
 
 
-def _superseded_page() -> str:
-    """Shown when a dashboard token exists but was retired by a newer report."""
-    return (
-        "<!DOCTYPE html>"
-        '<html lang="en"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        "<title>Report superseded</title>"
-        "<style>"
-        "body{font-family:system-ui,sans-serif;background:#f4f5f7;"
-        "display:flex;align-items:center;justify-content:center;height:100vh;margin:0}"
-        ".card{background:#fff;border-radius:12px;padding:36px 40px;width:380px;"
-        "text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.1)}"
-        "h1{font-size:18px;font-weight:700;margin-bottom:10px;color:#0f172a}"
-        "p{color:#64748b;font-size:13.5px;line-height:1.6}"
-        "</style></head><body>"
-        '<div class="card"><h1>This report link has been replaced</h1>'
-        "<p>A newer report has since been generated. Open the latest report "
-        "message in your Slack reports channel to view the current dashboard.</p>"
-        "</div></body></html>"
-    )
-
-
 @app.get("/r/{share_token}")
 async def get_report(share_token: str, request: Request) -> Response:
     """Serve a pre-rendered HTML report by its capability token.
@@ -425,95 +423,200 @@ async def _render_daily_panel(day_arg: str | None) -> str:
     )
 
 
-async def _dashboard_gate(
-    share_token: str, request: Request
-) -> Response | None:
-    """Shared access check for every /dashboard/{token} page.
+# --- dashboard: one URL, a signed-in viewer, a page scoped to their role ------
+# Until 2026-09-11 the dashboard was a rotating capability URL plus one password
+# shared in Slack. That design cannot answer "who is reading", and the `head`
+# role is defined by the answer: a department lead sees every manager EXCEPT
+# themselves. So the link is now fixed and carries no secret, and the viewer
+# signs in as a person — by tapping a one-time link the bot DMs them, or through
+# Telegram's Login Widget. Old tokenised URLs redirect here rather than 404, so
+# links already sitting in Slack keep working.
 
-    Returns a Response to short-circuit with (superseded notice, 404, or the
-    password form), or ``None`` when the caller may serve content. POST
-    /dashboard/{token} verifies the password and sets the auth cookie; a fresh
-    tab (no cookie) always sees the prompt.
+_DASHBOARD_URL = "/dashboard"
+
+#: Cached bot @username for the Login Widget; resolved once per process.
+_bot_username: str | None = None
+
+
+async def _login_widget_username() -> str | None:
+    """The bot's @username, or ``None`` when Telegram cannot be reached.
+
+    The widget is optional furniture: if this fails the login page still offers
+    the bot-link route, which is the path most people take anyway.
     """
+    global _bot_username
+    if _bot_username is None:
+        try:
+            me = await bot.get_me()
+        except Exception as exc:  # noqa: BLE001 — any failure means "no widget"
+            log.warning("dashboard.bot_username_unavailable", error=str(exc))
+            return None
+        _bot_username = me.username
+    return _bot_username
+
+
+def _login_page(bot_username: str | None, *, error: str | None = None) -> str:
+    """The sign-in page. Two ways in, both landing on the same session cookie."""
+    widget = (
+        '<script async src="https://telegram.org/js/telegram-widget.js?22" '
+        f'data-telegram-login="{_html.escape(bot_username)}" data-size="large" '
+        f'data-auth-url="{_html.escape(settings.SERVER_BASE_URL.rstrip("/"))}'
+        '/auth/telegram" data-request-access="write"></script>'
+        if bot_username
+        else '<p class="muted">Telegram login is unavailable right now — '
+        "use the bot link below.</p>"
+    )
+    bot_hint = (
+        f"@{_html.escape(bot_username)}" if bot_username else "the monitoring bot"
+    )
+    err = f'<p class="err">{_html.escape(error)}</p>' if error else ""
+    return (
+        "<!DOCTYPE html>"
+        '<html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>Team summary</title>"
+        "<style>"
+        "body{font-family:system-ui,sans-serif;background:#f4f5f7;"
+        "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}"
+        ".card{background:#fff;border-radius:12px;padding:36px 40px;width:380px;"
+        "box-shadow:0 1px 3px rgba(0,0,0,.1)}"
+        "h1{font-size:18px;font-weight:700;margin:0 0 6px;color:#0f172a}"
+        "p{color:#64748b;font-size:13.5px;line-height:1.6;margin:0 0 14px}"
+        ".muted{color:#94a3b8;font-size:12.5px}"
+        ".sep{border:0;border-top:1px solid #e2e8f0;margin:20px 0}"
+        "code{background:#f1f5f9;padding:2px 6px;border-radius:5px;font-size:12.5px}"
+        ".err{color:#b91c1c;font-size:12.5px}"
+        "</style></head><body>"
+        '<div class="card"><h1>Team summary</h1>'
+        "<p>Sign in with the Telegram account you use at work.</p>"
+        f"{widget}"
+        '<hr class="sep">'
+        f"<p>Or open a chat with {bot_hint} and send <code>/dashboard</code> — "
+        "it replies with a link that signs you in on this device.</p>"
+        f"{err}"
+        "</div></body></html>"
+    )
+
+
+def _notice_page(title: str, body: str, *, status: int = 403) -> Response:
+    """A plain message page — wrong account, expired link, mode not available."""
+    html = (
+        "<!DOCTYPE html>"
+        '<html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"<title>{_html.escape(title)}</title>"
+        "<style>"
+        "body{font-family:system-ui,sans-serif;background:#f4f5f7;"
+        "display:flex;align-items:center;justify-content:center;height:100vh;margin:0}"
+        ".card{background:#fff;border-radius:12px;padding:36px 40px;width:380px;"
+        "text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.1)}"
+        "h1{font-size:18px;font-weight:700;margin-bottom:10px;color:#0f172a}"
+        "p{color:#64748b;font-size:13.5px;line-height:1.6}"
+        "a{color:#4f46e5}"
+        "</style></head><body>"
+        f'<div class="card"><h1>{_html.escape(title)}</h1><p>{body}</p></div>'
+        "</body></html>"
+    )
+    return Response(content=html, media_type="text/html", status_code=status)
+
+
+async def _session_user(request: Request) -> InternalUser | None:
+    """The signed-in viewer, or ``None``.
+
+    The cookie only asserts an id: the role and the enabled flag are re-read from
+    the database on every request, so ``/disable_user`` and ``/set_role`` take
+    effect on the person's next page load instead of whenever a 90-day cookie
+    happens to lapse.
+    """
+    claims = verify_session(request.cookies.get(SESSION_COOKIE))
+    if claims is None:
+        return None
     async with acquire_connection() as conn:
-        dash = await get_dashboard_by_token(conn, share_token)
-        if dash is None:
-            # Distinguish a retired link (superseded by a newer report) from an
-            # unknown one, so the user gets a helpful notice instead of a 404.
-            known = await dashboard_token_known(conn, share_token)
-        else:
-            known = True
-    if dash is None:
-        if known:
-            return Response(content=_superseded_page(), media_type="text/html")
-        return Response(status_code=404)
-    if request.cookies.get(_auth_cookie("d", share_token)) != "1":
+        user = await get_internal_user_by_id(conn, claims.user_id)
+    if user is None or not user.enabled or user.role not in DASHBOARD_ROLES:
+        return None
+    return user
+
+
+def _sign_in(user: InternalUser) -> RedirectResponse:
+    """Set the session cookie and land on the dashboard."""
+    redirect = RedirectResponse(url=_DASHBOARD_URL, status_code=303)
+    redirect.set_cookie(
+        key=SESSION_COOKIE,
+        value=sign_session(user.id, user.role),
+        httponly=True,
+        secure=True,
+        # Lax, not Strict: the sign-in arrives as a top-level navigation from
+        # telegram.org (widget) or from the Telegram client (bot link), and
+        # Strict would drop the cookie on exactly that first hop.
+        samesite="lax",
+        max_age=settings.DASHBOARD_SESSION_DAYS * 86400,
+    )
+    log.info("dashboard.signed_in", user=str(user.id)[:8], role=user.role)
+    return redirect
+
+
+@app.get("/dashboard")
+async def get_dashboard(request: Request) -> Response:
+    """The Team summary, scoped to whoever is signed in."""
+    user = await _session_user(request)
+    if user is None:
         return Response(
-            content=_pw_form(
-                title="Risk Reports Dashboard",
-                action=f"/dashboard/{share_token}",
-            ),
+            content=_login_page(await _login_widget_username()),
             media_type="text/html",
         )
-    return None
+    return Response(
+        content=await build_preview(
+            fresh=request.query_params.get("fresh") == "1",
+            include_tone=True,
+            scope=scope_for(user),
+        ),
+        media_type="text/html",
+    )
 
 
-@app.get("/dashboard/{share_token}")
-async def get_dashboard(share_token: str, request: Request) -> Response:
-    """The Team summary — the dashboard link's front page since 2026-08-25.
-
-    The Phase 2 stand's layout released to production: the link already posted
-    to Slack keeps working, but now opens the manager metrics page (rendered
-    live, period-driven, React shell) with the classic risk report one segment
-    away at /dashboard/{token}/risk. Same token, same password, same cookie.
-    """
-    gate = await _dashboard_gate(share_token, request)
-    if gate is not None:
-        return gate
-    fresh = request.query_params.get("fresh") == "1"
-    return Response(content=await build_preview(fresh=fresh), media_type="text/html")
-
-
-@app.get("/dashboard/{share_token}/risk")
-async def get_dashboard_risk(share_token: str, request: Request) -> Response:
+@app.get("/dashboard/risk")
+async def get_dashboard_risk(request: Request) -> Response:
     """The classic risk report — weekly/monthly tabs + live daily digest.
 
-    Exactly what the dashboard root served before 2026-08-25, now skinned and
-    headed as the second mode of the page (system fonts, mirrored mode switch).
+    Admin only. It is rendered from stored HTML snapshots, which cannot be
+    re-scoped per viewer, so there is no way to show a head everyone's cases but
+    their own here — the Team summary's per-manager cards are their risk surface.
     """
-    gate = await _dashboard_gate(share_token, request)
-    if gate is not None:
-        return gate
+    user = await _session_user(request)
+    if user is None:
+        return Response(
+            content=_login_page(await _login_widget_username()),
+            media_type="text/html",
+        )
+    if user.role != "admin":
+        return _notice_page(
+            "Not available",
+            'The risk report is admin-only. <a href="/dashboard">Back to the '
+            "Team summary</a>.",
+        )
     day_arg = request.query_params.get("day")
     page = await _render_risk_report(
         day_arg,
-        team_url=f"/dashboard/{share_token}",
+        team_url=_DASHBOARD_URL,
         subtitle="weekly &middot; monthly &middot; daily",
-        # Token-specific key: the page embeds team_url, and serving one token's
-        # cached page to another token's viewer would leak the other URL.
-        cache_key=f"risk:dash:{share_token}:{day_arg or 'today'}",
+        cache_key=f"risk:dash:{day_arg or 'today'}",
         fresh=request.query_params.get("fresh") == "1",
     )
     return Response(content=page, media_type="text/html")
 
 
-@app.get("/dashboard/{share_token}/daily")
-@app.get("/dashboard/{share_token}/risk/daily")
-async def get_dashboard_daily(share_token: str, request: Request) -> Response:
-    """Daily-digest panel fragment — polled once an hour by an open dashboard.
+@app.get("/dashboard/daily")
+@app.get("/dashboard/risk/daily")
+async def get_dashboard_daily(request: Request) -> Response:
+    """Daily-digest panel fragment — polled once an hour by an open report.
 
     Returns the panel HTML only (no page shell), so the browser swaps it in
-    place instead of reloading: the active tab and scroll position survive.
-    Same cookie gate as the dashboard itself; a retired token 404s, which stops
-    the polling. Registered on both paths because the polling URL is built
-    path-relative (``location.pathname + '/daily'``) and the risk report now
-    lives one segment deeper.
+    place instead of reloading: the active tab and scroll position survive. A
+    401 stops the polling, which is what should happen once a session lapses.
     """
-    async with acquire_connection() as conn:
-        dash = await get_dashboard_by_token(conn, share_token)
-    if dash is None:
-        return Response(status_code=404)
-    if request.cookies.get(_auth_cookie("d", share_token)) != "1":
+    user = await _session_user(request)
+    if user is None or user.role != "admin":
         return Response(status_code=401)
     return Response(
         content=await _render_daily_panel(request.query_params.get("day")),
@@ -522,34 +625,80 @@ async def get_dashboard_daily(share_token: str, request: Request) -> Response:
     )
 
 
-@app.post("/dashboard/{share_token}")
-async def post_dashboard_auth(
-    share_token: str, pw: str = Form("")
-) -> Response:
-    """Verify dashboard password; on success set auth cookie and redirect to GET."""
-    async with acquire_connection() as conn:
-        dash = await get_dashboard_by_token(conn, share_token)
-    if dash is None:
-        return Response(status_code=404)
-    if not pw or not hmac.compare_digest(pw, str(dash["access_password"])):
+@app.get("/auth/telegram")
+async def auth_telegram(request: Request) -> Response:
+    """Telegram Login Widget callback: verify the signature, start a session."""
+    telegram_id = verify_telegram_login(dict(request.query_params))
+    if telegram_id is None:
         return Response(
-            content=_pw_form(
-                title="Risk Reports Dashboard",
-                action=f"/dashboard/{share_token}",
-                error=True,
+            content=_login_page(
+                await _login_widget_username(),
+                error="That sign-in could not be verified. Please try again.",
             ),
             media_type="text/html",
         )
-    redirect = RedirectResponse(url=f"/dashboard/{share_token}", status_code=303)
-    redirect.set_cookie(
-        key=_auth_cookie("d", share_token),
-        value="1",
-        httponly=True,
-        secure=True,
-        samesite="strict",
-        max_age=_COOKIE_MAX_AGE,
-    )
+    async with acquire_connection() as conn:
+        user = await find_internal_user_by_telegram_id(conn, telegram_id)
+    if user is None or user.role not in DASHBOARD_ROLES:
+        log.info("dashboard.login_refused", telegram_id=telegram_id)
+        return _notice_page(
+            "No access",
+            "This Telegram account is not set up to view the report. "
+            "Ask an administrator to grant access.",
+        )
+    return _sign_in(user)
+
+
+@app.get("/auth/link/{token}")
+async def auth_link(token: str) -> Response:
+    """One-time link from the bot: redeem it and start a session."""
+    user_id = consume_login_token(token)
+    if user_id is None:
+        return _notice_page(
+            "Link expired",
+            "Sign-in links are valid for 15 minutes and can be used once. "
+            "Send <b>/dashboard</b> to the bot for a fresh one.",
+            status=410,
+        )
+    async with acquire_connection() as conn:
+        user = await get_internal_user_by_id(conn, user_id)
+    if user is None or not user.enabled or user.role not in DASHBOARD_ROLES:
+        return _notice_page(
+            "No access",
+            "This account is not set up to view the report.",
+        )
+    return _sign_in(user)
+
+
+@app.get("/logout")
+async def logout() -> Response:
+    """Drop the session cookie on this device."""
+    redirect = RedirectResponse(url=_DASHBOARD_URL, status_code=303)
+    redirect.delete_cookie(SESSION_COOKIE)
     return redirect
+
+
+# Legacy tokenised URLs. Every one of them is in somebody's Slack history or
+# browser history; redirecting costs two lines and saves a support question.
+# Declared AFTER the fixed paths so "/dashboard/risk" is never read as a token.
+
+
+@app.get("/dashboard/{share_token}")
+async def get_dashboard_legacy(share_token: str) -> Response:
+    return RedirectResponse(url=_DASHBOARD_URL, status_code=307)
+
+
+@app.get("/dashboard/{share_token}/risk")
+async def get_dashboard_risk_legacy(share_token: str) -> Response:
+    return RedirectResponse(url="/dashboard/risk", status_code=307)
+
+
+@app.get("/dashboard/{share_token}/daily")
+@app.get("/dashboard/{share_token}/risk/daily")
+async def get_dashboard_daily_legacy(share_token: str) -> Response:
+    # A page left open on an old URL polls this; 404 stops it, and its next
+    # reload lands on the redirect above.
+    return Response(status_code=404)
 
 
 # --- archive review: one permanent link, outside the report rotation -----------
@@ -646,45 +795,10 @@ async def post_archive_auth(token: str, pw: str = Form("")) -> Response:
     return redirect
 
 
-# --- Phase 2 preview stand ----------------------------------------------------
-# A separate link for reviewing the new manager metrics while the live
-# weekly/monthly report keeps running untouched. Same shape as the archive link:
-# fixed token + password, fail-closed, rendered live on request. It writes
-# nothing, posts nothing to Slack, and shares no table or token with `summaries`
-# / `dashboards`, so it cannot disturb the report already in production.
-
-
-def _preview_credentials() -> tuple[str, str] | None:
-    """``(token, password)`` if the preview stand is enabled, else ``None``."""
-    token = settings.PREVIEW_REPORT_TOKEN
-    password = settings.PREVIEW_REPORT_PASSWORD
-    if token is None or password is None:
-        return None
-    token_value = token.get_secret_value()
-    password_value = password.get_secret_value()
-    if not token_value or not password_value:
-        return None
-    return token_value, password_value
-
-
-@app.get("/preview/{token}")
-async def get_preview(token: str, request: Request) -> Response:
-    """Serve the Phase 2 metrics preview, rendered live from the database."""
-    credentials = _preview_credentials()
-    if credentials is None:
-        return Response(status_code=404)
-    expected_token, _ = credentials
-    if not hmac.compare_digest(token, expected_token):
-        return Response(status_code=404)
-
-    if request.cookies.get(_auth_cookie("preview", token)) != "1":
-        return Response(
-            content=_pw_form(title="Phase 2 Preview", action=f"/preview/{token}"),
-            media_type="text/html",
-        )
-    fresh = request.query_params.get("fresh") == "1"
-    return Response(content=await build_preview(fresh=fresh), media_type="text/html")
-
+# --- the report shell's risk mode --------------------------------------------
+# Retired 2026-09-11: the /preview stand (fixed token + password in .env) was a
+# second, unscoped door to the admin view. The dashboard is now per-viewer, so
+# the stand had nothing left to show that /dashboard does not.
 
 def _stand_header(team_url: str, subtitle: str) -> str:
     """A header strip mirroring the Team summary's, injected above the tabs.
@@ -814,63 +928,6 @@ async def _render_risk_report(
                 page = page[: body_end + 1] + header + page[body_end + 1 :]
     preview_cache.put(cache_key, page)
     return page
-
-
-@app.get("/preview/{token}/risk")
-async def get_preview_risk(token: str, request: Request) -> Response:
-    """The production risk report, served read-only on the preview stand.
-
-    One known difference from the production risk mode: the daily tab's hourly
-    self-refresh polls ``/preview/{token}/risk/daily``, which does not exist —
-    content is as of page load.
-    """
-    credentials = _preview_credentials()
-    if credentials is None:
-        return Response(status_code=404)
-    expected_token, _ = credentials
-    if not hmac.compare_digest(token, expected_token):
-        return Response(status_code=404)
-    if request.cookies.get(_auth_cookie("preview", token)) != "1":
-        # The password form lives on the main preview URL; one gate, one cookie.
-        return RedirectResponse(url=f"/preview/{token}", status_code=303)
-
-    day_arg = request.query_params.get("day")
-    page = await _render_risk_report(
-        day_arg,
-        team_url=f"/preview/{token}",
-        subtitle="production report &middot; live copy on the stand",
-        cache_key=f"risk:preview:{day_arg or 'today'}",
-        fresh=request.query_params.get("fresh") == "1",
-    )
-    return Response(content=page, media_type="text/html")
-
-
-@app.post("/preview/{token}")
-async def post_preview_auth(token: str, pw: str = Form("")) -> Response:
-    """Verify the preview password; on success set the cookie and redirect to GET."""
-    credentials = _preview_credentials()
-    if credentials is None:
-        return Response(status_code=404)
-    expected_token, expected_pw = credentials
-    if not hmac.compare_digest(token, expected_token):
-        return Response(status_code=404)
-    if not pw or not hmac.compare_digest(pw, expected_pw):
-        return Response(
-            content=_pw_form(
-                title="Phase 2 Preview", action=f"/preview/{token}", error=True
-            ),
-            media_type="text/html",
-        )
-    redirect = RedirectResponse(url=f"/preview/{token}", status_code=303)
-    redirect.set_cookie(
-        key=_auth_cookie("preview", token),
-        value="1",
-        httponly=True,
-        secure=True,
-        samesite="strict",
-        max_age=_COOKIE_MAX_AGE,
-    )
-    return redirect
 
 
 def _json(payload: dict[str, object], status_code: int = 200) -> Response:

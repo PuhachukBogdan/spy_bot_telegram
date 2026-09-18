@@ -48,6 +48,7 @@ from src.db.queries.summaries import summary_exists_since
 from src.pipeline.batch_processor import process_analysis_task
 from src.pipeline.file_processor import process_file_task
 from src.pipeline.tier1 import pattern_cache
+from src.pipeline.tone import ToneRunStats, pending_days, run_tone_pass
 from src.pipeline.transcription import process_whisper_task
 from src.summary.generator import generate_report, refresh_report
 from src.utils.logging import get_logger
@@ -562,7 +563,7 @@ def _last_monthly_occurrence(now: datetime) -> datetime:
     return occ.astimezone(UTC)
 
 
-async def run_summary_scheduler_tick() -> list[str]:
+async def run_summary_scheduler_tick(bot: Bot | None = None) -> list[str]:
     """One scheduler pass: release any due report, then refresh today's content.
 
     Two kinds of work, both at 00:00 local (``REPORT_TIMEZONE``):
@@ -575,6 +576,9 @@ async def run_summary_scheduler_tick() -> list[str]:
       of each type, so the link already in Slack starts showing it. Without this
       a risk event detected after Monday morning stayed invisible in the weekly
       report until the following Monday.
+
+    ``bot`` is passed straight to :func:`generate_report`, which uses it to DM
+    the report's readers; a tick without one still releases, just silently.
 
     Returns what fired this tick (for tests/observability): ``"weekly"`` for a
     release, ``"weekly:refresh"`` for a content refresh. A slot fires only if its
@@ -606,7 +610,7 @@ async def run_summary_scheduler_tick() -> list[str]:
             period_type=period_type,
             scheduled_for=occ.isoformat(),
         )
-        result = await generate_report(period_type=period_type, until=occ)  # type: ignore[arg-type]
+        result = await generate_report(period_type=period_type, until=occ, bot=bot)  # type: ignore[arg-type]
         fired.append(period_type)
         log.info(
             "worker.summary_scheduler.done",
@@ -641,6 +645,7 @@ async def run_summary_scheduler_tick() -> list[str]:
 
 
 async def summary_scheduler_loop(
+    bot: Bot | None = None,
     interval_seconds: int = _SUMMARY_SCHEDULER_INTERVAL_SECONDS,
 ) -> None:
     """Fire weekly/monthly summary reports on schedule — replaces the n8n cron.
@@ -657,10 +662,75 @@ async def summary_scheduler_loop(
     log.info("worker.summary_scheduler.start", interval_s=interval_seconds)
     while True:
         try:
-            await run_summary_scheduler_tick()
+            await run_summary_scheduler_tick(bot)
         except asyncio.CancelledError:
             log.info("worker.summary_scheduler.stop")
             raise
         except Exception as exc:  # never let one bad tick kill the loop
             log.error("worker.summary_scheduler.error", error=str(exc))
         await asyncio.sleep(interval_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Tone-of-voice daily pass (Phase 2, track F)
+# ---------------------------------------------------------------------------
+
+
+async def run_tone_tick(bot: Bot) -> ToneRunStats | None:
+    """One pass over every finished local day that still has unprocessed chat-days.
+
+    Returns ``None`` when nothing ran — the feature is off, the global LLM budget
+    gate is closed, or no finished day is in range — else the pass's stats.
+    """
+    if not settings.TONE_ANALYSIS_ENABLED:
+        return None
+    if await _budget_gate(bot, "tone"):
+        return None
+    tz = report_timezone()
+    today_local = datetime.now(UTC).astimezone(tz).date()
+    days = pending_days(
+        today_local,
+        backfill_days=settings.TONE_BACKFILL_DAYS,
+        epoch=settings.METRICS_EPOCH_DATE,
+    )
+    if not days:
+        return None
+    return await run_tone_pass(
+        acquire_connection,
+        days=days,
+        model=settings.LLM_MODEL_TONE,
+        budget_usd=settings.TONE_DAILY_BUDGET_USD,
+        tz=tz,
+    )
+
+
+async def tone_worker_loop(bot: Bot, interval_seconds: int | None = None) -> None:
+    """Judge yesterday's manager messages once the local day is over.
+
+    Idempotent per chat-day (``manager_tone_progress``), so the poll interval only
+    bounds how soon after local midnight the numbers appear — every later tick
+    finds nothing to do and costs one query. Per-tick errors are logged and
+    swallowed; cancellation propagates.
+    """
+    interval = interval_seconds or settings.TONE_POLL_INTERVAL_SECONDS
+    log.info("worker.tone.start", enabled=settings.TONE_ANALYSIS_ENABLED, interval_s=interval)
+    while True:
+        try:
+            stats = await run_tone_tick(bot)
+            if stats is not None and (stats.chat_days_done or stats.errors):
+                log.info(
+                    "worker.tone.tick",
+                    chat_days=stats.chat_days_done,
+                    calls=stats.calls,
+                    assessed=stats.assessed,
+                    flags=stats.flags,
+                    spent_usd=str(stats.cost_usd),
+                    budget_exhausted=stats.budget_exhausted,
+                    errors=len(stats.errors),
+                )
+        except asyncio.CancelledError:
+            log.info("worker.tone.stop")
+            raise
+        except Exception as exc:  # never let one bad tick kill the loop
+            log.error("worker.tone.error", error=str(exc))
+        await asyncio.sleep(interval)

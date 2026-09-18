@@ -44,6 +44,15 @@ _EXPECTED: dict[str, dict[str, list[str]]] = {
             "idx_retro_findings_unique",
         ],
     },
+    "0025": {
+        "tables": ["manager_tone_daily", "manager_tone_flags", "manager_tone_progress"],
+        "indexes": [
+            "idx_tone_daily_day",
+            "idx_tone_flags_manager_day",
+            "idx_tone_flags_day",
+            "idx_tone_progress_created",
+        ],
+    },
 }
 
 

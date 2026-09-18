@@ -82,8 +82,10 @@ def test_payload_shape() -> None:
     payload = _payload()
     assert set(payload) == {
         "generatedAt", "since", "until", "previous", "epoch", "thresholds",
-        "categories", "managers", "trends",
+        "categories", "managers", "trends", "tone", "viewer",
     }
+    # Default scope = an admin: the page labels itself and offers the risk mode.
+    assert payload["viewer"] == {"name": "", "role": "admin", "seesRiskReport": True}
     manager = payload["managers"][0]
     assert set(manager) == {
         "id", "name", "slaPercent", "slaMet", "slaRated", "slaOffline",

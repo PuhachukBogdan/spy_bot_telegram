@@ -6,8 +6,8 @@ Flow:
   1. Query DB: managers, heatmap, events for the period.
   2. Build HTML via builder.build_report_html().
   3. Save rendered HTML to summaries table (with access_password).
-  4. Create a dashboard row (share_token + password).
-  5. Post dashboard URL + password to Slack.
+  4. Create a dashboard row (records the release; the link itself is fixed).
+  5. Post the dashboard link to Slack — viewers sign in as themselves.
   6. Stamp delivery_status=delivered.
 """
 
@@ -18,10 +18,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+from aiogram import Bot
+
 from src.alerts.slack import get_slack_client
+from src.bot.notify import notify_internal_user
 from src.config import settings
 from src.db.client import acquire_connection
 from src.db.queries.activity_signals import count_proposals, list_proposal_dates
+from src.db.queries.etc import list_report_recipients
 from src.db.queries.summaries import (
     count_chats_added,
     count_proposals_by_chat,
@@ -161,6 +165,7 @@ async def generate_report(
     *,
     period_type: Literal["weekly", "monthly"],
     until: datetime | None = None,
+    bot: Bot | None = None,
 ) -> ReportResult:
     """Build, persist, and announce one summary report.
 
@@ -169,6 +174,10 @@ async def generate_report(
     consecutive windows are exactly contiguous — a tick that runs a few minutes
     late must not leave a gap that no report covers. On-demand callers omit it
     and get a window ending now.
+
+    ``bot``, when given, also DMs everyone who may read the report that a new
+    one is out. Optional so the on-demand HTTP route and scripts/trigger_summary
+    keep working without one; the scheduler always passes it.
 
     Returns a :class:`ReportResult` describing the dashboard URL, access
     password, and whether the Slack announcement actually went out.
@@ -215,7 +224,7 @@ async def generate_report(
     new_ts: str | None = None
     try:
         new_ts = await _post_slack_link(
-            period_type, since, until, len(event_rows), dashboard_url, dash_pw
+            period_type, since, until, len(event_rows), dashboard_url
         )
     except Exception as exc:
         slack_delivered = False
@@ -247,6 +256,9 @@ async def generate_report(
     async with acquire_connection() as conn:
         await mark_summary_delivered(conn, summary_id)
 
+    if bot is not None:
+        await _announce_to_readers(bot, period_type, since, until, len(event_rows))
+
     log.info(
         "summary.generated",
         period_type=period_type,
@@ -265,9 +277,63 @@ async def generate_report(
     )
 
 
+async def _announce_to_readers(
+    bot: Bot,
+    period_type: str,
+    since: datetime,
+    until: datetime,
+    event_count: int,
+) -> None:
+    """DM every admin and head that a new report is out. Never raises.
+
+    Why a DM and not just the Slack post: the Slack channel announces to whoever
+    is in the channel, while the address list here IS the permission — it is read
+    from ``internal_users`` at send time, so granting ``head`` adds a reader and
+    revoking it removes one, with no second list to keep in step.
+
+    The link is the plain, permanent ``/dashboard``, deliberately NOT a one-time
+    login token: those live 15 minutes in process memory, so a weekly message
+    carrying one would be dead by morning and dead again after any restart. A
+    session lasts 90 days against a weekly report, so this link normally opens
+    straight into the page; when it does not, the sign-in page is one tap.
+
+    Delivery is best-effort per person (``notify_internal_user`` swallows a
+    blocked or never-started chat): a report release must not fail because one
+    reader never opened the bot.
+    """
+    async with acquire_connection() as conn:
+        recipients = await list_report_recipients(conn)
+    if not recipients:
+        log.info("summary.dm.no_recipients", period_type=period_type)
+        return
+
+    label = "Weekly" if period_type == "weekly" else "Monthly"
+    noun = "signal" if event_count == 1 else "signals"
+    url = f"{settings.SERVER_BASE_URL.rstrip('/')}/dashboard"
+    text = (
+        f"\U0001F4CA <b>{label} team report</b>\n\n"
+        f"{since.strftime('%d %b')} \u2013 {until.strftime('%d %b %Y')} \u00b7 "
+        f"{event_count} risk {noun}\n\n"
+        f'<a href="{url}">Open the report</a>'
+    )
+    for user in recipients:
+        await notify_internal_user(bot, user, text)
+    log.info(
+        "summary.dm.sent", period_type=period_type, recipients=len(recipients)
+    )
+
+
 def _dashboard_url(dash_token: str) -> str:
+    """The link posted to Slack — fixed, and carrying no secret.
+
+    Since 2026-09-11 the dashboard identifies its reader instead of trusting a
+    token plus a shared password, so the URL is the same every week and what a
+    given person sees depends on who they signed in as. ``dash_token`` is still
+    minted and rotated (it records that a report was released, and old links
+    redirect here), it is simply no longer part of the address.
+    """
     base = settings.SERVER_BASE_URL.rstrip("/")
-    return f"{base}/dashboard/{dash_token}"
+    return f"{base}/dashboard"
 
 
 async def _supersede_message(channel: str, ts: str) -> None:
@@ -303,7 +369,6 @@ async def _post_slack_link(
     until: datetime,
     event_count: int,
     dashboard_url: str,
-    password: str,
 ) -> str:
     label = "Weekly" if period_type == "weekly" else "Monthly"
     channel = settings.SLACK_CHANNEL_REPORTS
@@ -313,7 +378,7 @@ async def _post_slack_link(
 
     fallback = (
         f"{label} Risk Report ({since_str} – {until_str}) is now available. "
-        f"{event_count} risk {noun} recorded. Password: {password}"
+        f"{event_count} risk {noun} recorded."
     )
     blocks: list[dict[str, Any]] = [
         {"type": "divider"},
@@ -333,13 +398,16 @@ async def _post_slack_link(
             "fields": [
                 {
                     "type": "mrkdwn",
-                    "text": f":key: *Access password:*\n`{password}`",
+                    "text": (
+                        ":key: *Sign in with Telegram*\nor send `/dashboard` "
+                        "to the bot for a link."
+                    ),
                 },
                 {
                     "type": "mrkdwn",
                     "text": (
-                        ":lock: *Access restricted* — do not forward "
-                        "this message outside the team."
+                        ":lock: *Personal access* — the page shows what your "
+                        "own account is allowed to see."
                     ),
                 },
             ],

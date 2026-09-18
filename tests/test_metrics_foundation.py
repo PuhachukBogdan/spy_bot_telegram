@@ -213,7 +213,10 @@ async def test_list_real_managers_excludes_stubs_disabled_and_test() -> None:
     # The stub discriminator — without it the axis fills with aff_id rows, which
     # is exactly what sank the manager-centric report in June.
     assert "jsonb_array_length(COALESCE(telegram_accounts, '[]'::jsonb)) > 0" in sql
-    assert "role = 'manager'" in sql
+    # 'head' belongs here: a department lead still owns chats and is still
+    # measured — the role changes what they may READ, not whether they count.
+    # Narrowing this to 'manager' deletes them from the page for everyone.
+    assert "role IN ('manager', 'head')" in sql
     assert "enabled = true" in sql
     assert "COALESCE(is_test, false) = false" in sql
 

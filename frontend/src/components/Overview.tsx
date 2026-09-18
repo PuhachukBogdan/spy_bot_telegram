@@ -2,6 +2,7 @@ import { useMemo } from 'react'
 import { Bar, BarChart, CartesianGrid, LabelList, XAxis, YAxis } from 'recharts'
 
 import { Meter, Pct, Stat, riskLabel } from '@/components/bits'
+import ToneBlock from '@/components/ToneBlock'
 import TrendBlock from '@/components/TrendBlock'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
@@ -22,6 +23,7 @@ import type { ReportData } from '@/data'
 import {
   computeRange,
   inRange,
+  offlineShareOf,
   periodLabel,
   type MetricSource,
   type PeriodRange,
@@ -197,6 +199,7 @@ export default function Overview({
     ? Math.round((rated.reduce((s, m) => s + (m.slaPercent ?? 0), 0) / rated.length) * 10) / 10
     : null
   const offline = data.managers.reduce((s, m) => s + m.slaOffline, 0)
+  const slaRatedAll = data.managers.reduce((s, m) => s + m.slaRated, 0)
   const chatsActive = data.managers.reduce((s, m) => s + m.chatsActive, 0)
   const chatsTotal = data.managers.reduce((s, m) => s + m.chatsTotal, 0)
   const risksOwn = data.managers.reduce((s, m) => s + m.risksOwn, 0)
@@ -292,7 +295,15 @@ export default function Overview({
             value={avgSla === null ? '—' : `${avgSla}%`}
             hint={`${rated.length} of ${data.managers.length} rated`}
           />
-          <Stat label="Offline waits" value={String(offline)} hint="excluded from SLA %" />
+          <Stat
+            label="Offline waits"
+            value={
+              offlineShareOf(offline, slaRatedAll) === null
+                ? String(offline)
+                : `${offline} / ${offlineShareOf(offline, slaRatedAll)}%`
+            }
+            hint={`of ${offline + slaRatedAll} waits · not in SLA %`}
+          />
           <Stat
             label="Active chats"
             value={chatsTotal ? `${Math.round((100 * chatsActive) / chatsTotal)}%` : '—'}
@@ -315,6 +326,19 @@ export default function Overview({
         <SlaChart rows={slaRows} />
         <CategoryChart categories={categories} />
       </div>
+
+      {/* Tone of voice: team gauges, rescoped to the same period. Not a risk
+          surface — nothing here ever alerts; it reads its own tables. */}
+      {data.tone ? (
+        <div className="mb-4">
+          <ToneBlock
+            tone={data.tone}
+            managerId={null}
+            range={range}
+            periodNote={range ? ` · ${periodLabel(period, range)}` : ''}
+          />
+        </div>
+      ) : null}
 
       {/* Few managers, four measures: a table with inline meters beats any chart —
           exact numbers, instant comparison, nothing truncated. */}
@@ -362,6 +386,13 @@ export default function Overview({
                     }`}
                   >
                     {r.offline}
+                    {/* The count alone never says "out of what" — the share of
+                        all waits does, and it is what compares between people. */}
+                    {offlineShareOf(r.offline, r.slaRated) !== null ? (
+                      <div className="num text-[11px] text-muted-foreground">
+                        {offlineShareOf(r.offline, r.slaRated)}% of waits
+                      </div>
+                    ) : null}
                   </TableCell>
                   <TableCell className="text-right">
                     <Pct value={r.coveragePercent} />

@@ -24,6 +24,7 @@ On a total Slack failure, hand off to :func:`handle_failed_alert`.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from html import escape as html_escape
 
 from aiogram import Bot
 
@@ -37,13 +38,16 @@ from src.alerts.slack import (
     update_alert,
 )
 from src.alerts.suppression import is_suppressed
+from src.bot.notify import notify_admins
 from src.config import settings
 from src.db.client import acquire_connection
 from src.db.models import Chat, RiskEvent
+from src.db.queries.etc import list_admin_users, list_head_telegram_ids
 from src.db.queries.messages import get_message_timestamp, get_messages_by_ids
 from src.db.queries.risk_events import list_case_events, set_slack_message_ts
 from src.db.queries.suppressions import list_active_suppressions
 from src.utils.logging import get_logger
+from src.utils.text import short_why
 
 log = get_logger(__name__)
 
@@ -71,6 +75,7 @@ async def _dispatch_one(
             conn, chat_id=chat.id, risk_type=event.risk_type
         )
         mention_prefix = await critical_mention_prefix(conn) if is_critical else ""
+        head_ids = await list_head_telegram_ids(conn)
 
     # Staff-suppressed signal (confirmed FP): the risk_event stays in the DB for
     # audit/report, but no Slack alert is posted. Narrow match — never a category.
@@ -82,12 +87,53 @@ async def _dispatch_one(
         )
         return
 
+    # A signal a department lead wrote themselves must not land in the Slack
+    # channel that same lead reads — the head role exists precisely so nobody
+    # reviews their own conduct. It is still persisted and still reported, just
+    # to the admins directly. Authorship, not chat ownership: the question is
+    # who wrote the flagged message.
+    if event.sender_id is not None and event.sender_id in head_ids:
+        await _route_to_admins(bot, chat, partner_name, event)
+        return
+
     if case_ts is None:
         await _open_case(bot, chat, partner_name, event, mention_prefix)
     else:
         await _update_case(
             bot, chat, partner_name, event, case_ts, mention_prefix, is_critical
         )
+
+
+async def _route_to_admins(
+    bot: Bot, chat: Chat, partner_name: str | None, event: RiskEvent
+) -> None:
+    """Deliver a head-authored signal to the admins by DM instead of Slack.
+
+    No Slack card at all — not a quieter one — because the alerts channel is a
+    shared surface and a card there cannot be scoped to an audience. Best-effort,
+    like every other notification path: a Telegram failure must never propagate
+    back into the analysis that produced the event.
+    """
+    label = chat.chat_name or str(chat.telegram_chat_id)
+    partner = f" · {partner_name}" if partner_name else ""
+    why = short_why(event.llm_explanation) if event.llm_explanation else ""
+    text = (
+        "🔒 <b>Risk signal by a department lead</b>\n"
+        "Not posted to the alerts channel.\n\n"
+        f"<b>{html_escape(label)}</b>{html_escape(partner)}\n"
+        f"{event.risk_type} · {event.risk_level} {event.final_score}\n"
+        f"{html_escape(why)}\n\n"
+        f"<code>/risk {str(event.id)[:8]}</code>"
+    )
+    async with acquire_connection() as conn:
+        admins = await list_admin_users(conn)
+    await notify_admins(bot, admins, text)
+    log.info(
+        "alert.head_authored_to_admins",
+        risk_event_id=str(event.id)[:8],
+        risk_type=event.risk_type,
+        admins=len(admins),
+    )
 
 
 async def _open_case(

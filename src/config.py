@@ -255,6 +255,63 @@ class Settings(BaseSettings):
     PREVIEW_REPORT_TOKEN: SecretStr | None = None
     PREVIEW_REPORT_PASSWORD: SecretStr | None = None
 
+    # === Dashboard sign-in (2026-09-11) ===
+    # The dashboard is no longer a shared token + password: a viewer signs in as
+    # themselves (Telegram Login Widget, or a one-time link the bot DMs) and the
+    # page is scoped to their role — see src/metrics/scope.py.
+    # Signing key for the session cookie. Left unset it is derived from the bot
+    # token, so no .env change is needed to deploy; setting (or changing) it
+    # invalidates every outstanding session, which is the way to force re-login.
+    DASHBOARD_SESSION_SECRET: SecretStr | None = None
+    # Long on purpose: these are two or three internal people on their own
+    # devices, and a page they have to re-authenticate weekly is a page they
+    # stop opening. Revocation does not wait for it — /disable_user and
+    # /set_role take effect on the viewer's next request.
+    DASHBOARD_SESSION_DAYS: int = 90
+
+    # Slack member ID -> role, applied ONCE when that Slack account finishes
+    # /register. The dashboard is for two or three people who are not going to
+    # be walked through a multi-step onboarding, so the grant makes their setup
+    # "send /register, paste your Slack ID, paste the code" and nothing else.
+    #
+    # What actually gates this is NOT the id in the list: the one-time code is
+    # delivered to that Slack account's DM, so only its owner can redeem an
+    # entry. Knowing someone else's member ID buys nothing.
+    #
+    # Lives in .env, never in the repo: these are personal identifiers and the
+    # tree is pushed to three GitHub remotes. Shape (one line):
+    #   REGISTRATION_ROLE_GRANTS={"U01234ABCDE": "admin"}
+    REGISTRATION_ROLE_GRANTS: dict[str, str] = {}
+
+    # === Tone of voice (Phase 2, track F — daily LLM review of manager wording) ===
+    # Kill switch. Off by default like OPS_ALERTS_ENABLED: a new LLM load is turned
+    # on deliberately after its cost has been measured, never by a deploy.
+    TONE_ANALYSIS_ENABLED: bool = False
+    # The judgement is "clear cases only", which a small model handles well, and
+    # the volume is a few dozen calls a day — switching to sonnet is one variable
+    # if the calibration review shows misses.
+    LLM_MODEL_TONE: str = "anthropic/claude-haiku-4-5"
+    # Ceiling for the pass per UTC day, checked against OpenRouter's REPORTED spend
+    # before each call. Separate from DAILY_LLM_BUDGET_USD (which it also counts
+    # toward) so a runaway day cannot eat the live pipeline's headroom.
+    TONE_DAILY_BUDGET_USD: Decimal = Decimal("2")
+    # Flags below this confidence are dropped client-side even if the model returns
+    # them — the prompt asks for 0.7; this enforces it rather than trusting it.
+    TONE_MIN_CONFIDENCE: float = 0.7
+    # A rate is shown only once this many manager messages were judged in the
+    # period; below it the page says "too few messages" instead of 1-in-3 = 33 %.
+    TONE_MIN_ASSESSED: int = 20
+    # How many FINISHED days a tick may reach back for unprocessed chat-days —
+    # covers an outage or a late enable without a separate backfill run. Today is
+    # never judged: a day must be over to be judged whole.
+    TONE_BACKFILL_DAYS: int = 7
+    TONE_POLL_INTERVAL_SECONDS: int = 900
+    # Lead-in context prepended to a day (the previous day's last messages), and
+    # the window / overlap a very long day is split into.
+    TONE_CONTEXT_MESSAGES: int = 10
+    TONE_WINDOW_MESSAGES: int = 100
+    TONE_WINDOW_OVERLAP: int = 10
+
     # === Ops Alerts (payment-provider incidents + Argentina holidays) ===
     # Master kill-switch: when false neither ops-alerts worker runs.
     OPS_ALERTS_ENABLED: bool = False
@@ -297,6 +354,23 @@ class Settings(BaseSettings):
     BOT_DM_LANGUAGE: str = "en"
     ENVIRONMENT: Literal["production", "staging", "dev"] = "production"
     LOG_LEVEL: str = "INFO"
+
+    @model_validator(mode="after")
+    def _normalise_role_grants(self) -> Settings:
+        """Upper-case the Slack ids and drop entries naming an unknown role.
+
+        A typo in .env must not silently grant something, and it must not take
+        the process down either: an unusable entry is dropped and the rest of
+        the map still works. Roles mirror migration 0026's CHECK constraint.
+        """
+        allowed = {"admin", "head", "manager", "viewer"}
+        cleaned: dict[str, str] = {}
+        for key, raw_role in self.REGISTRATION_ROLE_GRANTS.items():
+            role = raw_role.strip().lower()
+            if role in allowed:
+                cleaned[key.strip().upper()] = role
+        self.REGISTRATION_ROLE_GRANTS = cleaned
+        return self
 
     @model_validator(mode="after")
     def _derive_webhook_url(self) -> Settings:

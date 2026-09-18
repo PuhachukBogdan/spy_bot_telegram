@@ -1,6 +1,14 @@
 import { useMemo, useState } from 'react'
 
-import { HoursCell, LevelBadge, Stat, UnitBadge, riskLabel } from '@/components/bits'
+import {
+  FoldableTitle,
+  HoursCell,
+  LevelBadge,
+  Stat,
+  UnitBadge,
+  riskLabel,
+} from '@/components/bits'
+import ToneBlock, { ToneFlagList } from '@/components/ToneBlock'
 import TrendBlock from '@/components/TrendBlock'
 import { Card, CardContent } from '@/components/ui/card'
 import { Separator } from '@/components/ui/separator'
@@ -12,15 +20,16 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import type { ManagerRow, RiskCase, Trends } from '@/data'
+import type { ManagerRow, RiskCase, ToneData, Trends } from '@/data'
 import {
   computeRange,
   coverageThreshold,
   daysBetweenInclusive,
   inRange,
   loadCollapsed,
+  offlineShareOf,
   periodLabel,
-  saveCollapsed,
+  persistCollapsed,
   type PeriodRange,
   type PeriodState,
   type SectionId,
@@ -31,42 +40,6 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
     <h3 className="mb-2 mt-6 font-display text-[12px] uppercase tracking-widest text-primary">
       {children}
     </h3>
-  )
-}
-
-/** A section header that folds its body. The longest dossier blocks (risk cards,
- * the chat table) hide behind these so the page opens readable; the chosen state
- * persists across visits via localStorage (best-effort — a blocked store just
- * means defaults). The header keeps its count, so a folded section still says
- * how much it is hiding. */
-function FoldableTitle({
-  open,
-  onToggle,
-  children,
-}: {
-  open: boolean
-  onToggle: () => void
-  children: React.ReactNode
-}) {
-  return (
-    <button
-      onClick={onToggle}
-      aria-expanded={open}
-      className="mb-2 mt-6 flex w-full items-center gap-1.5 text-left font-display text-[12px] uppercase tracking-widest text-primary transition-colors hover:text-foreground"
-    >
-      <span
-        aria-hidden="true"
-        className={`inline-block text-[10px] transition-transform ${open ? 'rotate-90' : ''}`}
-      >
-        ▶
-      </span>
-      <span>{children}</span>
-      {!open ? (
-        <span className="ml-1 font-mono text-[9px] normal-case tracking-wider text-muted-foreground">
-          — click to expand
-        </span>
-      ) : null}
-    </button>
   )
 }
 
@@ -120,6 +93,7 @@ function RiskCard({ risk }: { risk: RiskCase }) {
 export default function Dossier({
   manager,
   trends,
+  tone,
   activeChatMin,
   period,
   onPeriodChange,
@@ -127,6 +101,7 @@ export default function Dossier({
 }: {
   manager: ManagerRow
   trends: Trends | null
+  tone: ToneData | null
   activeChatMin: number
   period: PeriodState
   onPeriodChange: (period: PeriodState) => void
@@ -138,7 +113,7 @@ export default function Dossier({
   const toggle = (id: SectionId) =>
     setCollapsed((prev) => {
       const next = { ...prev, [id]: !prev[id] }
-      saveCollapsed(next)
+      persistCollapsed(id, next[id])
       return next
     })
 
@@ -188,6 +163,12 @@ export default function Dossier({
   const quietCount = chatRows.length - activeCount
   const periodNote = range ? ` · ${periodLabel(period, range)}` : ''
 
+  // Accepted tone flags for this manager, filtered by local day like risks.
+  const toneFlags = useMemo(() => {
+    const all = tone?.flags[manager.id] ?? []
+    return range ? all.filter((f) => inRange(f.day, range)) : all
+  }, [tone, manager.id, range])
+
   return (
     <div>
       {/* The manager-scoped analytics block — same component as the overview's,
@@ -213,8 +194,12 @@ export default function Dossier({
           />
           <Stat
             label="Offline waits"
-            value={String(manager.slaOffline)}
-            hint="excluded from SLA %"
+            value={
+              offlineShareOf(manager.slaOffline, manager.slaRated) === null
+                ? String(manager.slaOffline)
+                : `${manager.slaOffline} / ${offlineShareOf(manager.slaOffline, manager.slaRated)}%`
+            }
+            hint={`of ${manager.slaOffline + manager.slaRated} waits · not in SLA %`}
           />
           <Stat
             label="Active chats"
@@ -250,16 +235,17 @@ export default function Dossier({
 
       <SectionTitle>Positive</SectionTitle>
       {proposals > 0 ? (
-        <div className="rounded-md border bg-card p-3 text-[13px]">
-          <b className="num text-[17px]">{proposals}</b> manager proposals in
-          this period. Tone-of-voice signals (completeness, slang, toxicity) land here
-          once that track ships.
+        <div className="mb-3 rounded-md border bg-card p-3 text-[13px]">
+          <b className="num text-[17px]">{proposals}</b> manager proposals in this period.
         </div>
       ) : (
-        <div className="rounded-md border border-dashed bg-card p-3 text-[13px] text-muted-foreground">
+        <div className="mb-3 rounded-md border border-dashed bg-card p-3 text-[13px] text-muted-foreground">
           No proposals recorded in this period.
         </div>
       )}
+      {tone ? (
+        <ToneBlock tone={tone} managerId={manager.id} range={range} periodNote={periodNote} />
+      ) : null}
 
       <FoldableTitle open={!collapsed.risks} onToggle={() => toggle('risks')}>
         Negative — {periodRisks.length === 0 ? 'no cases' : `${own.length} own`}
@@ -287,6 +273,17 @@ export default function Dossier({
           ) : null}
         </>
       )}
+
+      {tone ? (
+        <>
+          <FoldableTitle open={!collapsed.tone} onToggle={() => toggle('tone')}>
+            Tone flags ({toneFlags.length}){periodNote}
+          </FoldableTitle>
+          {collapsed.tone ? null : (
+            <ToneFlagList flags={toneFlags} defs={tone.metrics} range={range} />
+          )}
+        </>
+      ) : null}
 
       <FoldableTitle open={!collapsed.chats} onToggle={() => toggle('chats')}>
         Chats ({chatRows.length}) — {activeCount} active{periodNote}

@@ -695,8 +695,7 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         rec["delivered"].append(summary_id)
 
     async def fake_post(period_type: Any, since: Any, until: Any,
-                        event_count: Any, dashboard_url: Any,
-                        password: Any) -> str:
+                        event_count: Any, dashboard_url: Any) -> str:
         rec["slack_posts"].append(dashboard_url)
         return "1700000000.000100"
 
@@ -747,8 +746,9 @@ async def test_generate_report_saves_html_and_returns_url(
 ) -> None:
     monkeypatch.setattr(gen_mod.settings, "SERVER_BASE_URL", "https://bot.example.com")
     result = await gen_mod.generate_report(period_type="weekly")
-    assert result.url.startswith("https://bot.example.com/dashboard/")
-    assert len(result.url.split("/dashboard/")[1]) == 64  # 32-byte hex token
+    # Fixed, secret-free link since 2026-09-11: the reader signs in as
+    # themselves, so there is no per-report token in the URL any more.
+    assert result.url == "https://bot.example.com/dashboard"
     assert result.slack_delivered is True
     assert result.slack_error is None
     assert patched_generator["saved_html"] is not None
@@ -853,7 +853,7 @@ async def test_generate_report_monthly_url(
 ) -> None:
     monkeypatch.setattr(gen_mod.settings, "SERVER_BASE_URL", "https://example.com")
     result = await gen_mod.generate_report(period_type="monthly")
-    assert result.url.startswith("https://example.com/dashboard/")
+    assert result.url == "https://example.com/dashboard"
 
 
 async def test_generate_report_slack_failure_does_not_raise(

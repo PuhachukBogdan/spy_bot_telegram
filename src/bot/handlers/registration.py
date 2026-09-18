@@ -35,6 +35,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from src.alerts.slack import SlackDeliveryError, send_dm_to_user
+from src.config import settings
 from src.db.client import acquire_connection
 from src.db.models import InternalUser
 from src.db.queries.audit import insert_audit_log
@@ -42,6 +43,7 @@ from src.db.queries.etc import (
     create_internal_user,
     find_internal_user_by_telegram_id,
     update_slack_user_id,
+    update_user_role,
 )
 from src.utils.logging import get_logger
 
@@ -176,6 +178,41 @@ async def _step_receive_slack_id(message: Message, user_id: int, text: str) -> N
     )
 
 
+#: Roles a grant may confer that are worth telling the person about. Everything
+#: else is silent — a manager has no surface to be told about.
+_GRANT_NOTE = (
+    "\n\nYou also have access to the <b>team report</b>. "
+    "Send /dashboard for a sign-in link."
+)
+
+
+def _granted_role(slack_user_id: str, existing: InternalUser | None) -> str | None:
+    """The role ``REGISTRATION_ROLE_GRANTS`` confers here, or ``None``.
+
+    Deliberately narrow, because this runs without a human in the loop:
+
+    * only at the FIRST binding of that Slack account (``slack_user_id`` still
+      unset). A re-registration must not quietly restore a role an admin has
+      since changed with /set_role — the human decision has to win.
+    * never a downgrade. If the row is already ``admin`` and the map says
+      ``head``, nothing happens; a grant is a way in, not a way to demote.
+
+    The map is keyed on the Slack id because that is what the one-time code
+    proves possession of. The Telegram account redeeming it is whichever one the
+    person is holding — which is the point: no id has to be collected in advance.
+    """
+    role = settings.REGISTRATION_ROLE_GRANTS.get(slack_user_id.upper())
+    if role is None:
+        return None
+    if existing is not None and existing.slack_user_id:
+        return None  # re-registration: leave whatever an admin has set
+    current = existing.role if existing is not None else "manager"
+    ranking = {"viewer": 0, "manager": 1, "head": 2, "admin": 3}
+    if ranking.get(role, 0) <= ranking.get(current, 0):
+        return None
+    return role
+
+
 async def _step_receive_code(message: Message, user_id: int, text: str) -> None:
     """Step 2 → done: verify OTP, store slack_user_id."""
     pending = _pending.get(user_id)
@@ -210,6 +247,9 @@ async def _step_receive_code(message: Message, user_id: int, text: str) -> None:
                     tg_user_id=user_id,
                     full_name=pending.tg_full_name,
                 )
+            # Read the grant BEFORE the slack_user_id is written — "first
+            # binding" is exactly the state where that column is still empty.
+            grant = _granted_role(pending.slack_user_id, existing)
             updated = await update_slack_user_id(conn, existing.id, pending.slack_user_id)
             if updated is None:
                 await message.answer("Something went wrong. Please try again.")
@@ -224,6 +264,28 @@ async def _step_receive_code(message: Message, user_id: int, text: str) -> None:
                 target_id=existing.id,
                 payload={"slack_user_id": pending.slack_user_id},
             )
+            if grant is not None:
+                previous = existing.role
+                await update_user_role(conn, existing.id, grant)
+                await insert_audit_log(
+                    conn,
+                    action="role_granted_by_registration",
+                    actor_user_id=user_id,
+                    actor_internal_id=existing.id,
+                    target_entity="internal_user",
+                    target_id=existing.id,
+                    payload={
+                        "from": previous,
+                        "to": grant,
+                        "slack_user_id": pending.slack_user_id,
+                    },
+                )
+                log.info(
+                    "registration.role_granted",
+                    tg_user_id=user_id,
+                    slack_id=pending.slack_user_id,
+                    **{"from": previous, "to": grant},
+                )
 
     _cleanup(user_id)
     log.info(
@@ -232,7 +294,8 @@ async def _step_receive_code(message: Message, user_id: int, text: str) -> None:
         internal_id=str(existing.id),
         slack_id=pending.slack_user_id,
     )
+    note = _GRANT_NOTE if grant in ("admin", "head") else ""
     await message.answer(
         "✅ Your Slack account has been linked.\n\n"
-        f"Slack ID: <code>{html_escape(pending.slack_user_id)}</code>"
+        f"Slack ID: <code>{html_escape(pending.slack_user_id)}</code>{note}"
     )

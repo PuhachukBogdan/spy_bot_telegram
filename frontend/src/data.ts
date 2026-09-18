@@ -88,6 +88,20 @@ export interface ReportData {
   managers: ManagerRow[]
   /** Bucket series for the analytics block. null when the horizon is empty. */
   trends: Trends | null
+  /** Tone of voice (daily LLM pass): metric registry, per-manager-day counters
+   * over the horizon, accepted flags per manager. null = tables unavailable. */
+  tone: ToneData | null
+  /** Who is signed in. The page is already filtered server-side for this person
+   * (a head never receives their own row), so this only labels the page and
+   * decides whether the risk-report switch is offered. */
+  viewer: Viewer | null
+}
+
+export interface Viewer {
+  name: string
+  /** 'admin' sees the whole team · 'head' sees everyone except themselves. */
+  role: string
+  seesRiskReport: boolean
 }
 
 export type TrendGranularity = 'day' | 'week' | 'month' | 'quarter'
@@ -140,6 +154,52 @@ export interface Trends {
   managers: Record<string, ScopeTrend>
   chatDays: { chats: ChatDaysEntry[] }
   horizon: { floor: string; today: string; testUntil: string | null }
+}
+
+/* ── Tone of voice ─────────────────────────────────────────────────────────── */
+
+/** negative: a flag is bad, show the rate (ideal 0 %) · positive_gap: a flag is
+ * a gap, show 100 − rate (ideal 100 %) · negative_event: a flag is a bad move,
+ * show the count (ideal 0) · positive_event: a flag is a good move, show the
+ * count. Mirrors TonePolarity in src/metrics/tone.py. */
+export type TonePolarity = 'negative' | 'positive_gap' | 'negative_event' | 'positive_event'
+
+export interface ToneMetricDef {
+  key: string
+  label: string
+  polarity: TonePolarity
+  description: string
+}
+
+/** One manager, one local day: `a` messages judged, `f` flags per metric key. */
+export interface ToneDay {
+  m: string
+  d: string
+  a: number
+  f: Record<string, number>
+}
+
+export interface ToneFlag {
+  id: string
+  metric: string
+  /** Local ISO day — the period filter's key, same calendar as risks. */
+  day: string
+  at: string
+  chatName: string
+  unitType: UnitType
+  quote: string
+  reason: string
+  confidence: number
+}
+
+export interface ToneData {
+  enabled: boolean
+  /** A rate shows only from this many judged messages in the period. */
+  minAssessed: number
+  metrics: ToneMetricDef[]
+  days: ToneDay[]
+  /** manager id -> accepted flags over the horizon, newest first. */
+  flags: Record<string, ToneFlag[]>
 }
 
 /** Read the injected island. Throws a legible error rather than rendering blank. */

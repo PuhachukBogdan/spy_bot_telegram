@@ -236,6 +236,7 @@ def patched_dispatch(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "ts_writes": [],
         "failures": [],
         "case_events": [],
+        "admin_only": [],
     }
 
     monkeypatch.setattr(dispatch_mod, "acquire_connection", lambda: _NullAcquire())
@@ -271,6 +272,18 @@ def patched_dispatch(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     async def fake_failed(bot: Any, event: Any, channel: str, error: str) -> None:
         rec["failures"].append((event.id, channel, error))
 
+    async def fake_heads(conn: Any) -> set[int]:
+        # Telegram ids whose authored signals bypass Slack. Populated per-test by
+        # writing rec["heads"]; empty here so the normal path is what runs.
+        return set(rec.get("heads", set()))
+
+    async def fake_to_admins(
+        bot: Any, chat: Any, partner_name: Any, event: Any
+    ) -> None:
+        rec["admin_only"].append(event.id)
+
+    monkeypatch.setattr(dispatch_mod, "list_head_telegram_ids", fake_heads)
+    monkeypatch.setattr(dispatch_mod, "_route_to_admins", fake_to_admins)
     monkeypatch.setattr(dispatch_mod, "resolve_open_case_ts", fake_resolve)
     monkeypatch.setattr(dispatch_mod, "critical_mention_prefix", fake_mentions)
     monkeypatch.setattr(dispatch_mod, "list_active_suppressions", fake_suppressions)
@@ -304,6 +317,49 @@ async def test_suppressed_event_is_not_posted(
     assert patched_dispatch["posts"] == []
     assert patched_dispatch["updates"] == []
     assert patched_dispatch["ts_writes"] == []
+
+
+async def test_head_authored_signal_skips_slack_and_goes_to_admins(
+    patched_dispatch: dict[str, Any],
+) -> None:
+    """A department lead must not review their own conduct in the shared channel.
+
+    The event is still dispatched — it reaches the admins by DM — but nothing is
+    posted to #alerts, where the lead themselves reads.
+    """
+    patched_dispatch["case_ts"] = None
+    patched_dispatch["heads"] = {1000000001}
+    event = _event(level="critical", score=88).model_copy(
+        update={"sender_id": 1000000001}
+    )
+    await dispatch_mod.dispatch_alerts(FakeBot(), _chat("c"), "Acme", [event])  # type: ignore[arg-type]
+    assert patched_dispatch["posts"] == []
+    assert patched_dispatch["updates"] == []
+    assert patched_dispatch["ts_writes"] == []
+    assert patched_dispatch["admin_only"] == [event.id]
+
+
+async def test_signal_by_anyone_else_still_posts_normally(
+    patched_dispatch: dict[str, Any],
+) -> None:
+    """The head branch is narrow: same chat, same shape, a different author."""
+    patched_dispatch["case_ts"] = None
+    patched_dispatch["heads"] = {1000000001}
+    event = _event(level="high").model_copy(update={"sender_id": 999})
+    await dispatch_mod.dispatch_alerts(FakeBot(), _chat("c"), "Acme", [event])  # type: ignore[arg-type]
+    assert len(patched_dispatch["posts"]) == 1
+    assert patched_dispatch["admin_only"] == []
+
+
+async def test_unattributable_signal_is_not_treated_as_head_authored(
+    patched_dispatch: dict[str, Any],
+) -> None:
+    """No sender id (anonymous admin, channel post) → the normal path, not silence."""
+    patched_dispatch["case_ts"] = None
+    patched_dispatch["heads"] = {1000000001}
+    await dispatch_mod.dispatch_alerts(FakeBot(), _chat("c"), "Acme", [_event()])  # type: ignore[arg-type]
+    assert len(patched_dispatch["posts"]) == 1
+    assert patched_dispatch["admin_only"] == []
 
 
 async def test_fresh_case_posts_top_level_and_writes_ts(

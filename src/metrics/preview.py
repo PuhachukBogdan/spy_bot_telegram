@@ -22,6 +22,8 @@ from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+import asyncpg
+
 from src.config import settings
 from src.db.client import acquire_connection
 from src.db.queries.etc import list_real_managers
@@ -34,6 +36,7 @@ from src.db.queries.metrics import (
     list_risk_events,
     list_sla_messages,
 )
+from src.db.queries.tone import list_tone_days, list_tone_flags
 from src.metrics.attribution import build_manager_index
 from src.metrics.cache import preview_cache
 from src.metrics.collect import (
@@ -44,10 +47,26 @@ from src.metrics.collect import (
     pair_waits_dated,
     risks_by_manager,
 )
+from src.metrics.scope import (
+    ADMIN_SCOPE,
+    PageScope,
+    visible_managers,
+    visible_risk_rows,
+    visible_rows,
+    visible_tone,
+)
 from src.metrics.shell import render_with_shell
+from src.metrics.tone import (
+    metric_defs_payload,
+    tone_days_payload,
+    tone_flags_payload,
+)
 from src.metrics.trends import build_scope_days, build_scope_trends
 from src.metrics.window import MetricsWindow, resolve_metrics_window
 from src.metrics.workhours import EffectiveWorkHours, resolve_effective_work_hours
+from src.utils.logging import get_logger
+
+log = get_logger(__name__)
 
 _CSS = """
 :root{--ink:#1A1A1A;--muted:#5C5C5C;--rule:#C9C4BA;--surface:#ECE9E2;
@@ -189,6 +208,8 @@ def build_payload(
     *,
     trends: dict[str, Any] | None = None,
     tz: ZoneInfo | None = None,
+    tone: dict[str, Any] | None = None,
+    scope: PageScope = ADMIN_SCOPE,
 ) -> dict[str, Any]:
     """The metrics document handed to the React shell.
 
@@ -203,6 +224,14 @@ def build_payload(
     risk_tz = tz if tz is not None else UTC
     return {
         "trends": trends,
+        # Who is reading. Drives the mode switch and the "signed in as" line; the
+        # data itself was already filtered upstream, so this block only labels
+        # the page — removing it would hide nothing extra.
+        "viewer": scope.to_payload(),
+        # Tone of voice (§18): metric registry + per-manager-day counters over the
+        # horizon + the accepted flags. None when the tables are absent or the
+        # read failed — the page then simply has no tone block.
+        "tone": tone,
         "generatedAt": datetime.now(UTC).isoformat(timespec="seconds"),
         "since": window.since.isoformat(timespec="minutes"),
         "until": window.until.isoformat(timespec="minutes"),
@@ -359,7 +388,46 @@ async def _on_own_connection(
         return await query(conn, *args)
 
 
-async def build_preview(days: int = 30, *, fresh: bool = False) -> str:
+#: Flags shipped to the dossier's review list per page — the list is a folded
+#: drill-down, not an archive; the counters carry the numbers.
+_TONE_FLAGS_LIMIT = 400
+
+
+async def _load_tone(floor: date, today: date, tz: ZoneInfo) -> dict[str, Any] | None:
+    """Tone-of-voice block for the island, or ``None`` when it cannot be read.
+
+    Failing soft is deliberate: the tables arrive with migration 0025, and a page
+    served before it is applied (or during a partial deploy) must still render
+    SLA, coverage and risk rather than 500 on a block that is additive.
+    """
+
+    async def _flags(conn: Any, since: date, until: date) -> Any:
+        return await list_tone_flags(conn, since, until, limit=_TONE_FLAGS_LIMIT)
+
+    try:
+        day_rows, flag_rows = await asyncio.gather(
+            _on_own_connection(list_tone_days, floor, today),
+            _on_own_connection(_flags, floor, today),
+        )
+    except asyncpg.PostgresError as exc:
+        log.warning("tone.payload_unavailable", error=str(exc))
+        return None
+    return {
+        "enabled": settings.TONE_ANALYSIS_ENABLED,
+        "minAssessed": settings.TONE_MIN_ASSESSED,
+        "metrics": metric_defs_payload(),
+        "days": tone_days_payload(day_rows),
+        "flags": tone_flags_payload(flag_rows, tz),
+    }
+
+
+async def build_preview(
+    days: int = 30,
+    *,
+    fresh: bool = False,
+    include_tone: bool = False,
+    scope: PageScope = ADMIN_SCOPE,
+) -> str:
     """Collect current metrics over the trailing ``days`` and render the stand.
 
     Two windows on purpose: the DETAIL window (``days``, feeds the server-side
@@ -377,8 +445,19 @@ async def build_preview(days: int = 30, *, fresh: bool = False) -> str:
     Prefers the built React shell. Falls back to the plain server-rendered table
     when the frontend has not been built — a container built without the Node
     stage still serves working numbers instead of an error page.
+
+    ``include_tone`` adds the tone-of-voice block (section 18). It is a per-route
+    switch so the feature can sit on the /preview stand for review while the live
+    dashboard keeps rendering exactly what it rendered before.
+
+    ``scope`` decides WHOSE page this is (:mod:`src.metrics.scope`). A head's
+    page is built without them in it — the exclusion happens on the raw rows,
+    before any total is summed, so the team numbers a head reads are genuinely
+    the team minus themselves rather than the full team with one row hidden.
     """
-    cache_key = f"summary:{days}"
+    # Cache slots are per surface AND per viewer: the tone block is route-gated,
+    # and two roles see different pages from the same query set.
+    cache_key = f"summary:{days}:{'tone' if include_tone else 'base'}:{scope.cache_key}"
     if not fresh:
         cached = preview_cache.get(cache_key)
         if cached is not None:
@@ -397,12 +476,20 @@ async def build_preview(days: int = 30, *, fresh: bool = False) -> str:
 
     metrics: list[ManagerMetrics] = []
     trends: dict[str, Any] | None = None
+    tone: dict[str, Any] | None = None
     async with acquire_connection() as conn:
-        managers = await list_real_managers(conn)
+        all_managers = await list_real_managers(conn)
+    # The attribution index spans the WHOLE team on purpose: whether a case was
+    # written by a manager at all is a fact about the case, not about who is
+    # reading it. Scoping happens on the rows below, never on this index.
+    manager_index = build_manager_index(all_managers)
+    managers = visible_managers(all_managers, scope)
+    # A manager with no work-hours entry never opens a wait (see
+    # pair_waits_dated), so leaving the hidden one out here already keeps their
+    # waits out of both their own series and the team's.
     hours: dict[UUID, EffectiveWorkHours] = {
         m.id: resolve_effective_work_hours(m) for m in managers
     }
-    manager_index = build_manager_index(managers)
     if not horizon.is_empty:
         tz_name = str(tz)
         (
@@ -439,6 +526,21 @@ async def build_preview(days: int = 30, *, fresh: bool = False) -> str:
                 count_messages_per_chat, horizon.since, horizon.until
             ),
         )
+
+        # Scope every manager-keyed row set before a single number is derived
+        # from it. build_scope_days folds the same rows into the team series, so
+        # filtering afterwards would leave a hidden manager inside the totals.
+        chat_rows = visible_rows(chat_rows, scope)
+        chat_day_rows = visible_rows(chat_day_rows, scope)
+        registry_rows = visible_rows(registry_rows, scope)
+        proposal_days = visible_rows(proposal_days, scope)
+        risk_days = visible_risk_rows(risk_days, scope)
+        risk_rows = visible_risk_rows(risk_rows, scope)
+        proposals = {
+            manager_id: count
+            for manager_id, count in proposals.items()
+            if manager_id not in scope.hidden_manager_ids
+        }
 
         dated = pair_waits_dated(sla_rows, hours)
         window_outcomes = {
@@ -489,8 +591,12 @@ async def build_preview(days: int = 30, *, fresh: bool = False) -> str:
                 "testUntil": test_until.isoformat() if test_until else None,
             },
         }
+        if include_tone:
+            tone = visible_tone(await _load_tone(floor, today, tz), scope)
 
-    rendered = render_with_shell(build_payload(metrics, window, trends=trends, tz=tz))
+    rendered = render_with_shell(
+        build_payload(metrics, window, trends=trends, tz=tz, tone=tone, scope=scope)
+    )
     page = (
         rendered
         if rendered is not None

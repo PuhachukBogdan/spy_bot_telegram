@@ -120,3 +120,13 @@ __MACOSX/
 /static/
 PHASE2_ANALYTICS_SUMMARY.md
 Phase 2 Analytics - Summary.pdf
+
+# Reading guide for the Team summary page (Russian, for people) — local-only like
+# the other docs; the .md is the source, the .pdf is built by gen_phase2_pdf.py.
+Team summary - как читать.md
+Team summary - как читать.pdf
+# Manager onboarding hand-out (Russian): .md is the PDF source, .docx comes from
+# gen_handoff_docs.py; both are local-only like the other people-facing docs.
+Partner Assistant — инструкция для менеджера.md
+Partner Assistant — инструкция для менеджера.pdf
+DASHBOARD_ROLES_PLAN.md

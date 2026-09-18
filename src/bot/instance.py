@@ -21,6 +21,7 @@ from src.bot.handlers.dm_commands import router as dm_commands_router
 from src.bot.handlers.edits import router as edits_router
 from src.bot.handlers.messages import router as messages_router
 from src.bot.handlers.registration import router as registration_router
+from src.bot.handlers.unknown import router as unknown_router
 from src.bot.middleware.audit import AuditMiddleware
 from src.bot.middleware.whitelist import WhitelistMiddleware
 from src.config import settings
@@ -49,6 +50,11 @@ dp.include_router(dm_commands_router)
 # order vs dm_commands is immaterial, but it stays ahead of the group routers.
 dp.include_router(admin_panel_router)
 dp.include_router(registration_router)
+# Last of the private-chat routers: answers "Command not found." to any command
+# none of them claimed, so a hidden command and a nonexistent one are
+# indistinguishable (see handlers/unknown.py). Must stay AHEAD of messages_router,
+# whose catch-all would otherwise swallow the update in silence.
+dp.include_router(unknown_router)
 dp.include_router(messages_router)
 dp.include_router(edits_router)
 # Telegram Business updates ride their own observers (not dp.message), so the

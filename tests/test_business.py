@@ -206,8 +206,52 @@ async def test_message_unknown_contact_registered_owner_auto_links(deps, bot, mk
 
     assert deps.create_chat.call_args.kwargs["status"] == "active"
     deps.ingest.assert_awaited_once()  # monitoring starts immediately
-    assert 500 in bot.chat_ids
-    assert "monitoring started" in bot.texts.lower()
+    # Cover: the manager owner is told only that the dialog is connected.
+    owner_texts = [t or "" for cid, t in bot.sent if cid == 500]
+    assert len(owner_texts) == 1
+    assert "dialog connected" in owner_texts[0].lower()
+    assert "monitoring" not in owner_texts[0].lower()
+    assert "/link_business_chat" not in owner_texts[0]
+    # No admins configured in this test → nothing else goes out.
+    assert bot.chat_ids == [500]
+
+
+async def test_message_manager_owner_routes_admin_prompt_to_admins(deps, bot, mk) -> None:
+    # The /link_business_chat prompt names monitoring: admins get it, the
+    # manager owner does not — and the admin copy says whose connection it is.
+    owner = mk.user(role="manager", tg_id=500, accounts=[500], name="Mirror | Betonwin")
+    admin = mk.user(role="admin", tg_id=999, accounts=[999])
+    deps.bc_get.return_value = mk.grant(status="active", internal_user_id=owner.id)
+    deps.get_unit.return_value = None
+    deps.pc_get.return_value = None
+    deps.create_chat.return_value = mk.chat(status="active")
+    deps.get_user_by_id.return_value = owner
+    deps.list_admins.return_value = [admin]
+
+    await biz.on_business_message(mk.biz_message("BC1", 888), bot)
+
+    by_chat = {cid: (t or "") for cid, t in bot.sent}
+    assert set(by_chat) == {500, 999}
+    assert "monitoring" not in by_chat[500].lower()
+    assert "/link_business_chat BC1 888" in by_chat[999]
+    assert "monitoring started" in by_chat[999].lower()
+    assert "Mirror | Betonwin" in by_chat[999]
+
+
+async def test_message_admin_owner_gets_admin_prompt_directly(deps, bot, mk) -> None:
+    # An admin owner is the audience for the actionable prompt; no fan-out.
+    owner = mk.user(role="admin", tg_id=999, accounts=[999])
+    deps.bc_get.return_value = mk.grant(status="active", internal_user_id=owner.id)
+    deps.get_unit.return_value = None
+    deps.pc_get.return_value = None
+    deps.create_chat.return_value = mk.chat(status="active")
+    deps.get_user_by_id.return_value = owner
+
+    await biz.on_business_message(mk.biz_message("BC1", 888), bot)
+
+    assert bot.chat_ids == [999]
+    assert "/link_business_chat BC1 888" in bot.texts
+    deps.list_admins.assert_not_awaited()
 
 
 async def test_message_unknown_contact_no_owner_parks_pending(deps, bot, mk) -> None:
@@ -398,8 +442,19 @@ def test_connection_notice_external_escapes_and_offers_actions() -> None:
     assert "/approve_business" in text and "/reject_business" in text
 
 
-def test_link_prompt_includes_peer_and_command(mk) -> None:
+def test_owner_dialog_note_is_cover_safe(mk) -> None:
     msg = mk.biz_message(first="Peer", username="peer", peer_id=888)
-    text = biz._link_prompt("BC1", 888, msg)
-    assert "888" in text
+    text = biz._owner_dialog_note(msg)
+    assert "Peer" in text
+    for leak in ("monitor", "risk", "/link_business_chat", "888"):
+        assert leak not in text.lower()
+
+
+def test_auto_linked_prompt_names_owner_for_admins(mk) -> None:
+    owner = mk.user(role="manager", tg_id=500, name="Kowalski | BetonWin")
+    msg = mk.biz_message(first="Peer", username="peer", peer_id=888)
+    text = biz._auto_linked_prompt("BC1", 888, msg, owner=owner)
     assert "/link_business_chat BC1 888" in text
+    assert "Kowalski | BetonWin" in text
+    assert "Owner:" not in biz._auto_linked_prompt("BC1", 888, msg)
+

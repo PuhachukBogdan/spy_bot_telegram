@@ -115,12 +115,19 @@ async def list_real_managers(conn: asyncpg.Connection) -> list[InternalUser]:
     deliberately NOT the enabled-agnostic lookup used for ``sender_role`` — there,
     conflating "may use the bot" with "is staff" corrupted risk analysis; here we
     genuinely want only people currently being measured.
+
+    ``head`` counts as a manager here. A department lead still owns chats and
+    still writes to partners, so they are measured like anyone else — what the
+    ``head`` role changes is what that person may READ (they do not see their own
+    numbers, see :mod:`src.metrics.scope`), not whether they are measured.
+    Filtering on ``role = 'manager'`` alone would delete them from the page for
+    everyone, the admin included, the moment the role was granted.
     """
     rows = await conn.fetch(
         """
         SELECT *
         FROM internal_users
-        WHERE role = 'manager'
+        WHERE role IN ('manager', 'head')
           AND enabled = true
           AND COALESCE(is_test, false) = false
           AND jsonb_array_length(COALESCE(telegram_accounts, '[]'::jsonb)) > 0
@@ -294,3 +301,69 @@ async def list_admin_users(conn: asyncpg.Connection) -> list[InternalUser]:
         """
     )
     return [InternalUser.from_record(row) for row in rows]
+
+
+async def list_report_recipients(conn: asyncpg.Connection) -> list[InternalUser]:
+    """Enabled people who may READ the report — the weekly DM's address list.
+
+    Exactly :data:`src.metrics.scope.DASHBOARD_ROLES`, kept in SQL so the
+    notification and the page can never drift apart: someone granted ``head``
+    starts receiving the DM on the next release, and someone demoted stops,
+    with no second list to maintain. Rows with no Telegram account are dropped —
+    there is nowhere to deliver to, and the caller would only log a failure.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT *
+        FROM internal_users
+        WHERE role IN ('admin', 'head')
+          AND enabled = true
+          AND jsonb_array_length(COALESCE(telegram_accounts, '[]'::jsonb)) > 0
+        ORDER BY full_name ASC
+        """
+    )
+    return [InternalUser.from_record(row) for row in rows]
+
+
+async def update_user_role(
+    conn: asyncpg.Connection, user_id: UUID, role: str
+) -> InternalUser | None:
+    """Set a user's role; return the updated row (None if the id is unknown).
+
+    The role is what the dashboard scopes on (``admin`` sees everything, ``head``
+    sees every manager but themselves), so this is a privilege change: the caller
+    audits it. The CHECK constraint from 0026 rejects anything outside the four
+    known values, so a typo fails loudly instead of locking someone out.
+    """
+    row = await conn.fetchrow(
+        """
+        UPDATE internal_users
+        SET role = $2, updated_at = now()
+        WHERE id = $1
+        RETURNING *
+        """,
+        user_id,
+        role,
+    )
+    return InternalUser.from_record(row) if row is not None else None
+
+
+async def list_head_telegram_ids(conn: asyncpg.Connection) -> set[int]:
+    """Telegram ids of every enabled ``head``.
+
+    Used by alert dispatch: a risk signal a department lead wrote themselves must
+    not land in the shared Slack channel that same lead reads. The event is still
+    persisted and still reaches the admins — only the broadcast surface changes.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT telegram_accounts
+        FROM internal_users
+        WHERE role = 'head' AND enabled = true
+        """
+    )
+    out: set[int] = set()
+    for row in rows:
+        for telegram_id in row["telegram_accounts"] or []:
+            out.add(int(telegram_id))
+    return out

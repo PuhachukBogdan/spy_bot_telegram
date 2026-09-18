@@ -138,9 +138,14 @@ def case_env(monkeypatch: pytest.MonkeyPatch) -> tuple[list[RiskEvent], _FakeSla
     async def _no_suppressions(_conn: Any) -> list[Any]:
         return []
 
+    async def _no_heads(_conn: Any) -> set[int]:
+        return set()
+
     monkeypatch.setattr(dispatch_mod, "critical_mention_prefix", _prefix)
     monkeypatch.setattr(dispatch_mod, "handle_failed_alert", _failed)
     monkeypatch.setattr(dispatch_mod, "list_active_suppressions", _no_suppressions)
+    # Nobody is a head in these cases: the routing branch is exercised on its own.
+    monkeypatch.setattr(dispatch_mod, "list_head_telegram_ids", _no_heads)
     return store, slack
 
 

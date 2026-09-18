@@ -1,6 +1,7 @@
 import { useState } from 'react'
 
 import Dossier from '@/components/Dossier'
+import HowToRead from '@/components/HowToRead'
 import Overview from '@/components/Overview'
 import { Separator } from '@/components/ui/separator'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -87,6 +88,7 @@ function Managers({
         period={period}
         onPeriodChange={onPeriodChange}
         range={range}
+        tone={data.tone}
       />
     </div>
   )
@@ -94,7 +96,11 @@ function Managers({
 
 /** Mode switch between the two reports. The old risk report stays a full page
  * of its own (its filters and date-range live in its own JS); this is two links
- * styled as one control, not an embedding. */
+ * styled as one control, not an embedding.
+ *
+ * Only an admin gets it. The risk report is rendered from stored HTML snapshots,
+ * which cannot be re-scoped per viewer, so there is no version of that page a
+ * head could read without reading their own cases too. */
 function ModeSwitch() {
   const risk = `${window.location.pathname.replace(/\/$/, '')}/risk`
   return (
@@ -126,7 +132,6 @@ export default function App({ data }: { data: ReportData }) {
   const range = data.trends
     ? resolveRange(data.trends.team, data.trends.horizon, period)
     : null
-  const t = data.thresholds
 
   const openManager = (id: string) => {
     setSelected(id)
@@ -145,7 +150,19 @@ export default function App({ data }: { data: ReportData }) {
             {data.epoch ? ` · counting from ${data.epoch}` : ' · no epoch floor set'}
           </div>
         </div>
-        <ModeSwitch />
+        <div className="flex flex-col items-end gap-1.5">
+          {data.viewer?.seesRiskReport ? <ModeSwitch /> : null}
+          {data.viewer?.name ? (
+            <div className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+              {data.viewer.name} · {data.viewer.role}
+              {data.viewer.role === 'head' ? ' · your own numbers are not shown' : ''}
+              {' · '}
+              <a href="/logout" className="underline">
+                sign out
+              </a>
+            </div>
+          ) : null}
+        </div>
       </div>
 
       <Tabs value={tab} onValueChange={setTab}>
@@ -174,38 +191,7 @@ export default function App({ data }: { data: ReportData }) {
         </TabsContent>
       </Tabs>
 
-      <h2 className="mb-2 mt-9 font-display text-[13px] uppercase tracking-widest text-primary">
-        How to read this
-      </h2>
-      <ul className="list-disc space-y-1.5 pl-5 text-[13px] text-muted-foreground">
-        <li>
-          <b className="text-foreground">SLA</b> — replies inside{' '}
-          {Math.round(t.slaSeconds / 60)} min, plus substantial replies (&gt;
-          {t.substantiveChars} chars) inside {Math.round(t.graceSeconds / 60)} min.
-          Timers only start during working hours, never at night, weekends or
-          holidays. A dash means nothing waited this period — not a failure.
-        </li>
-        <li>
-          <b className="text-foreground">Offline</b> — waits with no reply for{' '}
-          {Math.round(t.offlineSeconds / 60)} min. Counted separately and kept out of
-          the SLA %: absence is not slowness, and averaging it in would hide it.
-        </li>
-        <li>
-          <b className="text-foreground">Active chats</b> — chats with at least{' '}
-          {t.activeChatMinMessages} messages, over the manager&apos;s whole portfolio.
-          Silent chats stay in the denominator.
-        </li>
-        <li>
-          <b className="text-foreground">Risk</b> — a case appears on the page of the
-          manager who OWNS the chat. Cases someone else wrote are marked{' '}
-          <i>in their chat</i> and never counted; only the manager&apos;s own conduct
-          moves a number. There is deliberately no combined score.
-        </li>
-        <li>
-          <b className="text-foreground">private / group / topic</b> — the unit type.
-          Private is a Telegram Business chat; it is rare, so it is marked loudest.
-        </li>
-      </ul>
+      <HowToRead data={data} />
 
       <Separator className="mt-8" />
       <footer className="pt-3 text-[12px] text-muted-foreground">

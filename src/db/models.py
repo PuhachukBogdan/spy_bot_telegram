@@ -65,7 +65,11 @@ class InternalUser(_ORMModel):
     # role is the single source of truth for access (migration 0007). The legacy
     # is_admin column still exists in the DB but is ignored on read (extra keys
     # are dropped) — is_admin is exposed below as a property derived from role.
-    role: Literal["admin", "manager", "viewer"] = "manager"
+    # "head" arrived with migration 0026 (a department lead: reads the team
+    # report, scoped to everyone but themselves). It MUST be listed here — the
+    # value comes back from the database through from_record, so a role the
+    # Literal does not know makes the person unloadable, bot commands included.
+    role: Literal["admin", "head", "manager", "viewer"] = "manager"
     telegram_accounts: list[int] = Field(default_factory=list)
     enabled: bool = True
     # Migration 0008: working hours for the operational_sla track. start/end are

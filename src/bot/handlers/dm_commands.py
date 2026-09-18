@@ -92,6 +92,7 @@ from src.db.queries.etc import (
     get_internal_user_by_telegram_id_any,
     list_internal_users,
     set_user_enabled,
+    update_user_role,
     update_work_hours,
 )
 from src.db.queries.messages import get_message_by_id, get_messages_around
@@ -105,6 +106,7 @@ from src.db.queries.partners import (
 )
 from src.db.queries.patterns import load_enabled_patterns
 from src.utils.logging import get_logger
+from src.utils.session import issue_login_token
 from src.utils.workhours import parse_work_hours
 
 log = get_logger(__name__)
@@ -192,15 +194,45 @@ _HELP_ADMIN = (
 )
 
 
-def _help_for(role: str | None) -> str:
-    """Build the /help body. Only an admin sees the real command surface.
+#: What an admin sees by default. The full surface is 35 commands — a wall of
+#: text for someone whose whole job here is opening the report — so the everyday
+#: four come first. Nothing is hidden from an admin: /help all prints the lot.
+_HELP_ESSENTIALS = (
+    "<b>Available commands</b>\n\n"
+    "/dashboard — sign-in link for the team report\n"
+    "/whoami — show how I recognize you and your role\n"
+    "/set_hours — set your working hours and timezone\n"
+    "/help — this message\n\n"
+    "<i>/help all — every administrative command</i>"
+)
 
-    A recognized manager/viewer gets the cover text plus /set_hours; an outsider
-    gets the bare cover. Neither variant hints that the bot reads messages or
-    tracks risk.
+#: A head reads the report and nothing else: no partner, chat or risk command
+#: exists for them. They do need to know /dashboard is there, which is the one
+#: thing the cover text cannot say.
+_HELP_HEAD = (
+    "<b>Available commands</b>\n\n"
+    "/dashboard — sign-in link for the team report\n"
+    "/whoami — show how I recognize you and your role\n"
+    "/set_hours — set your working hours and timezone\n"
+    "/register — link your Slack account for notifications\n"
+    "/help — this message"
+)
+
+
+def _help_for(role: str | None, *, full: bool = False) -> str:
+    """Build the /help body for a role. Only an admin sees the real surface.
+
+    An admin gets the short list unless they ask for ``all``; a head gets the
+    report commands only; a recognized manager/viewer gets the cover text plus
+    /set_hours; an outsider gets the bare cover. No variant below ``admin`` hints
+    that the bot reads messages or tracks risk.
     """
     if role == "admin":
-        return "\n\n".join([_HELP_COMMON, _HELP_REVIEW, _HELP_ADMIN])
+        if full:
+            return "\n\n".join([_HELP_COMMON, _HELP_REVIEW, _HELP_ADMIN])
+        return _HELP_ESSENTIALS
+    if role == "head":
+        return _HELP_HEAD
     if role in ("manager", "viewer"):
         return _COVER_HELP_INTERNAL
     return _COVER_HELP_TEXT
@@ -219,14 +251,17 @@ async def cmd_start(message: Message) -> None:
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message) -> None:
+async def cmd_help(message: Message, command: CommandObject, **kwargs: Any) -> None:
     """List commands for the caller's role; show a cover message to outsiders."""
     user = message.from_user
     internal: InternalUser | None = None
     if user is not None:
         async with acquire_connection() as conn:
             internal = await find_internal_user_by_telegram_id(conn, user.id)
-    await message.answer(_help_for(internal.role if internal is not None else None))
+    full = (command.args or "").strip().lower() in ("all", "full")
+    await message.answer(
+        _help_for(internal.role if internal is not None else None, full=full)
+    )
 
 
 @router.message(Command("whoami"))
@@ -1877,3 +1912,117 @@ def _parse_int(token: str | None) -> int | None:
         return int(token.strip())
     except ValueError:
         return None
+
+
+# --- dashboard access ---------------------------------------------------------
+# The report page identifies its reader (2026-09-11): an admin sees the whole
+# team, a head sees every manager but themselves. Both sign in from here — the
+# link below is the whole login flow, and it is deliberately the only place a
+# non-admin can learn the report exists.
+
+
+@router.message(Command("dashboard"))
+@require_role("admin", "head")
+async def cmd_dashboard(message: Message, actor: InternalUser, **kwargs: Any) -> None:
+    """DM a one-time sign-in link for the report page.
+
+    The link carries a single-use token (15 minutes); opening it sets a 90-day
+    session cookie on that device, so this is a once-per-device errand rather
+    than a password to keep. Sending the command again simply issues another.
+
+    ``@require_role`` means a manager or viewer gets "Command not found." — the
+    cover holds: only people who may read the report learn it is there.
+    """
+    token = issue_login_token(actor.id)
+    url = f"{settings.SERVER_BASE_URL.rstrip('/')}/auth/link/{token}"
+    scope_note = (
+        "You see the whole team."
+        if actor.role == "admin"
+        else "You see the team's numbers."
+    )
+    await message.answer(
+        "<b>Your sign-in link</b>\n\n"
+        f'<a href="{html_escape(url)}">Open the team report</a>\n\n'
+        f"{scope_note}\n"
+        "The link works once and expires in 15 minutes. After that this browser "
+        "stays signed in for 90 days — send /dashboard again for a new device.",
+        disable_web_page_preview=True,
+    )
+    log.info("dm.dashboard_link", user=str(actor.id)[:8], role=actor.role)
+
+
+@router.message(Command("set_role"))
+@require_role("admin")
+async def cmd_set_role(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Change someone's role (admin only); audited.
+
+    Usage: ``/set_role <telegram_id|Full Name> <role>`` where role is one of
+    ``admin``, ``head``, ``manager``, ``viewer``.
+
+    ``head`` is the one that changes what a person can read: it grants the
+    report page, scoped to everyone but themselves. Granting it is a trust
+    decision, which is why it is an admin command rather than something a
+    person can claim for themselves during /register.
+    """
+    parts = (command.args or "").rsplit(maxsplit=1)
+    if len(parts) != 2 or parts[1] not in _ASSIGNABLE_ROLES:
+        await message.answer(
+            "Usage: <code>/set_role &lt;telegram_id|Full Name&gt; &lt;role&gt;</code>\n"
+            f"Roles: {', '.join(sorted(_ASSIGNABLE_ROLES))}\n"
+            'Example: <code>/set_role 1000000001 head</code>\n\n'
+            "<b>head</b> — reads the team report, without their own numbers.\n"
+            "<b>admin</b> — full access. <b>manager</b>/<b>viewer</b> — no report."
+        )
+        return
+    identifier, role = _strip_quotes(parts[0].strip()), parts[1]
+
+    async with acquire_connection() as conn:
+        target = await find_internal_user_by_identifier(conn, identifier)
+        if target is None:
+            await message.answer(
+                f"No enabled internal user matches <code>{html_escape(identifier)}</code>. "
+                "Use the Telegram id, or the exact full name."
+            )
+            return
+        if target.id == actor.id and role != "admin":
+            # Removing your own admin rights over DM leaves nobody able to undo it.
+            await message.answer(
+                "Refusing to change your own role away from admin — "
+                "ask another admin to do it."
+            )
+            return
+        previous = target.role
+        if previous == role:
+            await message.answer(
+                f"<b>{html_escape(target.full_name)}</b> is already <code>{role}</code>."
+            )
+            return
+        async with conn.transaction():
+            updated = await update_user_role(conn, target.id, role)
+            await insert_audit_log(
+                conn,
+                action="set_role",
+                actor_user_id=message.from_user.id if message.from_user else None,
+                actor_internal_id=actor.id,
+                target_entity="internal_user",
+                target_id=target.id,
+                payload={"from": previous, "to": role},
+            )
+    log.info(
+        "dm.set_role", target=str(target.id)[:8], **{"from": previous, "to": role}
+    )
+    name = html_escape(updated.full_name if updated else target.full_name)
+    hint = (
+        "\n\nThey can now send <code>/dashboard</code> to the bot for a sign-in link."
+        if role in ("admin", "head")
+        else "\n\nTheir report access is revoked — open sessions stop at the next page load."
+    )
+    await message.answer(
+        f"Role for <b>{name}</b>: <code>{previous}</code> &rarr; <code>{role}</code>.{hint}"
+    )
+
+
+#: Roles /set_role may assign. Mirrors the CHECK constraint from migration 0026.
+_ASSIGNABLE_ROLES = frozenset({"admin", "head", "manager", "viewer"})

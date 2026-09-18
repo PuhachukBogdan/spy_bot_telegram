@@ -179,7 +179,10 @@ async def on_business_message(message: Message, bot: Bot) -> None:
 
     Drops content when the connection is not active, the peer maps to a
     non-business unit, or the unit is pending/rejected. An unknown peer is
-    auto-linked (known ``partner_contacts``) or parked pending + the owner is DM'd.
+    auto-linked (known ``partner_contacts``) or, for a registered owner, attached
+    as a new business unit. The owner is DM'd a cover-safe "dialog connected"
+    line; the ``/link_business_chat`` prompt (which names monitoring and an admin
+    command) goes to admins only — an admin owner receives it directly.
     """
     bc_id = message.business_connection_id
     if bc_id is None:  # defensive: business messages always carry one
@@ -187,7 +190,8 @@ async def on_business_message(message: Message, bot: Bot) -> None:
     peer_user_id = message.chat.id
 
     unit_to_ingest: Chat | None = None
-    pending_dm: tuple[InternalUser, str] | None = None
+    owner_dm: tuple[InternalUser, str] | None = None
+    admin_dm: tuple[list[InternalUser], str] | None = None
 
     async with acquire_connection() as conn:
         grant = await bc_q.get_by_connection_id(conn, bc_id)
@@ -282,10 +286,23 @@ async def on_business_message(message: Message, bot: Bot) -> None:
                         else None
                     )
                     if owner is not None:
-                        prompt_fn = (
-                            _auto_linked_prompt if auto_activate else _link_prompt
-                        )
-                        pending_dm = (owner, prompt_fn(bc_id, peer_user_id, message))
+                        # Cover: the prompt below says "monitoring started" and
+                        # offers an admin command, so only an admin may read it.
+                        # A manager owner gets the neutral line their onboarding
+                        # instruction promised; admins get the actionable one.
+                        if owner.role == "admin":
+                            owner_dm = (
+                                owner,
+                                _auto_linked_prompt(bc_id, peer_user_id, message),
+                            )
+                        else:
+                            owner_dm = (owner, _owner_dialog_note(message))
+                            admin_dm = (
+                                await list_admin_users(conn),
+                                _auto_linked_prompt(
+                                    bc_id, peer_user_id, message, owner=owner
+                                ),
+                            )
                     if auto_activate:
                         unit_to_ingest = created
                 log.info(
@@ -297,9 +314,12 @@ async def on_business_message(message: Message, bot: Bot) -> None:
                 )
 
     # Outbound work AFTER releasing the connection (ingest opens its own).
-    if pending_dm is not None:
-        owner, text = pending_dm
+    if owner_dm is not None:
+        owner, text = owner_dm
         await notify_internal_user(bot, owner, text)
+    if admin_dm is not None:
+        admins, text = admin_dm
+        await notify_admins(bot, admins, text)
     if unit_to_ingest is not None:
         await ingest_message(message, unit_to_ingest)
 
@@ -462,31 +482,44 @@ def _connection_notice(
     return f"{head}\nApprove: {approve}\nReject: {reject}"
 
 
-def _link_prompt(bc_id: str, peer_user_id: int, message: Message) -> str:
-    """Owner DM suggesting how to attach an unknown business contact to a partner."""
+def _auto_linked_prompt(
+    bc_id: str, peer_user_id: int, message: Message, owner: InternalUser | None = None
+) -> str:
+    """ADMIN-ONLY DM: a new business contact was auto-linked and monitoring began.
+
+    Names monitoring and an admin command, so it must never reach a manager —
+    ``on_business_message`` sends it to the owner only when the owner is an
+    admin, otherwise to the admin list with ``owner`` named for context.
+    """
     chat = message.chat
     handle = f"@{html_escape(chat.username)}" if chat.username else "—"
     label = html_escape(_peer_label(message) or "unknown")
+    owner_line = (
+        f"Owner: <b>{html_escape(owner.full_name)}</b> ({html_escape(owner.role)})\n"
+        if owner is not None
+        else ""
+    )
     return (
-        "🔗 <b>New business contact</b>\n\n"
-        f"From <b>{label}</b> ({handle}), user_id <code>{peer_user_id}</code>.\n"
-        "Link to a partner:\n"
+        "✅ <b>New business contact — monitoring started</b>\n\n"
+        f"<b>{label}</b> ({handle}), user_id <code>{peer_user_id}</code>.\n"
+        f"{owner_line}"
+        "To bind to a partner:\n"
         f'<code>/link_business_chat {html_escape(bc_id)} {peer_user_id} '
         '"Partner Name"</code>'
     )
 
 
-def _auto_linked_prompt(bc_id: str, peer_user_id: int, message: Message) -> str:
-    """Owner DM when a new business contact is auto-linked (owner is a registered user)."""
-    chat = message.chat
-    handle = f"@{html_escape(chat.username)}" if chat.username else "—"
-    label = html_escape(_peer_label(message) or "unknown")
+def _owner_dialog_note(message: Message) -> str:
+    """Cover-safe owner DM: a partner dialog was attached, nothing to do.
+
+    This is the only text a manager sees about a new business peer. It names
+    no monitoring, no risk and no command — the same promise the onboarding
+    instruction makes ("new partner dialogs are picked up automatically").
+    """
+    label = html_escape(_peer_label(message) or "New contact")
     return (
-        "✅ <b>New business contact — monitoring started</b>\n\n"
-        f"<b>{label}</b> ({handle}), user_id <code>{peer_user_id}</code>.\n"
-        "To bind to a partner:\n"
-        f'<code>/link_business_chat {html_escape(bc_id)} {peer_user_id} '
-        '"Partner Name"</code>'
+        "✅ <b>Partner dialog connected</b>\n\n"
+        f"<b>{label}</b> is now in Partner Assistant. Nothing else to do."
     )
 
 

@@ -25,6 +25,8 @@ import {
   computeRange,
   daysBetweenInclusive,
   fmtShort,
+  offlineShare,
+  totalWaits,
   type MetricSource,
   type PeriodState,
 } from '@/lib/period'
@@ -40,6 +42,14 @@ interface MetricDef {
   goodUp: boolean
   value: (p: MetricSource) => number | null
   hint: (p: MetricSource) => string
+  /** Second figure shown beside the headline, e.g. Offline's share of all
+   * waits. A count alone answers "how many", never "how many out of what". */
+  extra?: (p: MetricSource) => string | null
+  /** What the delta compares, when that is not the headline number. Offline's
+   * count rises with sheer traffic; its SHARE is what is comparable between
+   * periods, so the arrow tracks the share and reads in pp. */
+  deltaValue?: (p: MetricSource) => number | null
+  deltaUnit?: '%' | 'n'
 }
 
 const METRICS: MetricDef[] = [
@@ -73,7 +83,16 @@ const METRICS: MetricDef[] = [
     unit: 'n',
     goodUp: false,
     value: (p) => p.offline,
-    hint: () => 'excluded from SLA %',
+    extra: (p) => {
+      const share = offlineShare(p)
+      return share === null ? null : `${share}%`
+    },
+    deltaValue: offlineShare,
+    deltaUnit: '%',
+    hint: (p) =>
+      totalWaits(p) > 0
+        ? `${p.offline} of ${totalWaits(p)} waits · not in SLA %`
+        : 'excluded from SLA %',
   },
   {
     key: 'risks',
@@ -195,8 +214,10 @@ function Delta({
       </span>
     )
   }
-  const now = current ? metric.value(current) : null
-  const then = base ? metric.value(base) : null
+  const read = metric.deltaValue ?? metric.value
+  const unit = metric.deltaUnit ?? metric.unit
+  const now = current ? read(current) : null
+  const then = base ? read(base) : null
   if (now === null || then === null) {
     return (
       <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
@@ -214,7 +235,7 @@ function Delta({
     <span className={`num text-[12px] font-semibold ${good ? 'text-ok' : 'text-crit'}`}>
       {up ? '▲' : '▼'} {up ? '+' : ''}
       {diff}
-      {metric.unit === '%' ? ' pp' : ''}
+      {unit === '%' ? ' pp' : ''}
     </span>
   )
 }
@@ -479,6 +500,12 @@ export default function TrendBlock({
                 </div>
                 <div className="num mt-1 text-[22px] font-bold leading-none">
                   {value === null ? '—' : `${value}${m.unit === '%' ? '%' : ''}`}
+                  {value !== null && current && m.extra?.(current) ? (
+                    <span className="text-[15px] font-semibold text-muted-foreground">
+                      {' / '}
+                      {m.extra(current)}
+                    </span>
+                  ) : null}
                 </div>
                 <div className="mt-1 flex items-center justify-between gap-1">
                   <Delta current={current} base={baseStats} metric={m} />

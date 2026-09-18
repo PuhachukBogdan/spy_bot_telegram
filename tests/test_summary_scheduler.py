@@ -92,6 +92,7 @@ class _NullConn:
 def patched_tick(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     rec: dict[str, Any] = {
         "generated": [],
+        "bot": [],
         "until": [],
         "refreshed": [],
         "refresh_until": [],
@@ -104,9 +105,10 @@ def patched_tick(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         return bool(rec["exists"])
 
     async def fake_generate(
-        *, period_type: str, until: datetime | None = None
+        *, period_type: str, until: datetime | None = None, bot: Any = None
     ) -> Any:
         rec["generated"].append(period_type)
+        rec["bot"].append(bot)
         rec["until"].append(until)
         return SimpleNamespace(
             url="https://x/r/abc", event_count=3, slack_delivered=True
