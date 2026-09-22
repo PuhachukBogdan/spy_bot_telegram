@@ -735,6 +735,14 @@ def patched_generator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(gen_mod, "set_dashboard_slack", fake_set_dashboard_slack)
     monkeypatch.setattr(gen_mod, "revoke_dashboards_except", fake_revoke)
     monkeypatch.setattr(gen_mod, "_supersede_message", fake_supersede)
+
+    async def fake_slack_dms(
+        period_type: Any, since: Any, until: Any, event_count: Any, url: Any
+    ) -> None:
+        rec["slack_dms"].append((period_type, url))
+
+    rec["slack_dms"] = []
+    monkeypatch.setattr(gen_mod, "_announce_to_slack_dms", fake_slack_dms)
     monkeypatch.setattr(gen_mod, "acquire_connection", lambda: _NullConn())
 
     return rec
@@ -1050,3 +1058,47 @@ def test_dashboard_polls_daily_fragment_hourly() -> None:
     assert "3600000" in html  # one-hour cadence
     assert "data-daily-live" in html  # gated on the live marker
     assert "location.reload" not in html  # swap in place, never a full reload
+
+# ---------------------------------------------------------------------------
+# The channel post is optional (2026-09-21): the report reaches its readers
+# personally, so #reports is an extra copy rather than the delivery.
+# ---------------------------------------------------------------------------
+
+
+async def test_channel_post_can_be_switched_off(
+    patched_generator: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gen_mod.settings, "REPORT_POST_TO_CHANNEL", False)
+    result = await gen_mod.generate_report(period_type="weekly")
+
+    assert patched_generator["slack_posts"] == []
+    assert patched_generator["slack_set"] == []
+    assert patched_generator["superseded"] == []
+    # Nothing was attempted, so nothing failed.
+    assert result.slack_delivered is True
+    assert result.slack_error is None
+    # The personal copies are the delivery now, and they still go out.
+    assert len(patched_generator["slack_dms"]) == 1
+
+
+async def test_links_still_rotate_without_a_channel_post(
+    patched_generator: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rotation used to be gated on a confirmed post; with no post it must still
+    happen — the advertised URL is fixed, so retiring a row invalidates nothing
+    anyone holds, it only records which release is current."""
+    monkeypatch.setattr(gen_mod.settings, "REPORT_POST_TO_CHANNEL", False)
+    await gen_mod.generate_report(period_type="weekly")
+    assert len(patched_generator["revoked_keep"]) == 1
+
+
+async def test_channel_post_still_happens_when_enabled(
+    patched_generator: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gen_mod.settings, "REPORT_POST_TO_CHANNEL", True)
+    await gen_mod.generate_report(period_type="weekly")
+    assert len(patched_generator["slack_posts"]) == 1
+    assert len(patched_generator["slack_set"]) == 1

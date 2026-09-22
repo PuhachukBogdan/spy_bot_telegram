@@ -371,3 +371,87 @@ async def test_correct_code_case_insensitive() -> None:
         await _step_receive_code(msg, 42, "aabb11")  # lowercase — should succeed
 
     assert 42 not in _pending
+
+
+# ---------------------------------------------------------------------------
+# Setup ends at /register: a report reader is handed a working link
+# ---------------------------------------------------------------------------
+
+
+async def _complete_registration(existing: Any, grants: dict[str, str]) -> Any:
+    """Run the final OTP step against fakes; return the patched link sender."""
+    _pending[42] = _PendingReg(
+        tg_full_name="Alice", slack_user_id="U01234ABCDE", code="AABB11"
+    )
+    msg = _fake_message(user_id=42)
+
+    fake_conn = AsyncMock()
+    fake_txn = AsyncMock()
+    fake_txn.__aenter__ = AsyncMock(return_value=fake_txn)
+    fake_txn.__aexit__ = AsyncMock(return_value=False)
+    fake_conn.transaction = MagicMock(return_value=fake_txn)
+
+    with (
+        patch("src.bot.handlers.registration.acquire_connection") as mock_acq,
+        patch(
+            "src.bot.handlers.registration.find_internal_user_by_telegram_id",
+            new_callable=AsyncMock,
+            return_value=existing,
+        ),
+        patch(
+            "src.bot.handlers.registration.update_slack_user_id",
+            new_callable=AsyncMock,
+            return_value=MagicMock(),
+        ),
+        patch(
+            "src.bot.handlers.registration.update_user_role",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "src.bot.handlers.registration.insert_audit_log",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "src.bot.handlers.registration.send_dashboard_link",
+            new_callable=AsyncMock,
+        ) as mock_link,
+        patch.object(
+            reg_mod.settings, "REGISTRATION_ROLE_GRANTS", grants
+        ),
+    ):
+        mock_acq.return_value.__aenter__ = AsyncMock(return_value=fake_conn)
+        mock_acq.return_value.__aexit__ = AsyncMock(return_value=False)
+        await _step_receive_code(msg, 42, "AABB11")
+    return mock_link, msg
+
+
+@pytest.mark.asyncio
+async def test_granted_head_gets_the_sign_in_link_without_asking() -> None:
+    """The grant exists so setup ends here — not with "now send /dashboard"."""
+    existing = _fake_internal_user()
+    existing.role = "manager"
+    mock_link, msg = await _complete_registration(
+        existing, {"U01234ABCDE": "head"}
+    )
+    mock_link.assert_awaited_once()
+    assert "team report" in msg.answer.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_an_existing_head_relinking_also_gets_a_link() -> None:
+    # No grant fires (not a first binding), but the person may read the report.
+    existing = _fake_internal_user(slack_user_id="U09999ZZZZZ")
+    existing.role = "head"
+    mock_link, _ = await _complete_registration(existing, {})
+    mock_link.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_plain_manager_is_told_nothing_about_a_report() -> None:
+    """The cover: a manager may be the SUBJECT of what the report measures."""
+    existing = _fake_internal_user()
+    existing.role = "manager"
+    mock_link, msg = await _complete_registration(existing, {})
+    mock_link.assert_not_awaited()
+    body = msg.answer.call_args[0][0]
+    assert "report" not in body.lower() and "/dashboard" not in body

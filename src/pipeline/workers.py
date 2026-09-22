@@ -70,13 +70,14 @@ _SUMMARY_SCHEDULER_INTERVAL_SECONDS = 900
 # old. Covers a short outage spanning the slot, without blasting a stale report
 # on a fresh deploy days later.
 _SUMMARY_CATCHUP_WINDOW_SECONDS = 21600  # 6h
-# Both slots fire at LOCAL midnight in settings.REPORT_TIMEZONE (Kyiv), so a
-# report is waiting at the start of the working day and its window covers whole
-# local days. Weekly: Monday 00:00 local. Monthly: 1st of month 00:00 local.
+# Release slots fire at settings.REPORT_RELEASE_HOUR local in
+# settings.REPORT_TIMEZONE (06:00 Kyiv since 2026-09-22 — the release is a DM
+# that gets pinned in the reader's chat, and 00:00 put it under a night's worth
+# of other messages). Weekly: Monday. Monthly: 1st of month.
 _WEEKLY_DOW = 0  # Monday (datetime.weekday(): Monday == 0)
-_WEEKLY_HOUR = 0
-_MONTHLY_HOUR = 0
-# Daily content refresh (no Slack post, no new link) at the same local midnight.
+# The daily content refresh keeps local MIDNIGHT: it posts nothing and rotates
+# nothing, it only makes sure yesterday is on the page before anyone opens it,
+# so it should happen as early in the day as possible.
 _DAILY_HOUR = 0
 
 
@@ -531,16 +532,18 @@ def report_timezone() -> tzinfo:
 
 
 def _last_weekly_occurrence(now: datetime) -> datetime:
-    """Most recent Monday 00:00 REPORT_TIMEZONE at or before ``now``, as UTC.
+    """Most recent Monday REPORT_RELEASE_HOUR, REPORT_TIMEZONE, at or before ``now``.
 
     The arithmetic is done on the LOCAL wall clock and only then converted, so
-    the slot stays at local midnight across a DST change rather than drifting an
-    hour twice a year.
+    the slot stays at the same local hour across a DST change rather than
+    drifting an hour twice a year.
     """
     local = now.astimezone(report_timezone())
-    occ = local.replace(hour=_WEEKLY_HOUR, minute=0, second=0, microsecond=0)
+    occ = local.replace(
+        hour=settings.REPORT_RELEASE_HOUR, minute=0, second=0, microsecond=0
+    )
     occ -= timedelta(days=(local.weekday() - _WEEKLY_DOW) % 7)
-    if occ > local:  # this week's Monday hasn't struck midnight yet → last week
+    if occ > local:  # this week's slot hasn't struck yet → last week's
         occ -= timedelta(days=7)
     return occ.astimezone(UTC)
 
@@ -553,12 +556,13 @@ def _last_daily_occurrence(now: datetime) -> datetime:
 
 
 def _last_monthly_occurrence(now: datetime) -> datetime:
-    """Most recent 1st-of-month 00:00 REPORT_TIMEZONE at or before ``now``, as UTC."""
+    """Most recent 1st-of-month release slot at or before ``now``, as UTC."""
     local = now.astimezone(report_timezone())
-    occ = local.replace(day=1, hour=_MONTHLY_HOUR, minute=0, second=0, microsecond=0)
-    if occ > local:  # before the 1st @ local midnight → step into previous month
+    hour = settings.REPORT_RELEASE_HOUR
+    occ = local.replace(day=1, hour=hour, minute=0, second=0, microsecond=0)
+    if occ > local:  # before this month's slot → step into the previous month
         occ = (occ - timedelta(days=1)).replace(
-            day=1, hour=_MONTHLY_HOUR, minute=0, second=0, microsecond=0
+            day=1, hour=hour, minute=0, second=0, microsecond=0
         )
     return occ.astimezone(UTC)
 
@@ -566,10 +570,11 @@ def _last_monthly_occurrence(now: datetime) -> datetime:
 async def run_summary_scheduler_tick(bot: Bot | None = None) -> list[str]:
     """One scheduler pass: release any due report, then refresh today's content.
 
-    Two kinds of work, both at 00:00 local (``REPORT_TIMEZONE``):
+    Two kinds of work, on two different local clocks (``REPORT_TIMEZONE``):
 
-    * **Release** (Monday / 1st of month) — full :func:`generate_report`: new
-      dashboard link, Slack post, old links retired.
+    * **Release** (Monday / 1st of month at ``REPORT_RELEASE_HOUR``) — full
+      :func:`generate_report`: new dashboard link, Slack post, old links retired,
+      and the pinned DM to every reader.
     * **Daily refresh** (every day) — :func:`refresh_report`: re-renders weekly
       and monthly content for the current rolling window and stores it, with NO
       Slack post and NO link rotation. The dashboard renders the newest summary
@@ -650,10 +655,10 @@ async def summary_scheduler_loop(
 ) -> None:
     """Fire weekly/monthly summary reports on schedule — replaces the n8n cron.
 
-    Weekly release: Monday 00:00 in ``REPORT_TIMEZONE``. Monthly release: 1st of
-    month 00:00 in the same zone (Kyiv by default — 21:00/22:00 UTC the day
-    before). Report CONTENT is refreshed daily at the same local midnight
-    (no Slack post). Checks every
+    Weekly release: Monday ``REPORT_RELEASE_HOUR`` in ``REPORT_TIMEZONE``.
+    Monthly release: 1st of month, same hour and zone. Report CONTENT is
+    refreshed daily at local MIDNIGHT, earlier and independent of the release
+    (no Slack post, no link rotation). Checks every
     ``interval_seconds``; the per-slot DB dedup (``summary_exists_since``) makes
     firing idempotent across restarts and overlapping ticks. Per-iteration errors
     are logged and swallowed so one bad run doesn't kill the loop; cancellation

@@ -11,11 +11,16 @@ Three pieces:
   HMAC over them. The role inside is a *hint* — every request re-reads the user
   from the database, so disabling someone or demoting a head takes effect on
   their next page load rather than when a stored session happens to lapse.
-* **One-time login links** (:func:`issue_login_token` / :func:`consume_login_token`).
-  The bot DMs a link, the link sets the cookie. Tokens live in memory with a
-  15-minute TTL and are consumed on first use — the same shape as the ``/register``
-  OTP flow, and for the same reason: a restart losing a handful of unopened
-  links costs nothing, while a table would need its own purge.
+* **Sign-in links** (:func:`issue_login_token` / :func:`verify_login_token`).
+  The bot DMs a link, the link sets the cookie. Signed like the cookie and
+  checked the same way, so they are stateless: nothing is stored, a restart
+  invalidates nothing, and there is no table to purge. They were single-use and
+  15 minutes long until 2026-09-22, when the weekly report became a *pinned*
+  message a reader returns to all week — a link that dies on first use makes
+  that message a one-shot. They now live ``DASHBOARD_LOGIN_LINK_DAYS`` and may be
+  followed more than once, which makes the URL a bearer credential for that
+  window: it goes only to that person's own DM, and rotating the signing secret
+  kills every outstanding one.
 * **Telegram Login Widget** (:func:`verify_telegram_login`). The standard check
   from Telegram's docs — HMAC over the sorted data fields with SHA-256 of the bot
   token as the key — plus a freshness bound, so a captured callback URL is not a
@@ -30,7 +35,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import secrets
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -44,10 +48,6 @@ _VERSION = "v1"
 #: Cookie name. Not token-scoped (there is no token any more) — one session per
 #: browser, for whoever signed in.
 SESSION_COOKIE = "dash_session"
-
-#: How long an unopened login link stays valid.
-LOGIN_TOKEN_TTL_SECONDS = 900
-
 
 def _signing_key() -> bytes:
     """Derive the HMAC key. Explicit setting wins; bot token is the fallback."""
@@ -108,41 +108,61 @@ def verify_session(raw: str | None, *, now: float | None = None) -> SessionClaim
 
 
 # ---------------------------------------------------------------------------
-# One-time login links
+# Sign-in links
 # ---------------------------------------------------------------------------
 
-#: token -> (user id, expiry). In-memory on purpose; see the module docstring.
-_login_tokens: dict[str, tuple[UUID, float]] = {}
-
-
-def _drop_expired(now: float) -> None:
-    for token in [t for t, (_, exp) in _login_tokens.items() if exp <= now]:
-        _login_tokens.pop(token, None)
+#: Signature domain, so a session cookie can never be replayed as a login token
+#: (or the other way round) even though both are signed with the same key.
+_LOGIN_DOMAIN = "login"
 
 
 def issue_login_token(user_id: UUID, *, now: float | None = None) -> str:
-    """A fresh single-use token for this user; older ones stay valid until used."""
-    moment = now if now is not None else time.monotonic()
-    _drop_expired(moment)
-    token = secrets.token_urlsafe(32)
-    _login_tokens[token] = (user_id, moment + LOGIN_TOKEN_TTL_SECONDS)
-    return token
+    """A sign-in token for this user, valid for ``DASHBOARD_LOGIN_LINK_DAYS``.
+
+    Stateless: the token IS its own record, so issuing one costs nothing, a
+    restart loses none of them, and the same link keeps working while a reader
+    comes back to the pinned message that carries it.
+    """
+    moment = int(now if now is not None else time.time())
+    expires_at = moment + settings.DASHBOARD_LOGIN_LINK_DAYS * 86400
+    payload = f"{_VERSION}.{user_id.hex}.{expires_at}"
+    return f"{payload}.{_sign(f'{_LOGIN_DOMAIN}:{payload}')}"
 
 
-def consume_login_token(token: str, *, now: float | None = None) -> UUID | None:
-    """Redeem a token exactly once. ``None`` if unknown, expired or already used."""
-    moment = now if now is not None else time.monotonic()
-    _drop_expired(moment)
-    entry = _login_tokens.pop(token, None)
-    if entry is None:
+def login_url(user_id: UUID) -> str:
+    """The full sign-in URL for this user — built in one place.
+
+    Two callers need the identical link: the bot's /dashboard reply and the weekly
+    report DM that gets pinned in the reader's chat. It lives here, next to the
+    signing, so neither has to know how a token is shaped.
+    """
+    return f"{settings.SERVER_BASE_URL.rstrip('/')}/auth/link/{issue_login_token(user_id)}"
+
+
+def verify_login_token(token: str, *, now: float | None = None) -> UUID | None:
+    """The user a token names, or ``None`` if it is not exactly right.
+
+    Signature first, expiry second — a tampered payload never reaches the field
+    parsing. The token grants a session, never a role: what the holder may then
+    see is re-read from the database on every request.
+    """
+    parts = token.split(".")
+    if len(parts) != 4:
         return None
-    user_id, expires_at = entry
-    return user_id if expires_at > moment else None
-
-
-def forget_login_tokens() -> None:
-    """Test hook — drop every outstanding token."""
-    _login_tokens.clear()
+    version, user_hex, expires_raw, signature = parts
+    if version != _VERSION:
+        return None
+    expected = _sign(f"{_LOGIN_DOMAIN}:{'.'.join(parts[:3])}")
+    if not hmac.compare_digest(signature, expected):
+        return None
+    try:
+        user_id = UUID(hex=user_hex)
+        expires_at = int(expires_raw)
+    except ValueError:
+        return None
+    if expires_at <= int(now if now is not None else time.time()):
+        return None
+    return user_id
 
 
 # ---------------------------------------------------------------------------

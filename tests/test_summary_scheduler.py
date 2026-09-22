@@ -13,13 +13,16 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from src.config import settings
 from src.pipeline import workers as w
 
 # June 2026: the 1st is a Monday, so the 15th and 22nd are Mondays too;
 # the 24th (today) is a Wednesday.
 #
-# Slots fire at 00:00 in REPORT_TIMEZONE (Kyiv = UTC+3 in summer, UTC+2 in
-# winter), so the expected UTC instant is 21:00 / 22:00 the PREVIOUS day.
+# Release slots fire at REPORT_RELEASE_HOUR (06:00 since 2026-09-22) in
+# REPORT_TIMEZONE (Kyiv = UTC+3 in summer, UTC+2 in winter), so the expected UTC
+# instant is 03:00 / 04:00 the SAME day. The daily content refresh still fires at
+# local midnight, which is 21:00 / 22:00 the previous day.
 _KYIV = ZoneInfo("Europe/Kyiv")
 
 
@@ -28,51 +31,66 @@ _KYIV = ZoneInfo("Europe/Kyiv")
 # ---------------------------------------------------------------------------
 
 
-def test_weekly_occurrence_is_prior_monday_local_midnight() -> None:
+def test_weekly_occurrence_is_prior_monday_at_the_release_hour() -> None:
     now = datetime(2026, 6, 24, 15, 0, tzinfo=UTC)  # Wednesday 15:00 UTC
     occ = w._last_weekly_occurrence(now)
-    assert occ == datetime(2026, 6, 21, 21, 0, tzinfo=UTC)  # Mon 00:00 Kyiv (+3)
+    assert occ == datetime(2026, 6, 22, 3, 0, tzinfo=UTC)  # Mon 06:00 Kyiv (+3)
     local = occ.astimezone(_KYIV)
-    assert local.weekday() == 0 and local.hour == 0
+    assert local.weekday() == 0 and local.hour == settings.REPORT_RELEASE_HOUR
     assert occ <= now and (now - occ) < timedelta(days=7)
 
 
-def test_weekly_occurrence_before_local_midnight_steps_back_a_week() -> None:
-    # Sunday 22:00 Kyiv — this week's Monday 00:00 has not struck yet.
-    now = datetime(2026, 6, 21, 19, 0, tzinfo=UTC)
+def test_weekly_occurrence_before_the_release_hour_steps_back_a_week() -> None:
+    # Monday 05:00 Kyiv — this week's 06:00 slot has not struck yet.
+    now = datetime(2026, 6, 22, 2, 0, tzinfo=UTC)
     occ = w._last_weekly_occurrence(now)
-    assert occ == datetime(2026, 6, 14, 21, 0, tzinfo=UTC)  # previous Mon 00:00 Kyiv
+    assert occ == datetime(2026, 6, 15, 3, 0, tzinfo=UTC)  # previous Mon 06:00 Kyiv
 
 
-def test_monthly_occurrence_is_first_of_month_local_midnight() -> None:
+def test_monthly_occurrence_is_first_of_month_at_the_release_hour() -> None:
     now = datetime(2026, 6, 24, 15, 0, tzinfo=UTC)
     occ = w._last_monthly_occurrence(now)
-    assert occ == datetime(2026, 5, 31, 21, 0, tzinfo=UTC)  # 1 Jun 00:00 Kyiv
-    assert occ.astimezone(_KYIV).day == 1
+    assert occ == datetime(2026, 6, 1, 3, 0, tzinfo=UTC)  # 1 Jun 06:00 Kyiv
+    local = occ.astimezone(_KYIV)
+    assert local.day == 1 and local.hour == settings.REPORT_RELEASE_HOUR
 
 
-def test_monthly_occurrence_before_local_midnight_steps_to_prev_month() -> None:
-    # 31 May 22:00 Kyiv — June's slot hasn't struck; fall back to 1 May.
-    now = datetime(2026, 5, 31, 19, 0, tzinfo=UTC)
+def test_monthly_occurrence_before_the_release_hour_steps_to_prev_month() -> None:
+    # 1 June 05:00 Kyiv — June's slot hasn't struck; fall back to 1 May.
+    now = datetime(2026, 6, 1, 2, 0, tzinfo=UTC)
     occ = w._last_monthly_occurrence(now)
-    assert occ == datetime(2026, 4, 30, 21, 0, tzinfo=UTC)  # 1 May 00:00 Kyiv
+    assert occ == datetime(2026, 5, 1, 3, 0, tzinfo=UTC)  # 1 May 06:00 Kyiv
 
 
-def test_occurrences_hold_local_midnight_across_dst() -> None:
-    """Winter slots land at 22:00 UTC, summer at 21:00 — local midnight either way."""
+def test_occurrences_hold_the_local_hour_across_dst() -> None:
+    """Winter slots land at 04:00 UTC, summer at 03:00 — 06:00 Kyiv either way."""
     winter = w._last_weekly_occurrence(datetime(2026, 1, 21, 12, 0, tzinfo=UTC))
     summer = w._last_weekly_occurrence(datetime(2026, 7, 22, 12, 0, tzinfo=UTC))
     for occ in (winter, summer):
         local = occ.astimezone(_KYIV)
-        assert (local.hour, local.minute, local.weekday()) == (0, 0, 0)
-    assert winter.hour == 22 and summer.hour == 21
+        assert (local.hour, local.minute, local.weekday()) == (6, 0, 0)
+    assert winter.hour == 4 and summer.hour == 3
+
+
+def test_the_daily_refresh_still_fires_at_local_midnight() -> None:
+    """It posts nothing and rotates nothing — it just gets yesterday onto the
+    page before anyone opens it, so it stays as early as the day allows."""
+    occ = w._last_daily_occurrence(datetime(2026, 6, 24, 15, 0, tzinfo=UTC))
+    local = occ.astimezone(_KYIV)
+    assert (local.hour, local.day) == (0, 24)
+
+
+def test_the_release_hour_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "REPORT_RELEASE_HOUR", 9)
+    occ = w._last_weekly_occurrence(datetime(2026, 6, 24, 15, 0, tzinfo=UTC))
+    assert occ.astimezone(_KYIV).hour == 9
 
 
 def test_bad_timezone_falls_back_to_utc(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(w.settings, "REPORT_TIMEZONE", "Mars/Olympus_Mons")
     assert w.report_timezone() is UTC
     occ = w._last_weekly_occurrence(datetime(2026, 6, 24, 15, 0, tzinfo=UTC))
-    assert occ == datetime(2026, 6, 22, 0, 0, tzinfo=UTC)  # Monday 00:00 UTC
+    assert occ == datetime(2026, 6, 22, 6, 0, tzinfo=UTC)  # Monday 06:00 UTC
 
 
 # ---------------------------------------------------------------------------

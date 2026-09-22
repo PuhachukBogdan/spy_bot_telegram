@@ -325,6 +325,34 @@ async def list_report_recipients(conn: asyncpg.Connection) -> list[InternalUser]
     return [InternalUser.from_record(row) for row in rows]
 
 
+async def list_slack_report_recipients(
+    conn: asyncpg.Connection,
+) -> list[InternalUser]:
+    """Report readers reachable in Slack — same roles, different transport.
+
+    The Telegram list (:func:`list_report_recipients`) drops rows with no
+    Telegram account; this one drops rows with no linked Slack account, for the
+    same reason: there is nowhere to deliver to. The two lists overlap on
+    purpose — someone who lives in Slack asked to be read there, and the same
+    release also reaches them in Telegram if they use the bot.
+
+    ``settings.REPORT_SLACK_DM_IDS`` covers the people who are not in the table
+    yet; this covers everyone who is, so a new head starts receiving the Slack
+    copy the moment the role is granted.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT *
+        FROM internal_users
+        WHERE role IN ('admin', 'head')
+          AND enabled = true
+          AND slack_user_id IS NOT NULL
+        ORDER BY full_name ASC
+        """
+    )
+    return [InternalUser.from_record(row) for row in rows]
+
+
 async def update_user_role(
     conn: asyncpg.Connection, user_id: UUID, role: str
 ) -> InternalUser | None:

@@ -35,6 +35,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from src.alerts.slack import SlackDeliveryError, send_dm_to_user
+from src.bot.handlers.dm_commands import send_dashboard_link
 from src.config import settings
 from src.db.client import acquire_connection
 from src.db.models import InternalUser
@@ -45,6 +46,7 @@ from src.db.queries.etc import (
     update_slack_user_id,
     update_user_role,
 )
+from src.metrics.scope import DASHBOARD_ROLES
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -181,8 +183,8 @@ async def _step_receive_slack_id(message: Message, user_id: int, text: str) -> N
 #: Roles a grant may confer that are worth telling the person about. Everything
 #: else is silent — a manager has no surface to be told about.
 _GRANT_NOTE = (
-    "\n\nYou also have access to the <b>team report</b>. "
-    "Send /dashboard for a sign-in link."
+    "\n\nYou also have access to the <b>team report</b> — "
+    "your sign-in link follows."
 )
 
 
@@ -294,8 +296,20 @@ async def _step_receive_code(message: Message, user_id: int, text: str) -> None:
         internal_id=str(existing.id),
         slack_id=pending.slack_user_id,
     )
-    note = _GRANT_NOTE if grant in ("admin", "head") else ""
+    # The role this person holds now: the fresh grant if there was one, else
+    # whatever the row already carried — re-registering as an existing head
+    # must land in the same place as being granted one.
+    effective_role = grant or existing.role
+    may_read_report = effective_role in DASHBOARD_ROLES
+    note = _GRANT_NOTE if may_read_report else ""
     await message.answer(
         "✅ Your Slack account has been linked.\n\n"
         f"Slack ID: <code>{html_escape(pending.slack_user_id)}</code>{note}"
     )
+    if may_read_report:
+        # Straight to a working link rather than 'now send /dashboard': the
+        # whole point of the grant is that setup ends here, and these are two
+        # or three senior people who will not chase a second command.
+        await send_dashboard_link(
+            message, updated.model_copy(update={"role": effective_role})
+        )

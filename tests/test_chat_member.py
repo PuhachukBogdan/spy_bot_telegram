@@ -42,6 +42,42 @@ def test_parse_no_numeric_affid() -> None:
     assert _parse_chat_title("Just A Partner | Beton.Win") == ("", "Just A Partner")
 
 
+# --- Stalker: the second company brand, in group titles since 2026-09 ---------
+# The three titles below are real ones taken from the live `chats` table.
+
+
+def test_parse_stalker_brand() -> None:
+    assert _parse_chat_title("91143| FTDteam | Stalker") == ("91143", "FTDteam")
+
+
+def test_parse_stalker_brand_in_the_middle() -> None:
+    assert _parse_chat_title("90151 | Stalker | Unlocked Traff") == (
+        "90151",
+        "Unlocked Traff",
+    )
+
+
+def test_parse_stalker_without_an_affid() -> None:
+    assert _parse_chat_title("Stalker | MirX") == ("", "MirX")
+
+
+def test_parse_both_brands_in_one_title() -> None:
+    """A chat serving both brands keeps neither token in the partner name."""
+    assert _parse_chat_title("74243 | HighRoll | Betonwin | Stalker") == (
+        "74243",
+        "HighRoll",
+    )
+
+
+def test_parse_stalker_is_a_whole_token_not_a_substring() -> None:
+    """Same rule as Beton.Win: the marker is its own pipe-separated token.
+
+    A partner whose name merely contains the word is not a brand marker, and
+    must not be mistaken for one and dropped from the name.
+    """
+    assert _parse_chat_title("12345 | Stalkerz Media") is None
+
+
 def test_parse_no_brand_suffix() -> None:
     assert _parse_chat_title("12345 | PartnerName") is None
 

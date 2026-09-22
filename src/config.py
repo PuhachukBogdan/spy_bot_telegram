@@ -203,6 +203,20 @@ class Settings(BaseSettings):
     # at local midnight too. DST is handled by zoneinfo, so the UTC instant
     # shifts with the season (Kyiv: 21:00 UTC in summer, 22:00 in winter).
     REPORT_TIMEZONE: str = "Europe/Kyiv"
+    # Local hour of the weekly (Monday) and monthly (1st) release. 06:00 since
+    # 2026-09-22 at the user's request: the release is now a personal DM that
+    # gets pinned in the reader's chat, and a message that arrives at 00:00 is
+    # already buried under the night's alerts by breakfast. The daily content
+    # refresh stays at local midnight — it posts nothing, it only makes sure the
+    # page shows yesterday before anyone opens it.
+    REPORT_RELEASE_HOUR: int = 6
+    # Whether a release still posts its card to SLACK_CHANNEL_REPORTS. Since the
+    # report reaches its readers personally (Slack DM + Telegram DM, §22), the
+    # channel is an extra copy in a shared room rather than the delivery. Turned
+    # off in prod on 2026-09-21 at the user's word; the channel id stays in .env
+    # so putting it back is one flag. Link rotation does not depend on it —
+    # the dashboard URL is fixed and secret-free since 2026-09-11.
+    REPORT_POST_TO_CHANNEL: bool = True
 
     # === Phase 2 manager metrics (SLA %, active-chat KPI, tone of voice) ===
     # Hard floor for EVERY metrics window. Phase 2 KPIs count forward from the day
@@ -257,7 +271,7 @@ class Settings(BaseSettings):
 
     # === Dashboard sign-in (2026-09-11) ===
     # The dashboard is no longer a shared token + password: a viewer signs in as
-    # themselves (Telegram Login Widget, or a one-time link the bot DMs) and the
+    # themselves (Telegram Login Widget, or a link the bot DMs) and the
     # page is scoped to their role — see src/metrics/scope.py.
     # Signing key for the session cookie. Left unset it is derived from the bot
     # token, so no .env change is needed to deploy; setting (or changing) it
@@ -268,11 +282,21 @@ class Settings(BaseSettings):
     # stop opening. Revocation does not wait for it — /disable_user and
     # /set_role take effect on the viewer's next request.
     DASHBOARD_SESSION_DAYS: int = 90
+    # How long a sign-in link from the bot stays usable, and how often it may be
+    # used. Until 2026-09-22 a link was single-use and lived 15 minutes, which
+    # made every message carrying one a one-shot: tapping the same message a
+    # second time, or an hour later, landed on "Link expired". The weekly report
+    # DM is now a pinned message a reader comes back to all week, so the link in
+    # it has to still work when they do. The trade-off is deliberate and worth
+    # naming: for these days the URL is a bearer credential for that person, so
+    # it is only ever sent to their own DM with the bot, and rotating
+    # DASHBOARD_SESSION_SECRET invalidates every outstanding one at once.
+    DASHBOARD_LOGIN_LINK_DAYS: int = 7
     # The Telegram Login Widget on the sign-in page works only after the bot's
     # owner has run /setdomain in BotFather for SERVER_BASE_URL's host; until
     # then it renders "Bot domain invalid". Off by default, so the page leads
     # with the route that needs nothing configured on Telegram's side — the
-    # deep link t.me/<bot>?start=dashboard, answered by the bot with a one-time
+    # deep link t.me/<bot>?start=dashboard, answered by the bot with a personal
     # sign-in link — and the widget is an addition, never a dependency.
     DASHBOARD_TELEGRAM_WIDGET: bool = False
 
@@ -289,6 +313,43 @@ class Settings(BaseSettings):
     # tree is pushed to three GitHub remotes. Shape (one line):
     #   REGISTRATION_ROLE_GRANTS={"U01234ABCDE": "admin"}
     REGISTRATION_ROLE_GRANTS: dict[str, str] = {}
+
+    # Slack member IDs that also receive the weekly/monthly report as a Slack DM,
+    # on top of the #reports channel post and the Telegram DM.
+    #
+    # Why a list in .env and not only the roles table: the people who asked to be
+    # read in Slack are not necessarily IN the bot yet — a person with no
+    # internal_users row has no role to key a lookup on, and waiting for their
+    # /register would mean waiting to deliver something they asked for. Anyone
+    # who DOES hold admin/head with a linked Slack account is addressed from the
+    # database as well (list_slack_report_recipients), so this list is a seed,
+    # not the address book: remove an id once its owner holds the role.
+    #
+    # Personal identifiers -> .env only, never the repo (three remotes). Shape:
+    #   REPORT_SLACK_DM_IDS=["U01234ABCDE"]
+    REPORT_SLACK_DM_IDS: list[str] = []
+
+    # Telegram user ids that receive the release as a bot DM, mapped to the role
+    # each one reads it as. The Telegram twin of REPORT_SLACK_DM_IDS, for the same
+    # reason: a person with no internal_users row has no role to key a lookup on,
+    # and everyone who DOES hold admin/head is addressed from the database anyway
+    # (list_report_recipients), so an id here is a seed, not the address book —
+    # drop it once its owner holds the role. An id already reachable through a
+    # role holder's account is DM'd once, not twice.
+    #
+    # Why a role per id where the Slack list is bare: the card is scoped by role
+    # (only an admin may read the company-wide signal count, §21) and there is no
+    # grants map to look it up in on this side — REGISTRATION_ROLE_GRANTS is keyed
+    # by Slack member id. An unknown role does not drop the reader, it only scopes
+    # them: the worst case is one line less.
+    #
+    # Telegram will not let a bot open a conversation the person never started, so
+    # a seeded id that has never pressed Start is unreachable; the release logs
+    # that and moves on.
+    #
+    # Personal identifiers -> .env only, never the repo (three remotes). Shape:
+    #   REPORT_TELEGRAM_DM_IDS={"123456789": "admin"}
+    REPORT_TELEGRAM_DM_IDS: dict[str, str] = {}
 
     # === Tone of voice (Phase 2, track F — daily LLM review of manager wording) ===
     # Kill switch. Off by default like OPS_ALERTS_ENABLED: a new LLM load is turned
@@ -377,6 +438,46 @@ class Settings(BaseSettings):
             if role in allowed:
                 cleaned[key.strip().upper()] = role
         self.REGISTRATION_ROLE_GRANTS = cleaned
+        return self
+
+    @model_validator(mode="after")
+    def _normalise_report_slack_dms(self) -> Settings:
+        """Upper-case, strip and de-duplicate the Slack DM list, order kept.
+
+        Slack member IDs are case-sensitive upper-case; a lower-case paste would
+        silently address nobody. Duplicates are dropped so one person cannot be
+        DM'd twice by a sloppy .env edit.
+        """
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for raw in self.REPORT_SLACK_DM_IDS:
+            uid = raw.strip().upper()
+            if uid and uid not in seen:
+                seen.add(uid)
+                cleaned.append(uid)
+        self.REPORT_SLACK_DM_IDS = cleaned
+        return self
+
+    @model_validator(mode="after")
+    def _normalise_report_telegram_dms(self) -> Settings:
+        """Keep entries whose key is a Telegram user id; scope an unknown role.
+
+        A key that is not a bare number can never be a chat id, so it is dropped
+        rather than sent to and logged as a failure every week. An unrecognised
+        role is the opposite case: the person was deliberately listed, so they
+        still get the report — just the scoped card, which is the fail-closed
+        direction (a head's page excludes his own rows, and a total he cannot
+        reconcile against it is exactly what the scoping removes).
+        """
+        allowed = {"admin", "head", "manager", "viewer"}
+        cleaned: dict[str, str] = {}
+        for key, raw_role in self.REPORT_TELEGRAM_DM_IDS.items():
+            chat_id = key.strip()
+            if not chat_id.isdigit():
+                continue
+            role = raw_role.strip().lower()
+            cleaned[chat_id] = role if role in allowed else "head"
+        self.REPORT_TELEGRAM_DM_IDS = cleaned
         return self
 
     @model_validator(mode="after")

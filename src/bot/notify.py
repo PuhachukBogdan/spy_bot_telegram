@@ -97,17 +97,58 @@ def format_auto_active_notice(
     )
 
 
-async def notify_internal_user(bot: Bot, user: InternalUser, text: str) -> bool:
+async def pin_replacing_previous(bot: Bot, chat_id: int, message_id: int) -> bool:
+    """Pin a message in a DM, unpinning the bot's own previous pin there.
+
+    What "previous" means is read from Telegram (``get_chat().pinned_message``)
+    rather than from a stored id: one call, no table, and it stays right when
+    someone unpins by hand or the bot is redeployed with a cold database. Only a
+    pin the BOT authored is removed — a message the reader pinned themselves is
+    theirs, not ours to touch.
+
+    Best-effort like every other DM here. Pinning is a convenience on top of a
+    message that has already been delivered, so a chat where it is not allowed
+    costs a log line, never the delivery.
+    """
+    try:
+        me = await bot.me()
+        previous = (await bot.get_chat(chat_id)).pinned_message
+        if (
+            previous is not None
+            and previous.message_id != message_id
+            and previous.from_user is not None
+            and previous.from_user.id == me.id
+        ):
+            await bot.unpin_chat_message(chat_id=chat_id, message_id=previous.message_id)
+        # Silent: the message itself already notified, and a second ping for its
+        # pin is the kind of noise that gets a bot muted.
+        await bot.pin_chat_message(
+            chat_id=chat_id, message_id=message_id, disable_notification=True
+        )
+        return True
+    except TelegramAPIError as exc:
+        log.warning("notify.pin_failed", chat_id=chat_id, error=str(exc))
+        return False
+
+
+async def notify_internal_user(
+    bot: Bot, user: InternalUser, text: str, *, pin: bool = False
+) -> bool:
     """DM one internal user; return whether delivery succeeded.
 
     A person may have several Telegram accounts but can only be DM'd on ones that
     have started the bot (Telegram restriction, CLAUDE.md 11.3). We try each
     account and stop after the first success, so the user gets one message; a user
     with no reachable account is logged (not retried) and ``False`` is returned.
+
+    ``pin`` replaces the bot's previous pin in that chat with this message — how
+    the weekly report keeps one live link at the top of the conversation.
     """
     for account_id in user.telegram_accounts:
         try:
-            await bot.send_message(account_id, text)
+            sent = await bot.send_message(account_id, text)
+            if pin:
+                await pin_replacing_previous(bot, account_id, sent.message_id)
             return True
         except TelegramAPIError as exc:
             # Most commonly: the user has not started the bot, or blocked it.
@@ -119,6 +160,28 @@ async def notify_internal_user(bot: Bot, user: InternalUser, text: str) -> bool:
             )
     log.warning("notify.user_unreachable", user=user.full_name)
     return False
+
+
+async def notify_telegram_id(
+    bot: Bot, chat_id: int, text: str, *, pin: bool = False
+) -> bool:
+    """DM a raw Telegram id; return whether delivery succeeded.
+
+    The counterpart of :func:`notify_internal_user` for someone the bot knows only
+    by id — a report reader seeded in ``.env`` who has no ``internal_users`` row
+    to carry their accounts. Same best-effort contract: a person who never pressed
+    Start (Telegram refuses to let a bot open that conversation) is logged once
+    and never retried, because a release must not fail over one unreachable
+    reader.
+    """
+    try:
+        sent = await bot.send_message(chat_id, text)
+        if pin:
+            await pin_replacing_previous(bot, chat_id, sent.message_id)
+        return True
+    except TelegramAPIError as exc:
+        log.warning("notify.chat_unreachable", chat_id=chat_id, error=str(exc))
+        return False
 
 
 async def notify_admins(bot: Bot, admins: list[InternalUser], text: str) -> None:

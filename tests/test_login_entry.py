@@ -86,7 +86,9 @@ def start_deps(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     find = AsyncMock(return_value=None)
     monkeypatch.setattr(dm, "acquire_connection", fake_acquire)
     monkeypatch.setattr(dm, "find_internal_user_by_telegram_id", find)
-    monkeypatch.setattr(dm, "issue_login_token", lambda user_id: "TOKEN123")
+    monkeypatch.setattr(
+        dm, "login_url", lambda user_id: "https://x.test/auth/link/TOKEN123"
+    )
     return find
 
 

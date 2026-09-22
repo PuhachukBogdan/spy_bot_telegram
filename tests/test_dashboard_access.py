@@ -38,10 +38,10 @@ from src.metrics.scope import (
 from src.metrics.trends import build_scope_days
 from src.metrics.window import resolve_metrics_window
 from src.utils.session import (
-    consume_login_token,
-    forget_login_tokens,
     issue_login_token,
+    login_url,
     sign_session,
+    verify_login_token,
     verify_session,
     verify_telegram_login,
 )
@@ -96,28 +96,66 @@ def test_session_expires() -> None:
 
 
 # ---------------------------------------------------------------------------
-# One-time login links
+# Sign-in links
+#
+# Single-use and 15 minutes until 2026-09-22. The weekly report is now a PINNED
+# message a reader comes back to all week, so a link that dies on first use made
+# that message a one-shot.
 # ---------------------------------------------------------------------------
 
 
-def test_login_token_is_single_use() -> None:
-    forget_login_tokens()
+def test_login_token_round_trip() -> None:
+    user_id = uuid4()
+    assert verify_login_token(issue_login_token(user_id)) == user_id
+
+
+def test_login_token_survives_being_used_again() -> None:
+    """The pinned weekly message is opened on a phone, then on a laptop."""
     user_id = uuid4()
     token = issue_login_token(user_id)
-    assert consume_login_token(token) == user_id
-    # A link forwarded to someone else, or re-opened from history, is dead.
-    assert consume_login_token(token) is None
+    assert verify_login_token(token) == user_id
+    assert verify_login_token(token) == user_id
 
 
-def test_login_token_expires() -> None:
-    forget_login_tokens()
-    token = issue_login_token(uuid4(), now=1000.0)
-    assert consume_login_token(token, now=1000.0 + 2000) is None
+def test_login_token_expires_after_the_configured_days() -> None:
+    now = 1_000_000.0
+    token = issue_login_token(uuid4(), now=now)
+    days = settings.DASHBOARD_LOGIN_LINK_DAYS
+    assert verify_login_token(token, now=now + (days - 1) * 86400) is not None
+    assert verify_login_token(token, now=now + (days + 1) * 86400) is None
 
 
-def test_login_token_unknown_is_refused() -> None:
-    forget_login_tokens()
-    assert consume_login_token("never-issued") is None
+def test_login_token_rejects_a_forged_user() -> None:
+    """Swapping the id in the URL must not sign you in as somebody else."""
+    token = issue_login_token(uuid4())
+    version, _user_hex, expires, signature = token.split(".")
+    forged = f"{version}.{uuid4().hex}.{expires}.{signature}"
+    assert verify_login_token(forged) is None
+
+
+def test_login_token_rejects_a_longer_life_than_it_was_given() -> None:
+    now = 1_000_000.0
+    token = issue_login_token(uuid4(), now=now)
+    version, user_hex, expires, signature = token.split(".")
+    stretched = f"{version}.{user_hex}.{int(expires) + 86400 * 365}.{signature}"
+    assert verify_login_token(stretched, now=now) is None
+
+
+def test_a_session_cookie_is_not_a_login_token() -> None:
+    """Both are signed with the same key; the domain prefix keeps them apart."""
+    assert verify_login_token(sign_session(uuid4(), "admin")) is None
+
+
+@pytest.mark.parametrize("raw", ["", "never-issued", "v1.deadbeef.1.2.3"])
+def test_login_token_rejects_malformed(raw: str) -> None:
+    assert verify_login_token(raw) is None
+
+
+def test_login_url_points_at_the_auth_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "SERVER_BASE_URL", "https://example.test/")
+    url = login_url(uuid4())
+    assert url.startswith("https://example.test/auth/link/")
+    assert verify_login_token(url.rsplit("/", 1)[1]) is not None
 
 
 # ---------------------------------------------------------------------------

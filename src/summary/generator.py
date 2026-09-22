@@ -14,18 +14,27 @@ Flow:
 from __future__ import annotations
 
 import secrets
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from aiogram import Bot
 
-from src.alerts.slack import get_slack_client
-from src.bot.notify import notify_internal_user
+from src.alerts.slack import (
+    SlackDeliveryError,
+    get_slack_client,
+    send_dm_to_user,
+)
+from src.bot.notify import notify_internal_user, notify_telegram_id
 from src.config import settings
 from src.db.client import acquire_connection
+from src.db.models import InternalUser
 from src.db.queries.activity_signals import count_proposals, list_proposal_dates
-from src.db.queries.etc import list_report_recipients
+from src.db.queries.etc import (
+    list_report_recipients,
+    list_slack_report_recipients,
+)
 from src.db.queries.summaries import (
     count_chats_added,
     count_proposals_by_chat,
@@ -41,6 +50,7 @@ from src.db.queries.summaries import (
 )
 from src.summary.builder import build_report_html
 from src.utils.logging import get_logger
+from src.utils.session import login_url
 
 log = get_logger(__name__)
 
@@ -58,8 +68,11 @@ class ReportResult:
 
     ``slack_delivered`` distinguishes "report saved but Slack post failed"
     (the silent-failure case that hid the missing-channel bug in pilot) from
-    full success — surfaced in the /summary/generate JSON response.
-    ``dashboard_password`` is the access password for the dashboard URL.
+    full success — surfaced in the /summary/generate JSON response. It describes
+    the CHANNEL post only, and is ``True`` when ``REPORT_POST_TO_CHANNEL`` is off
+    (nothing was attempted, so nothing failed); the personal copies report
+    themselves in the log, never here — one unreachable reader is not a failed
+    release. ``dashboard_password`` is the access password for the dashboard URL.
     """
 
     url: str
@@ -222,39 +235,62 @@ async def generate_report(
     slack_delivered = True
     slack_error: str | None = None
     new_ts: str | None = None
-    try:
-        new_ts = await _post_slack_link(
-            period_type, since, until, len(event_rows), dashboard_url
-        )
-    except Exception as exc:
-        slack_delivered = False
-        slack_error = str(exc)
-        log.warning(
-            "summary.post_link_failed",
-            error=slack_error,
-            channel=settings.SLACK_CHANNEL_REPORTS,
-        )
+    if settings.REPORT_POST_TO_CHANNEL:
+        try:
+            new_ts = await _post_slack_link(
+                period_type, since, until, len(event_rows), dashboard_url
+            )
+        except Exception as exc:
+            slack_delivered = False
+            slack_error = str(exc)
+            log.warning(
+                "summary.post_link_failed",
+                error=slack_error,
+                channel=settings.SLACK_CHANNEL_REPORTS,
+            )
+    else:
+        log.info("summary.channel_post_disabled", period_type=period_type)
 
-    # Only retire the old link once the NEW one is confirmed posted — otherwise a
-    # Slack outage would leave the channel with no working link at all.
-    if slack_delivered and new_ts:
-        channel = settings.SLACK_CHANNEL_REPORTS
+    if settings.REPORT_POST_TO_CHANNEL:
+        # Only retire the old link once the NEW one is confirmed posted — otherwise
+        # a Slack outage would leave the channel with no working link at all.
+        if slack_delivered and new_ts:
+            channel = settings.SLACK_CHANNEL_REPORTS
+            async with acquire_connection() as conn:
+                await set_dashboard_slack(conn, dash_id, channel, new_ts)
+                revoked = await revoke_dashboards_except(conn, dash_id)
+            log.info("summary.old_links_revoked", count=revoked)
+            if prev_dash and prev_dash.get("slack_ts"):
+                # Best-effort: edit the previous message to drop its (now-dead) button.
+                try:
+                    await _supersede_message(
+                        prev_dash.get("slack_channel") or channel,
+                        str(prev_dash["slack_ts"]),
+                    )
+                except Exception as exc:
+                    log.warning("summary.supersede_failed", error=str(exc))
+    else:
+        # No post to wait on, so nothing gates the rotation: the new row becomes
+        # the active dashboard immediately. Safe because the advertised URL is
+        # fixed and secret-free — retiring a row no longer invalidates a link
+        # anyone holds, it only records which release is current.
         async with acquire_connection() as conn:
-            await set_dashboard_slack(conn, dash_id, channel, new_ts)
             revoked = await revoke_dashboards_except(conn, dash_id)
-        log.info("summary.old_links_revoked", count=revoked)
-        if prev_dash and prev_dash.get("slack_ts"):
-            # Best-effort: edit the previous message to drop its (now-dead) button.
-            try:
-                await _supersede_message(
-                    prev_dash.get("slack_channel") or channel,
-                    str(prev_dash["slack_ts"]),
-                )
-            except Exception as exc:
-                log.warning("summary.supersede_failed", error=str(exc))
+        log.info("summary.old_links_revoked", count=revoked, channel_post=False)
 
     async with acquire_connection() as conn:
         await mark_summary_delivered(conn, summary_id)
+
+    # Independent of ``bot``: the Slack copy is what the CEO actually reads, and
+    # it must go out whether or not this caller has a Telegram bot to hand.
+    # Wrapped because a Slack outage must not fail a report that is already
+    # built, stored and (usually) posted.
+    try:
+        await _announce_to_slack_dms(
+            period_type, since, until, len(event_rows), dashboard_url
+        )
+    except Exception as exc:
+        log.warning("summary.slack_dm_announce_failed", error=str(exc))
 
     if bot is not None:
         await _announce_to_readers(bot, period_type, since, until, len(event_rows))
@@ -277,6 +313,26 @@ async def generate_report(
     )
 
 
+def _seeded_telegram_readers(
+    recipients: Sequence[InternalUser],
+) -> list[tuple[int, str]]:
+    """``REPORT_TELEGRAM_DM_IDS`` minus everyone the roles table already reaches.
+
+    The seed exists for readers the bot knows only by Telegram id — the CEO has
+    no ``internal_users`` row at all, so no role query can address him. The
+    moment such a person registers they appear in BOTH lists, and the overlap is
+    dropped here so they get one message rather than two.
+    """
+    covered = {
+        account for user in recipients for account in user.telegram_accounts
+    }
+    return [
+        (int(chat_id), role)
+        for chat_id, role in settings.REPORT_TELEGRAM_DM_IDS.items()
+        if int(chat_id) not in covered
+    ]
+
+
 async def _announce_to_readers(
     bot: Bot,
     period_type: str,
@@ -284,42 +340,67 @@ async def _announce_to_readers(
     until: datetime,
     event_count: int,
 ) -> None:
-    """DM every admin and head that a new report is out. Never raises.
+    """DM every Telegram reader that a new report is out, and pin it. Never raises.
 
     Why a DM and not just the Slack post: the Slack channel announces to whoever
     is in the channel, while the address list here IS the permission — it is read
     from ``internal_users`` at send time, so granting ``head`` adds a reader and
     revoking it removes one, with no second list to keep in step.
 
-    The link is the plain, permanent ``/dashboard``, deliberately NOT a one-time
-    login token: those live 15 minutes in process memory, so a weekly message
-    carrying one would be dead by morning and dead again after any restart. A
-    session lasts 90 days against a weekly report, so this link normally opens
-    straight into the page; when it does not, the sign-in page is one tap.
+    ``REPORT_TELEGRAM_DM_IDS`` is the exception that proves that rule: someone who
+    has never been onboarded holds no role, and waiting for their ``/register``
+    would mean withholding a report they asked to be sent. Those ids carry their
+    own role for the scoping rule below and are dropped from the seed as soon as
+    the same account is reachable through a role holder.
 
-    Delivery is best-effort per person (``notify_internal_user`` swallows a
-    blocked or never-started chat): a report release must not fail because one
-    reader never opened the bot.
+    **The message is pinned, replacing last week's (2026-09-22).** The report is a
+    place you go back to during the week, not a notification you read once, so it
+    lives at the top of the chat until the next release pushes it out. That is
+    also why a role holder's link is their own sign-in URL rather than the bare
+    ``/dashboard``: a pinned message whose link only works while a 90-day cookie
+    happens to be alive is a pinned dead end. The link outlives the week it
+    covers (``DASHBOARD_LOGIN_LINK_DAYS``) and the next release replaces it.
+
+    A seeded id gets the plain ``/dashboard`` instead — there is no row to sign a
+    token for, and one cannot be minted for a person the bot cannot identify.
+
+    Delivery is best-effort per person (both senders swallow a blocked or
+    never-started chat): a report release must not fail because one reader never
+    opened the bot.
     """
     async with acquire_connection() as conn:
         recipients = await list_report_recipients(conn)
-    if not recipients:
+    seeded = _seeded_telegram_readers(recipients)
+    if not recipients and not seeded:
         log.info("summary.dm.no_recipients", period_type=period_type)
         return
 
     label = "Weekly" if period_type == "weekly" else "Monthly"
     noun = "signal" if event_count == 1 else "signals"
-    url = f"{settings.SERVER_BASE_URL.rstrip('/')}/dashboard"
-    text = (
-        f"\U0001F4CA <b>{label} team report</b>\n\n"
-        f"{since.strftime('%d %b')} \u2013 {until.strftime('%d %b %Y')} \u00b7 "
-        f"{event_count} risk {noun}\n\n"
-        f'<a href="{url}">Open the report</a>'
-    )
+    period = f"{since.strftime('%d %b')} \u2013 {until.strftime('%d %b %Y')}"
+    # Same rule as the Slack copy: the signal total is company-wide, and a head's
+    # page does not contain their own rows, so only an admin gets it.
+    counted = f"{period} \u00b7 {event_count} risk {noun}"
+
+    def message(role: str, url: str) -> str:
+        body = counted if role == "admin" else period
+        return (
+            f"\U0001F4CA <b>{label} team report</b>\n\n{body}\n\n"
+            f'<a href="{url}">Open the report</a>'
+        )
+
+    plain_url = f"{settings.SERVER_BASE_URL.rstrip('/')}/dashboard"
     for user in recipients:
-        await notify_internal_user(bot, user, text)
+        await notify_internal_user(
+            bot, user, message(user.role, login_url(user.id)), pin=True
+        )
+    for chat_id, role in seeded:
+        await notify_telegram_id(bot, chat_id, message(role, plain_url), pin=True)
     log.info(
-        "summary.dm.sent", period_type=period_type, recipients=len(recipients)
+        "summary.dm.sent",
+        period_type=period_type,
+        recipients=len(recipients),
+        seeded=len(seeded),
     )
 
 
@@ -363,35 +444,45 @@ async def _supersede_message(channel: str, ts: str) -> None:
     log.info("summary.superseded_prev", channel=channel, ts=ts)
 
 
-async def _post_slack_link(
+def _report_message(
     period_type: str,
     since: datetime,
     until: datetime,
     event_count: int,
     dashboard_url: str,
-) -> str:
+    *,
+    with_counts: bool = True,
+) -> tuple[str, list[dict[str, Any]]]:
+    """The release announcement: notification fallback text + Block Kit card.
+
+    One card, two destinations — the #reports channel and the Slack DM of every
+    reader who asked to be reached there. Built once so the private copy can
+    never drift from the public one.
+
+    ``with_counts=False`` drops the company-wide signal total. A head's page
+    excludes their own rows, so a total they cannot reconcile against it would
+    leak precisely what the scoping removes (§21); they get the announcement
+    and the link, and the numbers on the page are theirs.
+    """
     label = "Weekly" if period_type == "weekly" else "Monthly"
-    channel = settings.SLACK_CHANNEL_REPORTS
     since_str = since.strftime("%d %b %Y")
     until_str = until.strftime("%d %b %Y")
     noun = "event" if event_count == 1 else "events"
 
-    fallback = (
-        f"{label} Risk Report ({since_str} – {until_str}) is now available. "
-        f"{event_count} risk {noun} recorded."
+    fallback = f"{label} Risk Report ({since_str} – {until_str}) is now available."
+    if with_counts:
+        fallback += f" {event_count} risk {noun} recorded."
+    headline = (
+        f":bar_chart:  *{label} Partner Risk Report*\n"
+        f"*Period:* {since_str} – {until_str}"
     )
+    if with_counts:
+        headline += f"\n*Risk events recorded:* {event_count}"
     blocks: list[dict[str, Any]] = [
         {"type": "divider"},
         {
             "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f":bar_chart:  *{label} Partner Risk Report*\n"
-                    f"*Period:* {since_str} – {until_str}\n"
-                    f"*Risk events recorded:* {event_count}"
-                ),
-            },
+            "text": {"type": "mrkdwn", "text": headline},
         },
         {
             "type": "section",
@@ -425,8 +516,97 @@ async def _post_slack_link(
             ],
         },
     ]
+    return fallback, blocks
+
+
+async def _post_slack_link(
+    period_type: str,
+    since: datetime,
+    until: datetime,
+    event_count: int,
+    dashboard_url: str,
+) -> str:
+    """Post the report card to the reports channel; return its ``ts``."""
+    fallback, blocks = _report_message(
+        period_type, since, until, event_count, dashboard_url
+    )
+    channel = settings.SLACK_CHANNEL_REPORTS
     client = get_slack_client()
     resp = await client.chat_postMessage(channel=channel, text=fallback, blocks=blocks)
     log.info("summary.slack_posted", channel=channel, period_type=period_type)
     ts = resp.get("ts")
     return str(ts) if ts else ""
+
+
+async def _announce_to_slack_dms(
+    period_type: str,
+    since: datetime,
+    until: datetime,
+    event_count: int,
+    dashboard_url: str,
+) -> None:
+    """DM the report card to everyone who reads the report in Slack.
+
+    Separate from the channel post because a channel announces to whoever
+    happens to be in it, and separate from the Telegram DM because the person
+    who asked for this does not read the bot — Slack is where they already
+    confirm and dismiss alert cards.
+
+    The address list is the union of two sources: ``REPORT_SLACK_DM_IDS`` from
+    .env (people who have no ``internal_users`` row yet, so no role to key a
+    lookup on) and every enabled admin/head with a linked Slack account. An id
+    appearing in both is DM'd once.
+
+    Delivery is best-effort per person: one unreachable Slack account must not
+    stop the rest, exactly like the Telegram side.
+    """
+    async with acquire_connection() as conn:
+        rows = await list_slack_report_recipients(conn)
+
+    # (slack id, role). The role decides whether the card may carry the
+    # company-wide signal total: only an admin reads an unscoped page. A seeded
+    # id has no row to read a role from, so it is taken from the grants map —
+    # the role that account will hold — and anything unknown counts as scoped.
+    # Fail-closed: the worst case is a card with one line less.
+    targets: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    seeded = [
+        (uid, settings.REGISTRATION_ROLE_GRANTS.get(uid.strip().upper(), "head"))
+        for uid in settings.REPORT_SLACK_DM_IDS
+    ]
+    from_db = [(r.slack_user_id or "", r.role) for r in rows]
+    for raw, role in [*seeded, *from_db]:
+        uid = raw.strip().upper()
+        if uid and uid not in seen:
+            seen.add(uid)
+            targets.append((uid, role))
+
+    if not targets:
+        log.info("summary.slack_dm.no_recipients", period_type=period_type)
+        return
+
+    variants = {
+        with_counts: _report_message(
+            period_type,
+            since,
+            until,
+            event_count,
+            dashboard_url,
+            with_counts=with_counts,
+        )
+        for with_counts in (True, False)
+    }
+    delivered = 0
+    for uid, role in targets:
+        fallback, blocks = variants[role == "admin"]
+        try:
+            await send_dm_to_user(uid, fallback, blocks=blocks)
+            delivered += 1
+        except SlackDeliveryError as exc:
+            log.warning("summary.slack_dm.failed", slack_user_id=uid, error=str(exc))
+    log.info(
+        "summary.slack_dm.sent",
+        period_type=period_type,
+        delivered=delivered,
+        addressed=len(targets),
+    )

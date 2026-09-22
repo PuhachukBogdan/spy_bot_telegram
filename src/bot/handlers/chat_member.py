@@ -52,11 +52,18 @@ log = get_logger(__name__)
 router = Router(name="onboarding")
 
 # Chat title format: pipe-separated, e.g. "{aff_id} | {partner_name} | Beton.Win".
-# The "Beton.Win" company token is the required partner-chat marker; it may sit in
-# any position and is discarded. The aff_id is the numeric token (any position),
-# maps to the owner manager (internal_users.aff_id), and is optional. Whatever
-# remains is the partner name.
-_BRAND_RE = re.compile(r"beton\.?win", re.IGNORECASE)
+# A company brand token is the required partner-chat marker; it may sit in any
+# position and is discarded. Two brands are in use: Beton.Win, and Stalker since
+# 2026-09 ("91143| FTDteam | Stalker", "90151 | Stalker | Unlocked Traff",
+# "Stalker | MirX"). A title may carry either, or both, and every brand token is
+# dropped. The aff_id is the numeric token (any position), maps to the owner
+# manager (internal_users.aff_id), and is optional. Whatever remains is the
+# partner name.
+#
+# Only the partner *name* depends on this: a chat added by a trusted internal
+# user goes active either way (the gate is the adder, not the title), so an
+# unrecognised brand costs an auto-bound partner, never the monitoring.
+_BRAND_RE = re.compile(r"beton\.?win|stalker", re.IGNORECASE)
 
 # Every 4–6 digit id in a title, not just the first. `_parse_chat_title` keeps only
 # the leading one (that is all the owner-manager lookup needs), but a chat can serve
@@ -124,9 +131,10 @@ async def _attach_archive_history(
 def _parse_chat_title(title: str | None) -> tuple[str, str] | None:
     """Parse a partner-chat title → (aff_id, partner_name), or None.
 
-    Requires a "Beton.Win" token somewhere. The aff_id is the first purely-numeric
-    token in any position ("" if none); the company token is dropped; the rest is
-    the partner name. Returns None if there is no brand marker or no name left.
+    Requires a brand token (Beton.Win or Stalker) somewhere. The aff_id is the
+    first purely-numeric token in any position ("" if none); brand tokens are
+    dropped; the rest is the partner name. Returns None if there is no brand
+    marker or no name left.
     """
     if not title:
         return None

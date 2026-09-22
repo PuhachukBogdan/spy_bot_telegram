@@ -72,8 +72,8 @@ from src.summary.builder import build_daily_card, build_dashboard_html  # noqa: 
 from src.summary.generator import generate_report  # noqa: E402
 from src.utils.session import (  # noqa: E402
     SESSION_COOKIE,
-    consume_login_token,
     sign_session,
+    verify_login_token,
     verify_session,
     verify_telegram_login,
 )
@@ -428,7 +428,7 @@ async def _render_daily_panel(day_arg: str | None) -> str:
 # shared in Slack. That design cannot answer "who is reading", and the `head`
 # role is defined by the answer: a department lead sees every manager EXCEPT
 # themselves. So the link is now fixed and carries no secret, and the viewer
-# signs in as a person — by tapping a one-time link the bot DMs them, or through
+# signs in as a person — by tapping a link the bot DMs them, or through
 # Telegram's Login Widget. Old tokenised URLs redirect here rather than 404, so
 # links already sitting in Slack keep working.
 
@@ -460,7 +460,7 @@ def _login_page(bot_username: str | None, *, error: str | None = None) -> str:
     """The sign-in page: one route that always works, one that is optional.
 
     The primary button is a Telegram deep link, ``t.me/<bot>?start=dashboard``.
-    It opens the bot, which answers ``/start dashboard`` with a one-time sign-in
+    It opens the bot, which answers ``/start dashboard`` with a personal sign-in
     link — exactly what ``/dashboard`` does — so a reader who lands here from the
     weekly DM or the Slack post is two taps from the page, and nothing has to be
     configured on Telegram's side for that to hold. The Login Widget is rendered
@@ -674,12 +674,17 @@ async def auth_telegram(request: Request) -> Response:
 
 @app.get("/auth/link/{token}")
 async def auth_link(token: str) -> Response:
-    """One-time link from the bot: redeem it and start a session."""
-    user_id = consume_login_token(token)
+    """Sign-in link from the bot: check it and start a session.
+
+    Followed more than once on purpose (since 2026-09-22): the link rides in a
+    pinned weekly message, and a reader who opens it on their phone on Monday
+    and their laptop on Thursday is the normal case, not an attack.
+    """
+    user_id = verify_login_token(token)
     if user_id is None:
         return _notice_page(
             "Link expired",
-            "Sign-in links are valid for 15 minutes and can be used once. "
+            f"Sign-in links are valid for {settings.DASHBOARD_LOGIN_LINK_DAYS} days. "
             "Send <b>/dashboard</b> to the bot for a fresh one.",
             status=410,
         )
