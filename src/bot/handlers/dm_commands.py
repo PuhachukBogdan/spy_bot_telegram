@@ -67,6 +67,7 @@ from src.db.models import InternalUser, Partner
 from src.db.queries import business_connections as bc_q
 from src.db.queries import notes as notes_q
 from src.db.queries import risk_events as risk_q
+from src.db.queries.account_links import LinkPlan, apply_account_link, plan_account_link
 from src.db.queries.audit import insert_audit_log
 from src.db.queries.chats import (
     authorize_chat,
@@ -188,6 +189,7 @@ _HELP_ADMIN = (
     "/chat_delete &lt;id&gt; — disconnect a unit and leave the chat\n"
     "/set_partner_status &lt;name&gt; &lt;status&gt; — change partner status\n"
     "/set_owner &lt;partner&gt; &lt;user&gt; — assign owning manager\n"
+    "/link_account &lt;tg_id&gt; &lt;user&gt; — attach a Telegram account to a person\n"
     "/thresholds · /categories · /dictionary [cat] · /cost_status — settings\n"
     "/business_connections — list Business connection grants\n"
     "/approve_business · /reject_business &lt;conn_id&gt; — approve / disable a grant\n"
@@ -2045,6 +2047,99 @@ async def cmd_set_role(
     await message.answer(
         f"Role for <b>{name}</b>: <code>{previous}</code> &rarr; <code>{role}</code>.{hint}"
     )
+
+
+@router.message(Command("link_account"))
+@require_role("admin")
+async def cmd_link_account(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Attach a Telegram account to an existing person (admin only); audited.
+
+    Usage: ``/link_account <telegram_id> <telegram_id|Full Name> [confirm]``.
+    Without ``confirm`` it only shows the plan. With it, the plan is rebuilt
+    inside the transaction and applied — a stale plan can never be applied.
+    A new account that already made its own record through /register is merged
+    into the person: chats, Slack id, tone counters and audit rows move, the
+    duplicate record is retired (disabled, kept). Old accounts stay attached.
+    """
+    usage = (
+        "Usage: <code>/link_account &lt;telegram_id&gt; &lt;telegram_id|Full Name&gt;</code>\n"
+        "Example: <code>/link_account 1000000002 1000000001</code>\n"
+        "Shows the plan; add <code>confirm</code> at the end to apply."
+    )
+    parts = (command.args or "").split()
+    confirm = bool(parts) and parts[-1].lower() == "confirm"
+    if confirm:
+        parts = parts[:-1]
+    if len(parts) < 2 or not parts[0].isdigit():
+        await message.answer(usage)
+        return
+    telegram_id = int(parts[0])
+    identifier = _strip_quotes(" ".join(parts[1:]))
+
+    async with acquire_connection() as conn:
+        target = await find_internal_user_by_identifier(conn, identifier)
+        if target is None:
+            await message.answer(f"No such user: <code>{html_escape(identifier)}</code>.")
+            return
+        async with conn.transaction():
+            plan = await plan_account_link(conn, target, telegram_id)
+            moved: dict[str, int] | None = None
+            if confirm and plan.status == "link":
+                moved = await apply_account_link(conn, plan, via="command")
+    # Reply only once the transaction is closed.
+    if plan.status == "noop":
+        await message.answer("Already linked — nothing to do.")
+        return
+    if plan.status == "refused":
+        await message.answer(f"Not linked: {html_escape(plan.reason or 'refused')}.")
+        return
+    if moved is not None:
+        log.info(
+            "dm.link_account",
+            actor=str(actor.id)[:8],
+            target=str(target.id)[:8],
+            merged=plan.duplicate is not None,
+        )
+        count = len(target.telegram_accounts) + 1
+        await message.answer(
+            f"✅ Linked. <b>{html_escape(target.full_name)}</b> now has {count} accounts."
+        )
+        return
+    await message.answer(_link_plan_text(plan))
+
+
+def _link_plan_text(plan: LinkPlan) -> str:
+    """The /link_account preview: what would move, in the words an admin reads."""
+    lines = [
+        f"<b>Link account</b> <code>{plan.telegram_id}</code> → "
+        f"<b>{html_escape(plan.primary.full_name)}</b>"
+    ]
+    dup = plan.duplicate
+    if dup is not None:
+        lines.append(
+            f"Duplicate record: <b>{html_escape(dup.full_name)}</b> — "
+            "will be retired (disabled, kept for history)"
+        )
+        labels = {
+            "chats.authorized_by": "chats",
+            "manager_tone_daily.manager_id": "tone days",
+            "manager_tone_flags.manager_id": "tone flags",
+            "admin_audit_log.actor_internal_id": "audit rows",
+        }
+        moves = [f"{n} {labels.get(k, k)}" for k, n in plan.references.items()]
+        lines.append("Moves: " + (" · ".join(moves) if moves else "nothing"))
+        slack = {
+            "move": f"moved from the duplicate (<code>{dup.slack_user_id}</code>)",
+            "keep_primary": "already the same",
+            "conflict": "both have one — the person's own is kept",
+            "none": "nothing to move",
+        }[plan.slack_action]
+        lines.append(f"Slack: {slack}")
+    lines.append(f"Messages relabelled partner → staff: {plan.relabel_messages}")
+    lines.append("\nSend the same command with <code>confirm</code> at the end to apply.")
+    return "\n".join(lines)
 
 
 #: Roles /set_role may assign. Mirrors the CHECK constraint from migration 0026.

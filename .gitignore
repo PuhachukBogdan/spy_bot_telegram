@@ -130,3 +130,8 @@ Team summary - как читать.pdf
 Partner Assistant — инструкция для менеджера.md
 Partner Assistant — инструкция для менеджера.pdf
 DASHBOARD_ROLES_PLAN.md
+
+# Spec Kit tooling + feature specs (working docs; specs carry real Telegram/Slack ids)
+.specify/
+specs/
+.claude/skills/

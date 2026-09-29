@@ -366,7 +366,7 @@ async def update_user_role(
     row = await conn.fetchrow(
         """
         UPDATE internal_users
-        SET role = $2, updated_at = now()
+        SET role = $2
         WHERE id = $1
         RETURNING *
         """,

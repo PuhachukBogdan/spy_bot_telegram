@@ -455,3 +455,25 @@ async def test_a_plain_manager_is_told_nothing_about_a_report() -> None:
     mock_link.assert_not_awaited()
     body = msg.answer.call_args[0][0]
     assert "report" not in body.lower() and "/dashboard" not in body
+
+
+async def test_register_from_a_linked_second_account_finds_the_person() -> None:
+    """Spec 001: /register from an account attached by /link_account.
+
+    The lookup must be array containment, so the account is found as the
+    SECOND element of telegram_accounts; the registration then binds Slack on
+    that person instead of minting a new manager (the Christopher case).
+    """
+    from src.db.queries.etc import find_internal_user_by_telegram_id
+
+    seen: list[tuple[str, tuple[object, ...]]] = []
+
+    class _Conn:
+        async def fetchrow(self, sql: str, *args: object) -> None:
+            seen.append((sql, args))
+            return None
+
+    await find_internal_user_by_telegram_id(_Conn(), 6000000002)  # type: ignore[arg-type]
+    (sql, args), = seen
+    assert "telegram_accounts @> $1::jsonb" in sql
+    assert args == ([6000000002],)
