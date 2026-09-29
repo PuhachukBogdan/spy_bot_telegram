@@ -117,6 +117,15 @@ def test_login_token_survives_being_used_again() -> None:
     assert verify_login_token(token) == user_id
 
 
+def test_a_fresh_dashboard_link_does_not_retire_the_pinned_weekly_one() -> None:
+    """Monday's pinned link must live its whole week, whatever /dashboard hands out."""
+    user_id = uuid4()
+    monday = 1_000_000.0
+    pinned = issue_login_token(user_id, now=monday)
+    issue_login_token(user_id, now=monday + 2 * 86400)  # /dashboard on Wednesday
+    assert verify_login_token(pinned, now=monday + 6.9 * 86400) == user_id
+
+
 def test_login_token_expires_after_the_configured_days() -> None:
     now = 1_000_000.0
     token = issue_login_token(uuid4(), now=now)

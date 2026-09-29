@@ -154,8 +154,8 @@ export default function App({ data }: { data: ReportData }) {
           {data.viewer?.seesRiskReport ? <ModeSwitch /> : null}
           {data.viewer?.name ? (
             <div className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
-              {data.viewer.name} · {data.viewer.role}
-              {data.viewer.role === 'head' ? ' · your own numbers are not shown' : ''}
+              {data.viewer.name}
+              {data.viewer.role === 'admin' ? ' · admin' : ''}
               {' · '}
               <a href="/logout" className="underline">
                 sign out

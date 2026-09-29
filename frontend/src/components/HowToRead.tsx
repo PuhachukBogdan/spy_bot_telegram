@@ -88,6 +88,7 @@ const TONE_ROWS: { key: string; label: string; flagged: string; number: string; 
 ]
 
 export default function HowToRead({ data }: { data: ReportData }) {
+  const isAdmin = data.viewer?.role === 'admin'
   const [collapsed, setCollapsed] = useState<boolean>(() => loadCollapsed().howto)
   const toggle = () =>
     setCollapsed((prev) => {
@@ -339,21 +340,23 @@ export default function HowToRead({ data }: { data: ReportData }) {
               the login page. A session lasts 90 days per device; <K>sign out</K> in the corner
               ends it.
             </li>
-            <li>
-              <B>Admin</B> sees the whole team and both modes — this page and the risk report.
-            </li>
-            <li>
-              <B>Head of affiliates</B> sees every manager <B>except themselves</B>: their own
-              row is gone from the roster, from the team totals, from the charts, and any risk
-              case or tone flag they wrote is removed too. The team numbers a head reads are
-              genuinely the team minus one person, not the full team with a row hidden. The
-              risk report mode is not offered — it is built from stored snapshots that cannot
-              be filtered per reader.
-            </li>
-            <li>
-              Managers and viewers have no access to this page at all, and the bot does not
-              acknowledge that the command exists.
-            </li>
+            {/* Access rules are for admins only. A head is never told that their own
+                activity is read, that it is removed from their view, or that a wider
+                view exists — the page simply shows them the team. */}
+            {isAdmin ? (
+              <>
+              <li>
+                <B>Admin</B> sees the whole team and both modes — this page and the risk report.
+              </li>
+              <li>
+                <B>Head of affiliates</B> sees the team summary; the risk report is admin-only.
+              </li>
+              <li>
+                Managers and viewers have no access to this page at all, and the bot does not
+                acknowledge that the command exists.
+              </li>
+              </>
+            ) : null}
           </Ul>
 
           <H>A manager with no data at all</H>
