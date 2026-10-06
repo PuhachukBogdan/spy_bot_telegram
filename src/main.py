@@ -53,6 +53,7 @@ from src.importer.retro_report import (  # noqa: E402
 from src.metrics.cache import preview_cache  # noqa: E402
 from src.metrics.preview import build_preview  # noqa: E402
 from src.metrics.scope import DASHBOARD_ROLES, scope_for  # noqa: E402
+from src.pipeline.membership import membership_worker_loop  # noqa: E402
 from src.pipeline.ops_alerts.scheduler import start_ops_alerts, stop_ops_alerts  # noqa: E402
 from src.pipeline.tier1 import pattern_cache  # noqa: E402
 from src.pipeline.workers import (  # noqa: E402
@@ -168,6 +169,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     tone_task = asyncio.create_task(
         tone_worker_loop(bot), name="tone_worker"
     )
+    membership_task = asyncio.create_task(
+        membership_worker_loop(bot), name="membership_sweep"
+    )
     ops_alerts_tasks = start_ops_alerts(bot)
     log.info("startup.whisper.worker", enabled=settings.WHISPER_ENABLED)
     log.info("startup.file_analysis.worker", enabled=settings.FILE_ANALYSIS_ENABLED)
@@ -183,6 +187,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         enabled=settings.TONE_ANALYSIS_ENABLED,
         model=settings.LLM_MODEL_TONE,
     )
+    log.info(
+        "startup.membership.worker",
+        enabled=settings.MEMBERSHIP_SWEEP_ENABLED,
+        interval_s=settings.MEMBERSHIP_SWEEP_INTERVAL_SECONDS,
+    )
 
     try:
         yield
@@ -191,7 +200,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         bg_tasks = (
             cleanup_task, pattern_task, whisper_task, analysis_task,
             file_task, reaper_task, summary_task, failed_alert_task,
-            storage_task, tone_task,
+            storage_task, tone_task, membership_task,
         )
         for task in bg_tasks:
             task.cancel()

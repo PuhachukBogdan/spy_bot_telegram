@@ -38,9 +38,16 @@ from src.db.queries.archive import (
     find_archived_unit_for_aff_ids,
 )
 from src.db.queries.audit import insert_audit_log
-from src.db.queries.chats import bind_partner_to_chat, create_active_chat, create_pending_chat
+from src.db.queries.chat_members import record_event_status
+from src.db.queries.chats import (
+    bind_partner_to_chat,
+    create_active_chat,
+    create_pending_chat,
+    get_chat_unit,
+)
 from src.db.queries.etc import (
     find_internal_user_by_telegram_id,
+    get_internal_user_by_telegram_id_any,
     get_or_create_manager_by_aff_id,
     list_admin_users,
 )
@@ -288,3 +295,40 @@ async def on_bot_removed(event: ChatMemberUpdated) -> None:
     a later phase; recording it here keeps the audit trail honest in the meantime.
     """
     log.info("onboarding.bot_removed", chat_id=event.chat.id, chat_type=event.chat.type)
+
+
+@router.chat_member()
+async def on_member_status_changed(event: ChatMemberUpdated) -> None:
+    """A member's status changed in a chat where the bot is an administrator.
+
+    Telegram sends ``chat_member`` updates only to admin bots, so this is a
+    best-effort live feed; the membership sweep is the reconciliation. Only our
+    own people are recorded (``chat_members`` tracks staff, not partners), and
+    the status is stored as Telegram words it: a demotion from administrator to
+    member is still "present", a kick is not.
+    """
+    user = event.new_chat_member.user
+    if user.is_bot:
+        return
+    status = str(event.new_chat_member.status)
+    async with acquire_connection() as conn:
+        internal = await get_internal_user_by_telegram_id_any(conn, user.id)
+        if internal is None:
+            return
+        chat = await get_chat_unit(conn, event.chat.id, None)
+        if chat is None:
+            return
+        await record_event_status(
+            conn,
+            chat_id=chat.id,
+            telegram_user_id=user.id,
+            internal_user_id=internal.id,
+            status=status,
+            at=event.date,
+        )
+    log.info(
+        "membership.status_changed",
+        chat_id=event.chat.id,
+        user_id=user.id,
+        status=status,
+    )

@@ -20,13 +20,17 @@ import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from src.config import settings
 from src.metrics.attribution import attribute_risk
 from src.metrics.sla import SlaOutcome
+
+if TYPE_CHECKING:
+    from src.metrics.collect import WaitOutcome
+    from src.metrics.membership import Crews
 
 
 class Granularity(StrEnum):
@@ -97,6 +101,10 @@ class ScopeDays:
     chat_messages: dict[UUID, dict[date, int]] = field(default_factory=dict)
     #: chat_id -> local date the chat was created (bounds the denominator).
     chat_created: dict[UUID, date] = field(default_factory=dict)
+    #: Last local day this scope holds a portfolio. A deactivated manager keeps
+    #: every bucket up to their last day and shows 0 / 0 chats after it; None =
+    #: no cut.
+    active_until: date | None = None
 
     def day_counters(self, day: date) -> DayCounters:
         found = self.counters.get(day)
@@ -190,7 +198,10 @@ def _window_point(
     threshold = _coverage_threshold(counted_days) if counted_days else 1
     active = 0
     total = 0
-    for chat_id, created in scope.chat_created.items():
+    # A scope past its last active day has no portfolio to measure — the
+    # person is not working these chats any more, so they are not "theirs".
+    holds_portfolio = scope.active_until is None or start <= scope.active_until
+    for chat_id, created in scope.chat_created.items() if holds_portfolio else ():
         if created > last_day:
             continue  # a chat born after this window can't drag its rate down
         total += 1
@@ -278,61 +289,173 @@ def build_scope_trends(
 def build_scope_days(
     manager_ids: list[UUID],
     *,
-    sla_dated: dict[UUID, list[tuple[datetime, SlaOutcome]]],
     proposal_days: list[dict[str, Any]],
     risk_days: list[dict[str, Any]],
     manager_index: dict[int, UUID],
     chat_day_rows: list[dict[str, Any]],
     chat_registry: list[dict[str, Any]],
     tz: ZoneInfo,
+    sla_dated: dict[UUID, list[tuple[datetime, SlaOutcome]]] | None = None,
+    waits: list[WaitOutcome] | None = None,
+    crews: Crews | None = None,
+    deactivated: dict[UUID, date] | None = None,
 ) -> dict[UUID | None, ScopeDays]:
     """Distribute raw day-level inputs into per-manager scopes plus the team.
 
-    Returned dict maps manager id -> scope, and ``None`` -> the team scope. The
-    team is fed the same counter increments, so team = sum of managers by
-    construction rather than by a second code path that could drift.
+    Returned dict maps manager id -> scope, and ``None`` -> the team scope.
+
+    Two input styles. **Owner rule** (``sla_dated``, rows keyed by
+    ``manager_id``): every increment lands on its manager AND the team, so team
+    = sum of managers. **Crew rule** (``waits`` + ``crews``): one chat has
+    several managers, so the TEAM is fed once per fact — one wait, one chat, one
+    case — while each manager it concerns gets their own copy. Team totals are
+    then genuinely "what happened", not a sum that would count a shared chat
+    four times.
+
+    ``deactivated`` caps a manager's scope: nothing after their last day is
+    attributed to them (waits never are, see the pairing), and the portfolio
+    stops being theirs from that bucket on (``ScopeDays.active_until``).
     """
+    cuts = deactivated or {}
     scopes: dict[UUID | None, ScopeDays] = {None: ScopeDays()}
     for manager_id in manager_ids:
-        scopes[manager_id] = ScopeDays()
+        cut = cuts.get(manager_id)
+        scopes[manager_id] = ScopeDays(
+            active_until=cut - timedelta(days=1) if cut is not None else None
+        )
+
+    def bump_one(scope_key: UUID | None, day: date, **inc: int) -> None:
+        scope = scopes.get(scope_key)
+        if scope is None:
+            return
+        counters = scope.day_counters(day)
+        for name, value in inc.items():
+            setattr(counters, name, getattr(counters, name) + value)
 
     def bump(manager: UUID, day: date, **inc: int) -> None:
-        for scope_key in (manager, None):
-            scope = scopes.get(scope_key)
-            if scope is None:
-                continue
-            counters = scope.day_counters(day)
-            for name, value in inc.items():
-                setattr(counters, name, getattr(counters, name) + value)
+        bump_one(manager, day, **inc)
+        bump_one(None, day, **inc)
 
-    for manager_id, pairs in sla_dated.items():
+    def sla_inc(outcome: SlaOutcome) -> dict[str, int]:
+        if outcome is SlaOutcome.OFFLINE:
+            return {"offline": 1}
+        return {"sla_rated": 1, "sla_met": 1 if outcome.is_met else 0}
+
+    if waits is not None:
+        for wait in waits:
+            day = wait.started_at.astimezone(tz).date()
+            inc = sla_inc(wait.outcome)
+            bump_one(None, day, **inc)
+            for manager in wait.managers:
+                bump_one(manager, day, **inc)
+    for manager_id, pairs in (sla_dated or {}).items():
         for started_at, outcome in pairs:
-            day = started_at.astimezone(tz).date()
-            if outcome is SlaOutcome.OFFLINE:
-                bump(manager_id, day, offline=1)
-            else:
-                bump(manager_id, day, sla_rated=1, sla_met=1 if outcome.is_met else 0)
+            bump(manager_id, started_at.astimezone(tz).date(), **sla_inc(outcome))
 
     for row in proposal_days:
         bump(row["manager_id"], row["day"], proposals=row["proposals"])
 
     for row in risk_days:
-        attribution, _ = attribute_risk(row["sender_id"], manager_index)
-        if attribution.counts:
+        attribution, author = attribute_risk(row["sender_id"], manager_index)
+        if not attribution.counts:
+            continue
+        if crews is None:
             bump(row["manager_id"], row["day"], risks_own=1)
+        elif author is not None:
+            # Own = the AUTHOR's conduct. The team counts it once whoever wrote
+            # it; a page exists for it only if the author is on the roster.
+            bump(author, row["day"], risks_own=1)
+
+    def holders(row: dict[str, Any]) -> list[UUID | None]:
+        if crews is None:
+            return [row["manager_id"], None]
+        return [*crews.members_of(row["chat_id"]), None]
 
     for row in chat_registry:
         created = row["created_at"].astimezone(tz).date()
-        for scope_key in (row["manager_id"], None):
+        for scope_key in holders(row):
             scope = scopes.get(scope_key)
             if scope is not None:
                 scope.chat_created[row["chat_id"]] = created
 
     for row in chat_day_rows:
-        for scope_key in (row["manager_id"], None):
+        for scope_key in holders(row):
             scope = scopes.get(scope_key)
             if scope is not None:
                 per_day = scope.chat_messages.setdefault(row["chat_id"], {})
                 per_day[row["day"]] = per_day.get(row["day"], 0) + row["messages"]
 
     return scopes
+
+
+def account_key(telegram_id: int) -> str:
+    """Scope key of one Telegram account — shares the ``ms`` list with manager ids."""
+    return f"acct:{telegram_id}"
+
+
+def build_account_scope_days(
+    accounts: dict[int, UUID],
+    *,
+    waits: list[WaitOutcome],
+    proposal_sender_days: list[dict[str, Any]],
+    risk_days: list[dict[str, Any]],
+    chat_day_rows: list[dict[str, Any]],
+    chat_registry: list[dict[str, Any]],
+    crews: Crews,
+    tz: ZoneInfo,
+    deactivated: dict[UUID, date] | None = None,
+) -> dict[str, ScopeDays]:
+    """One scope per Telegram account — the dossier's Old / New switch.
+
+    What an account can own: the replies it gave (SLA met / rated), proposals and
+    risk cases it wrote, and the chats it is present in (coverage). What it
+    cannot: an UNANSWERED wait — nobody's account was silent, the person was —
+    so ``offline`` stays on the person's page and is 0 here by construction.
+
+    ``accounts`` maps account -> person; the person's deactivation date caps
+    the account's portfolio exactly as it caps the person's.
+    """
+    cuts = deactivated or {}
+    scopes: dict[int, ScopeDays] = {}
+    for account, person in accounts.items():
+        cut = cuts.get(person)
+        scopes[account] = ScopeDays(
+            active_until=cut - timedelta(days=1) if cut is not None else None
+        )
+
+    for wait in waits:
+        scope = scopes.get(wait.answered_with) if wait.answered_with is not None else None
+        if scope is None or not wait.outcome.in_ratio:
+            continue
+        counters = scope.day_counters(wait.started_at.astimezone(tz).date())
+        counters.sla_rated += 1
+        counters.sla_met += 1 if wait.outcome.is_met else 0
+
+    for row in proposal_sender_days:
+        scope = scopes.get(row["sender_id"])
+        if scope is not None:
+            scope.day_counters(row["day"]).proposals += row["proposals"]
+
+    for row in risk_days:
+        scope = scopes.get(row["sender_id"]) if row["sender_id"] is not None else None
+        if scope is not None:
+            scope.day_counters(row["day"]).risks_own += 1
+
+    created = {
+        row["chat_id"]: row["created_at"].astimezone(tz).date() for row in chat_registry
+    }
+    holders: dict[UUID, list[int]] = {
+        chat: [a for a in present if a in scopes]
+        for chat, present in crews.present_accounts.items()
+    }
+    for chat, present in holders.items():
+        if chat not in created:
+            continue
+        for account in present:
+            scopes[account].chat_created[chat] = created[chat]
+    for row in chat_day_rows:
+        for account in holders.get(row["chat_id"], ()):
+            per_day = scopes[account].chat_messages.setdefault(row["chat_id"], {})
+            per_day[row["day"]] = per_day.get(row["day"], 0) + row["messages"]
+
+    return {account_key(a): scope for a, scope in scopes.items()}

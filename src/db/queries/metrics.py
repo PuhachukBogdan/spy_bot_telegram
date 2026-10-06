@@ -24,12 +24,13 @@ import asyncpg
 async def list_sla_messages(
     conn: asyncpg.Connection, since: datetime, until: datetime
 ) -> list[dict[str, Any]]:
-    """Messages in owned, active group/topic chats, ordered for SLA pairing.
+    """Messages in active group/topic chats, ordered for SLA pairing.
 
     Business (private) units are excluded: the SLA track is about partner groups.
-    Chats with no ``authorized_by`` are excluded too — with nobody to attribute a
-    reply to there is no metric, and guessing an owner would put another manager's
-    silence on someone's record.
+    ``owner_id`` (``chats.authorized_by``) rides along as the FALLBACK for a chat
+    nobody on the roster is working yet; who a wait belongs to is decided in
+    Python from chat membership (:mod:`src.metrics.membership`), which is why
+    chats without an owner are no longer dropped here.
 
     Returned in ``(chat, time)`` order so the caller can walk each conversation
     once and pair waits to replies without sorting again.
@@ -41,7 +42,7 @@ async def list_sla_messages(
                m.sender_role,
                m.sender_id,
                COALESCE(char_length(m.message_text), 0) AS chars,
-               c.authorized_by AS manager_id
+               c.authorized_by AS owner_id
         FROM messages m
         JOIN chats c ON c.id = m.chat_id
         WHERE m.timestamp >= $1
@@ -50,7 +51,6 @@ async def list_sla_messages(
           AND c.status = 'active'
           AND COALESCE(c.is_test, false) = false
           AND c.unit_type IN ('group', 'topic')
-          AND c.authorized_by IS NOT NULL
         ORDER BY m.chat_id, m.timestamp
         """,
         since,
@@ -62,7 +62,10 @@ async def list_sla_messages(
 async def count_messages_per_chat(
     conn: asyncpg.Connection, since: datetime, until: datetime
 ) -> list[dict[str, Any]]:
-    """One row per owned active chat with its message count in the window.
+    """One row per active chat with its message count in the window.
+
+    Carries ``owner_id`` for the fallback only; which managers the chat counts
+    for is a membership question answered in Python (``fan_out_by_portfolio``).
 
     A LEFT JOIN, so a chat with zero traffic still appears — that is the whole
     point of the KPI: silent chats are the denominator, and an INNER JOIN would
@@ -70,7 +73,7 @@ async def count_messages_per_chat(
     """
     rows = await conn.fetch(
         """
-        SELECT c.authorized_by AS manager_id,
+        SELECT c.authorized_by AS owner_id,
                c.id            AS chat_id,
                c.chat_name,
                c.topic_name,
@@ -85,7 +88,6 @@ async def count_messages_per_chat(
               AND m.source <> 'imported'
         WHERE c.status = 'active'
           AND COALESCE(c.is_test, false) = false
-          AND c.authorized_by IS NOT NULL
         GROUP BY c.authorized_by, c.id, c.chat_name, c.topic_name, c.unit_type,
                  c.created_at
         """,
@@ -98,7 +100,7 @@ async def count_messages_per_chat(
 async def count_messages_per_chat_day(
     conn: asyncpg.Connection, since: datetime, until: datetime, tz: str
 ) -> list[dict[str, Any]]:
-    """(manager, chat, local day) -> message count, for coverage trend buckets.
+    """(chat, local day) -> message count, for coverage trend buckets.
 
     Only days that actually had messages appear; the zero days are implied by the
     chat registry (:func:`count_messages_per_chat` carries every owned chat plus
@@ -107,7 +109,7 @@ async def count_messages_per_chat_day(
     """
     rows = await conn.fetch(
         """
-        SELECT c.authorized_by AS manager_id,
+        SELECT c.authorized_by AS owner_id,
                c.id            AS chat_id,
                (m.timestamp AT TIME ZONE $3)::date AS day,
                COUNT(m.id)     AS messages
@@ -118,7 +120,6 @@ async def count_messages_per_chat_day(
           AND m.source <> 'imported'
           AND c.status = 'active'
           AND COALESCE(c.is_test, false) = false
-          AND c.authorized_by IS NOT NULL
         GROUP BY c.authorized_by, c.id, day
         """,
         since,
@@ -163,7 +164,8 @@ async def list_risk_days(
     """
     rows = await conn.fetch(
         """
-        SELECT c.authorized_by AS manager_id,
+        SELECT c.authorized_by AS owner_id,
+               r.chat_id,
                r.sender_id,
                (r.created_at AT TIME ZONE $3)::date AS day
         FROM risk_events r
@@ -173,7 +175,6 @@ async def list_risk_days(
           AND r.status IS DISTINCT FROM 'false_positive'
           AND c.status = 'active'
           AND COALESCE(c.is_test, false) = false
-          AND c.authorized_by IS NOT NULL
         """,
         since,
         until,
@@ -212,7 +213,7 @@ async def list_risk_events(
                c.chat_name,
                c.topic_name,
                c.unit_type,
-               c.authorized_by AS manager_id
+               c.authorized_by AS owner_id
         FROM risk_events r
         JOIN chats c ON c.id = r.chat_id
         WHERE r.created_at >= $1
@@ -220,7 +221,6 @@ async def list_risk_events(
           AND r.status IS DISTINCT FROM 'false_positive'
           AND c.status = 'active'
           AND COALESCE(c.is_test, false) = false
-          AND c.authorized_by IS NOT NULL
         ORDER BY r.created_at DESC
         """,
         since,
@@ -253,3 +253,65 @@ async def count_proposals_by_manager(
         until,
     )
     return {r["manager_id"]: r["proposals"] for r in rows}
+
+
+async def count_messages_per_sender_day(
+    conn: asyncpg.Connection,
+    since: datetime,
+    until: datetime,
+    tz: str,
+    sender_ids: list[int],
+) -> list[dict[str, Any]]:
+    """(staff account, chat, local day) -> messages, plus the last send time.
+
+    Two readers: the crew model (who was actually working a chat on a given
+    day) and the per-account split on the dashboard (is the old account still
+    in use). ``sender_ids`` are every Telegram account of every real manager;
+    partners never appear here.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT m.sender_id,
+               m.chat_id,
+               (m.timestamp AT TIME ZONE $3)::date AS day,
+               COUNT(*)        AS messages,
+               MAX(m.timestamp) AS last_at
+        FROM messages m
+        JOIN chats c ON c.id = m.chat_id
+        WHERE m.timestamp >= $1
+          AND m.timestamp < $2
+          AND m.source <> 'imported'
+          AND m.sender_id = ANY($4::bigint[])
+          AND c.status = 'active'
+          AND COALESCE(c.is_test, false) = false
+        GROUP BY m.sender_id, m.chat_id, day
+        """,
+        since,
+        until,
+        tz,
+        sender_ids,
+    )
+    return [dict(r) for r in rows]
+
+
+async def count_proposals_per_sender_day(
+    conn: asyncpg.Connection, since: datetime, until: datetime, tz: str
+) -> list[dict[str, Any]]:
+    """(Telegram account, local day) -> manager_proposal count — the account view."""
+    rows = await conn.fetch(
+        """
+        SELECT s.sender_id,
+               (s.created_at AT TIME ZONE $3)::date AS day,
+               COUNT(*) AS proposals
+        FROM activity_signals s
+        WHERE s.signal_type = 'manager_proposal'
+          AND s.created_at >= $1
+          AND s.created_at < $2
+          AND s.sender_id IS NOT NULL
+        GROUP BY s.sender_id, day
+        """,
+        since,
+        until,
+        tz,
+    )
+    return [dict(r) for r in rows]

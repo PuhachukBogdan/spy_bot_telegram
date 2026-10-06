@@ -44,6 +44,15 @@ _EXPECTED: dict[str, dict[str, list[str]]] = {
             "idx_retro_findings_unique",
         ],
     },
+    "0027": {
+        "tables": ["chat_members"],
+        "columns": [
+            "internal_users.deactivated_at",
+            "internal_users.deactivation_note",
+            "internal_users.account_labels",
+        ],
+        "indexes": ["idx_chat_members_present", "idx_chat_members_internal"],
+    },
     "0025": {
         "tables": ["manager_tone_daily", "manager_tone_flags", "manager_tone_progress"],
         "indexes": [

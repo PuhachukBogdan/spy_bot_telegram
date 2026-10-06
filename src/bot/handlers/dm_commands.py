@@ -69,6 +69,7 @@ from src.db.queries import notes as notes_q
 from src.db.queries import risk_events as risk_q
 from src.db.queries.account_links import LinkPlan, apply_account_link, plan_account_link
 from src.db.queries.audit import insert_audit_log
+from src.db.queries.chat_members import count_present_by_account
 from src.db.queries.chats import (
     authorize_chat,
     bind_partner_to_chat,
@@ -92,6 +93,7 @@ from src.db.queries.etc import (
     get_internal_user_by_id,
     get_internal_user_by_telegram_id_any,
     list_internal_users,
+    set_user_deactivated,
     set_user_enabled,
     update_user_role,
     update_work_hours,
@@ -184,6 +186,8 @@ _HELP_ADMIN = (
     "/admin — connected-chats panel (who linked what, drill down, ids)\n"
     '/users [all] · /add_manager &lt;id&gt; "Name" · /disable_user &lt;id|name&gt;'
     " — team access\n"
+    "/deactivate_user &lt;id|name&gt; [note] · /reactivate_user &lt;id|name&gt; — mark a"
+    " person as no longer working (kept on the dashboard, nothing new attributed)\n"
     "/pending · /authorize · /reject · /authorize_topic · /reject_topic — onboarding\n"
     '/bind_partner &lt;chat_id&gt; "Partner" — attach a partner to an active group\n'
     "/chat_delete &lt;id&gt; — disconnect a unit and leave the chat\n"
@@ -1159,6 +1163,10 @@ async def cmd_users(
     include_disabled = (command.args or "").strip().lower() == "all"
     async with acquire_connection() as conn:
         users = await list_internal_users(conn, include_disabled=include_disabled)
+        try:
+            present = await count_present_by_account(conn)
+        except Exception:  # chat_members arrives with 0027; the listing must not depend on it
+            present = {}
 
     if not users:
         await message.answer("No internal users.")
@@ -1167,11 +1175,17 @@ async def cmd_users(
     lines = [f"<b>Internal users — {scope}</b> ({len(users)})"]
     for u in users[:_MAX_LIST_ROWS]:
         accounts = (
-            ", ".join(f"<code>{a}</code>" for a in u.telegram_accounts)
+            ", ".join(
+                f"<code>{a}</code>"
+                + (f" ({present[a]} chats)" if a in present else "")
+                for a in u.telegram_accounts
+            )
             if u.telegram_accounts
             else "—"
         )
         flag = "" if u.enabled else " · <i>disabled</i>"
+        if u.deactivated_at is not None:
+            flag += f" · <i>deactivated {u.deactivated_at:%Y-%m-%d}</i>"
         lines.append(
             f"• <b>{html_escape(u.full_name)}</b> [{u.role}]{flag} — {accounts}"
         )
@@ -1295,6 +1309,124 @@ async def cmd_disable_user(
     await message.answer(
         f"🚫 <b>{html_escape(target.full_name)}</b> [{target.role}] disabled. "
         "Existing chats stay; new adds from them will go to pending."
+    )
+
+
+def _parse_deactivate_args(raw: str | None) -> tuple[str, str | None] | None:
+    """``<telegram_id | "Full Name" | Full Name> [note…]`` → (identifier, note).
+
+    A quoted name may carry spaces; an unquoted all-digits token is a Telegram
+    id; otherwise the FIRST word is the identifier and the rest is the note —
+    multi-word names must be quoted, same as /add_manager.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text[0] in "\"“":
+        closing = text.find(text[0] if text[0] == '"' else "”", 1)
+        if closing == -1:
+            closing = text.find('"', 1)
+        if closing == -1:
+            return None
+        identifier = text[1:closing].strip()
+        note = text[closing + 1 :].strip() or None
+        return (identifier, note) if identifier else None
+    head, _, rest = text.partition(" ")
+    return head, (rest.strip() or None)
+
+
+@router.message(Command("deactivate_user"))
+@require_role("admin")
+async def cmd_deactivate_user(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Mark a person as no longer working — NOT removed (admin only); audited.
+
+    Usage: ``/deactivate_user <telegram_id | "Full Name"> [note]``.
+
+    The person stays in ``internal_users`` and on the Team summary with a
+    ``deactivated`` badge and all their history; from today on no chat, wait or
+    case is attributed to them (their replies, if any, still are — those are
+    theirs). Bot access (``enabled``) is untouched: use ``/disable_user`` for that.
+    The distinction exists for the case "ушёл, не уволен — вдруг вернётся".
+    """
+    parsed = _parse_deactivate_args(command.args)
+    if parsed is None:
+        await message.answer(
+            "Usage: <code>/deactivate_user &lt;telegram_id | \"Full Name\"&gt; [note]</code>\n"
+            'Example: <code>/deactivate_user 1000000001 left 2026-09-30, may return</code>'
+        )
+        return
+    identifier, note = parsed
+    async with acquire_connection() as conn:
+        target = await find_internal_user_by_identifier(conn, identifier)
+        if target is None:
+            await message.answer("User not found.")
+            return
+        if target.id == actor.id:
+            await message.answer("You can't deactivate yourself.")
+            return
+        if target.deactivated_at is not None:
+            await message.answer(
+                f"<b>{html_escape(target.full_name)}</b> is already deactivated since "
+                f"{target.deactivated_at:%Y-%m-%d}."
+            )
+            return
+        now = datetime.now(UTC)
+        async with conn.transaction():
+            await set_user_deactivated(conn, target.id, deactivated_at=now, note=note)
+            await insert_audit_log(
+                conn,
+                action="deactivate_user",
+                actor_user_id=message.from_user.id if message.from_user else None,
+                actor_internal_id=actor.id,
+                target_entity="internal_user",
+                target_id=target.id,
+                payload={"full_name": target.full_name, "note": note},
+            )
+    log.info("dm.deactivate_user", target=str(target.id), by=str(actor.id))
+    await message.answer(
+        f"⏸ <b>{html_escape(target.full_name)}</b> marked deactivated from "
+        f"{now:%Y-%m-%d}. Stays on the dashboard with history; nothing new is "
+        "attributed to them. Bot access unchanged (/disable_user for that)."
+    )
+
+
+@router.message(Command("reactivate_user"))
+@require_role("admin")
+async def cmd_reactivate_user(
+    message: Message, actor: InternalUser, command: CommandObject, **kwargs: Any
+) -> None:
+    """Clear the deactivated mark (admin only); audited."""
+    identifier = _strip_quotes((command.args or "").strip())
+    if not identifier:
+        await message.answer(
+            "Usage: <code>/reactivate_user &lt;telegram_id | \"Full Name\"&gt;</code>"
+        )
+        return
+    async with acquire_connection() as conn:
+        target = await find_internal_user_by_identifier(conn, identifier)
+        if target is None:
+            await message.answer("User not found.")
+            return
+        if target.deactivated_at is None:
+            await message.answer(f"<b>{html_escape(target.full_name)}</b> is not deactivated.")
+            return
+        async with conn.transaction():
+            await set_user_deactivated(conn, target.id, deactivated_at=None, note=None)
+            await insert_audit_log(
+                conn,
+                action="reactivate_user",
+                actor_user_id=message.from_user.id if message.from_user else None,
+                actor_internal_id=actor.id,
+                target_entity="internal_user",
+                target_id=target.id,
+                payload={"full_name": target.full_name},
+            )
+    log.info("dm.reactivate_user", target=str(target.id), by=str(actor.id))
+    await message.answer(
+        f"▶️ <b>{html_escape(target.full_name)}</b> is active again — chats and waits "
+        "are attributed to them from now on."
     )
 
 

@@ -260,6 +260,26 @@ class Settings(BaseSettings):
     # chats from dead ones, not to set a performance bar.
     ACTIVE_CHAT_MIN_MESSAGES: int = 10
 
+    # === Chat membership (0027) ===
+    # The sweep asks Telegram, for every active group and every staff account,
+    # whether that account is in the chat (getChatMember) and what the group is
+    # called now (getChat). Read-only calls; nothing is ever sent to a partner
+    # chat. ~317 groups x ~13 accounts = ~4k calls per pass, paced by the
+    # concurrency cap; one pass takes a few minutes. Every six hours is plenty:
+    # joins and leaves also arrive live, the sweep is the reconciliation.
+    MEMBERSHIP_SWEEP_ENABLED: bool = True
+    MEMBERSHIP_SWEEP_INTERVAL_SECONDS: int = 21600
+    # First pass shortly after start, so a fresh deploy repairs the picture
+    # without waiting for the interval.
+    MEMBERSHIP_SWEEP_STARTUP_DELAY_SECONDS: int = 45
+    MEMBERSHIP_SWEEP_CONCURRENCY: int = 4
+    # The CREW of a chat on a given day = managers present in the chat who wrote
+    # in it within this many days before. An unanswered partner wait is charged
+    # to the crew (and the chat counts in each crew member's portfolio); a wait
+    # someone answered is credited to the person who answered. Presence alone is
+    # not responsibility: the head sits in 270 groups and works a handful.
+    METRICS_CREW_LOOKBACK_DAYS: int = 30
+
     # === Phase 2 preview stand ===
     # A SEPARATE link for reviewing the new metrics while the live weekly/monthly
     # report keeps running untouched. Same fail-closed pattern as the archive

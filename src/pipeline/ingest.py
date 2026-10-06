@@ -27,7 +27,8 @@ from aiogram.types import (
 
 from src.config import settings
 from src.db.client import acquire_connection
-from src.db.models import Chat
+from src.db.models import Chat, InternalUser
+from src.db.queries.chat_members import touch_presence
 from src.db.queries.etc import get_internal_user_by_telegram_id_any
 from src.db.queries.messages import insert_message, update_message_triggers
 from src.db.queries.queue import enqueue_chat_analysis, enqueue_task
@@ -67,7 +68,7 @@ async def ingest_message(message: Message, chat: Chat) -> None:
     business_peer_user_id = chat.business_peer_user_id
 
     async with acquire_connection() as conn:
-        sender_role = await _resolve_sender_role(conn, message)
+        sender_role, sender_user = await _resolve_sender(conn, message)
         stored = await insert_message(
             conn,
             telegram_message_id=message.message_id,
@@ -104,6 +105,17 @@ async def ingest_message(message: Message, chat: Chat) -> None:
                 msg_id=message.message_id,
             )
             return
+
+        # A staff message is proof the account is in the chat right now — keeps
+        # chat_members current between sweeps (0027). Partners are not tracked.
+        if sender_user is not None and message.from_user is not None:
+            await touch_presence(
+                conn,
+                chat_id=chat.id,
+                telegram_user_id=message.from_user.id,
+                internal_user_id=sender_user.id,
+                at=message.date,
+            )
 
         # Tier-1 rule matching (CLAUDE.md 7.1 steps 6-9): cheap, in-memory.
         result = pattern_cache.match(text, sender_role)
@@ -213,6 +225,14 @@ def _sender_name(message: Message) -> str | None:
 
 
 async def _resolve_sender_role(conn: asyncpg.Connection, message: Message) -> str:
+    """Role only — see :func:`_resolve_sender` for the row as well."""
+    role, _ = await _resolve_sender(conn, message)
+    return role
+
+
+async def _resolve_sender(
+    conn: asyncpg.Connection, message: Message
+) -> tuple[str, InternalUser | None]:
     """Classify the sender as internal / partner / anonymous_admin / unknown.
 
     A real user is ``internal`` if their Telegram id maps to ANY ``internal_users``
@@ -232,14 +252,14 @@ async def _resolve_sender_role(conn: asyncpg.Connection, message: Message) -> st
     """
     if message.from_user is not None:
         if message.from_user.is_bot:
-            return "unknown"
+            return "unknown", None
         internal = await get_internal_user_by_telegram_id_any(conn, message.from_user.id)
-        return "internal" if internal is not None else "partner"
+        return ("internal", internal) if internal is not None else ("partner", None)
     if message.sender_chat is not None:
         if message.sender_chat.id == message.chat.id:
-            return "anonymous_admin"
-        return "unknown"
-    return "unknown"
+            return "anonymous_admin", None
+        return "unknown", None
+    return "unknown", None
 
 
 def _resolve_forward(message: Message) -> tuple[int | None, int | None]:

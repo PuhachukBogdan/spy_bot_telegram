@@ -1,6 +1,12 @@
-import { useMemo } from 'react'
+import { Fragment, useMemo } from 'react'
 import { Bar, BarChart, CartesianGrid, LabelList, XAxis, YAxis } from 'recharts'
 
+import {
+  AccountTag,
+  DeactivatedBadge,
+  accountKey,
+  orderedAccounts,
+} from '@/components/Accounts'
 import { Meter, Pct, Stat, riskLabel } from '@/components/bits'
 import ToneBlock from '@/components/ToneBlock'
 import TrendBlock from '@/components/TrendBlock'
@@ -258,8 +264,12 @@ export default function Overview({
   const categories = useMemo(() => {
     if (!trend || !range) return data.categories
     const totals = new Map<string, number>()
+    // A context case sits on every crew member's page — count it once.
+    const seen = new Set<string>()
     for (const m of data.managers) {
       for (const r of m.risks) {
+        if (seen.has(r.id)) continue
+        seen.add(r.id)
         if (inRange(r.day, range)) totals.set(r.riskType, (totals.get(r.riskType) ?? 0) + 1)
       }
     }
@@ -363,15 +373,17 @@ export default function Overview({
           <TableBody>
             {data.managers.map((m) => {
               const r = rows.get(m.id)!
+              const split = m.accounts.length > 1
               return (
+                <Fragment key={m.id}>
                 <TableRow
-                  key={m.id}
                   onClick={() => onOpen(m.id)}
-                  className="cursor-pointer"
+                  className={`cursor-pointer ${split ? 'border-b-0' : ''}`}
                   title="Open dossier"
                 >
-                  <TableCell className="pl-5 font-semibold underline decoration-dotted underline-offset-4">
-                    {m.name}
+                  <TableCell className="pl-5 font-semibold">
+                    <span className="underline decoration-dotted underline-offset-4">{m.name}</span>
+                    {m.deactivatedAt ? <DeactivatedBadge manager={m} className="ml-1.5" /> : null}
                   </TableCell>
                   <TableCell className="text-right">
                     <Pct value={r.slaPercent} />
@@ -409,6 +421,58 @@ export default function Overview({
                     ) : null}
                   </TableCell>
                 </TableRow>
+                {split
+                  ? orderedAccounts(m).map((a) => {
+                      // One row per account, same columns: what THIS account
+                      // did. Offline stays on the person (an unanswered wait
+                      // belongs to nobody's account), hence the dash.
+                      const key = accountKey(a.id)
+                      const scoped = trend?.accounts[key]
+                      const st =
+                        trend && range && scoped
+                          ? computeRange(
+                              scoped.day.buckets,
+                              trend.chatDays.chats,
+                              key,
+                              range.from,
+                              range.to,
+                              data.thresholds.activeChatMinMessages,
+                            )
+                          : null
+                      const own = m.risks.filter(
+                        (x) =>
+                          x.counts && x.senderAccount === a.id && (!range || inRange(x.day, range)),
+                      ).length
+                      return (
+                        <TableRow
+                          key={a.id}
+                          onClick={() => onOpen(m.id)}
+                          className="cursor-pointer border-b-0 text-[12.5px] text-muted-foreground"
+                          title="Open dossier"
+                        >
+                          <TableCell className="py-1 pl-9">
+                            <AccountTag account={a} />
+                          </TableCell>
+                          <TableCell className="num py-1 text-right">
+                            {st?.slaPercent == null ? '—' : `${st.slaPercent}%`}
+                            <span className="text-[11px]">
+                              {' '}
+                              {st ? `${st.slaMet}/${st.slaRated}` : ''}
+                            </span>
+                          </TableCell>
+                          <TableCell className="num py-1 text-right" title="Offline is counted per person">
+                            —
+                          </TableCell>
+                          <TableCell className="num py-1 text-right">
+                            {st ? `${st.coverageActive} / ${st.coverageTotal}` : `${a.chats}`}
+                          </TableCell>
+                          <TableCell className="num py-1 text-right">{st ? st.proposals : '—'}</TableCell>
+                          <TableCell className="num py-1 pr-6 text-right">{own}</TableCell>
+                        </TableRow>
+                      )
+                    })
+                  : null}
+                </Fragment>
               )
             })}
           </TableBody>

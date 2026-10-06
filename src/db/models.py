@@ -87,7 +87,19 @@ class InternalUser(_ORMModel):
     # Seeded BY NAME, so a rename silently unflags — never treat it as authoritative
     # for anything but display/aggregation filtering.
     is_test: bool = False
+    # Migration 0027: a person who stopped working but is kept on purpose — still
+    # on the dashboard (badge + history), attributed nothing from this date on.
+    # Independent of ``enabled``, which is about bot access.
+    deactivated_at: datetime | None = None
+    deactivation_note: str | None = None
+    # Migration 0027: optional {telegram_id (as text): 'old' | 'new'} override for
+    # the dashboard's per-account split. Empty = derive from first-seen order.
+    account_labels: dict[str, str] = Field(default_factory=dict)
     created_at: datetime
+
+    @property
+    def is_deactivated(self) -> bool:
+        return self.deactivated_at is not None
 
     @property
     def is_admin(self) -> bool:

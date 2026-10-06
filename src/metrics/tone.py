@@ -360,6 +360,11 @@ def tone_flags_payload(
                 "quote": row["quote"],
                 "reason": row["reason"],
                 "confidence": float(row["confidence"]),
+                # Which of the person's Telegram accounts wrote it — the
+                # dossier's account switch filters the list on this.
+                "account": (
+                    str(row["sender_id"]) if row.get("sender_id") is not None else None
+                ),
             }
         )
     return out

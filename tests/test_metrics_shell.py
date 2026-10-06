@@ -88,7 +88,8 @@ def test_payload_shape() -> None:
     assert payload["viewer"] == {"name": "", "role": "admin", "seesRiskReport": True}
     manager = payload["managers"][0]
     assert set(manager) == {
-        "id", "name", "slaPercent", "slaMet", "slaRated", "slaOffline",
+        "id", "name", "deactivatedAt", "deactivationNote", "accounts",
+        "slaPercent", "slaMet", "slaRated", "slaOffline",
         "coveragePercent", "chatsActive", "chatsTotal", "proposals", "workHours",
         "risksOwn", "risksContext", "chats", "risks",
     }
@@ -139,8 +140,10 @@ def test_chat_days_entries_carry_the_chat_id() -> None:
     ]
     payload = _chat_days_payload(registry, day_rows, ZoneInfo("Europe/Kyiv"))
     entry = payload["chats"][0]
-    assert set(entry) == {"i", "m", "c", "d"}
+    assert set(entry) == {"i", "ms", "c", "d"}
     assert entry["i"] == str(chat_id)
+    # Without crews the owner is the one manager the chat belongs to.
+    assert entry["ms"] == [str(manager_id)]
     assert entry["d"] == {"2026-08-12": 7}
 
 

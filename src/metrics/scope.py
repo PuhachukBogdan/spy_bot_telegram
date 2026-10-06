@@ -8,11 +8,12 @@ It is enforced by removing data, never by hiding it in the browser: the excluded
 manager is absent from the payload, so there is nothing to find in the page
 source. Three separate paths carry a person into the page, and each is cut here:
 
-1. **By ownership** — SLA, offline, coverage, chats, proposals and the risk cases
-   raised in their chats all hang off ``chats.authorized_by``. Dropping the
-   manager from the roster and filtering every ``manager_id``-keyed row removes
-   these, and because the team series is summed from the same rows (see
-   ``trends.build_scope_days``), the team totals lose them too.
+1. **By membership** — chats, coverage and the crew that answers for a chat
+   come from ``chat_members``; the viewer's rows are dropped before any crew or
+   portfolio is built (``visible_memberships``), and so are their per-account
+   message rows. Waits they answered are dropped from the team as well
+   (``pair_waits_all(hidden_accounts=…)``), and proposals keyed by their id go
+   through ``visible_rows`` as before.
 2. **By authorship** — a risk case the viewer wrote in a *colleague's* chat is
    attributed to the colleague and would otherwise appear on that colleague's
    page, quoting the viewer. Those rows are matched on the author's Telegram id
@@ -130,6 +131,34 @@ def visible_risk_rows(
         if r.get("manager_id") not in scope.hidden_manager_ids
         and r.get("sender_id") not in scope.hidden_telegram_ids
     ]
+
+
+def visible_memberships(
+    rows: Iterable[dict[str, Any]], scope: PageScope
+) -> list[dict[str, Any]]:
+    """``chat_members`` rows minus the hidden person's accounts.
+
+    Membership is what puts a chat in someone's portfolio and someone in a
+    chat's crew; dropping the rows here keeps the head out of every crew and
+    every ``ms`` list, so the page cannot say "this chat is also his".
+    """
+    if not scope.hidden_manager_ids and not scope.hidden_telegram_ids:
+        return list(rows)
+    return [
+        r
+        for r in rows
+        if r.get("internal_user_id") not in scope.hidden_manager_ids
+        and r.get("telegram_user_id") not in scope.hidden_telegram_ids
+    ]
+
+
+def visible_sender_rows(
+    rows: Iterable[dict[str, Any]], scope: PageScope
+) -> list[dict[str, Any]]:
+    """Per-account message rows minus the hidden person's accounts."""
+    if not scope.hidden_telegram_ids:
+        return list(rows)
+    return [r for r in rows if r.get("sender_id") not in scope.hidden_telegram_ids]
 
 
 def visible_tone(tone: dict[str, Any] | None, scope: PageScope) -> dict[str, Any] | None:

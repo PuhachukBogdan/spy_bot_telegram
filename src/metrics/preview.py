@@ -1,15 +1,18 @@
 """The Team summary page: collect the manager metrics and render them standalone.
 
 Born as the Phase 2 preview stand; released to production on 2026-08-25 — the
-same page now fronts the live ``/dashboard/{token}`` (with the classic risk
-report as its second mode) while remaining available on the ``/preview`` stand.
-Deliberately isolated from ``src/summary``: it reads the same database but
-shares no code path and no table with the stored weekly/monthly reports, so it
-cannot alter what an issued ``/r/{token}`` snapshot shows.
+same page now fronts the live ``/dashboard`` (with the classic risk report as
+its second mode). Deliberately isolated from ``src.summary``: it reads the same
+database but shares no code path and no table with the stored weekly/monthly
+reports, so it cannot alter what an issued ``/r/{token}`` snapshot shows.
 
 The page is rendered live on every request and stored nowhere, so there is no
 snapshot to go stale and no publish step: reload the link and you see current
 numbers.
+
+Since 2026-10 a chat belongs to every manager PRESENT in it (``chat_members``),
+not to the one who added the bot; see :mod:`src.metrics.membership` for the
+rule and :mod:`src.metrics.accounts` for the old/new account split.
 """
 
 from __future__ import annotations
@@ -26,33 +29,47 @@ import asyncpg
 
 from src.config import settings
 from src.db.client import acquire_connection
+from src.db.queries.chat_members import first_seen_by_account, list_present_memberships
 from src.db.queries.etc import list_real_managers
 from src.db.queries.metrics import (
     count_messages_per_chat,
     count_messages_per_chat_day,
+    count_messages_per_sender_day,
     count_proposals_by_manager,
     count_proposals_per_day,
+    count_proposals_per_sender_day,
     list_risk_days,
     list_risk_events,
     list_sla_messages,
 )
 from src.db.queries.tone import list_tone_days, list_tone_flags
+from src.metrics.accounts import (
+    AccountStats,
+    account_days_payload,
+    account_stats,
+    label_accounts,
+)
 from src.metrics.attribution import build_manager_index
 from src.metrics.cache import preview_cache
 from src.metrics.collect import (
     ManagerMetrics,
+    WaitOutcome,
     assemble,
+    by_manager,
     chats_by_manager,
     coverage_by_manager,
-    pair_waits_dated,
+    pair_waits_all,
     risks_by_manager,
 )
+from src.metrics.membership import Crews, build_crews, fan_out_by_portfolio, local_day
 from src.metrics.scope import (
     ADMIN_SCOPE,
     PageScope,
     visible_managers,
+    visible_memberships,
     visible_risk_rows,
     visible_rows,
+    visible_sender_rows,
     visible_tone,
 )
 from src.metrics.shell import render_with_shell
@@ -61,9 +78,18 @@ from src.metrics.tone import (
     tone_days_payload,
     tone_flags_payload,
 )
-from src.metrics.trends import build_scope_days, build_scope_trends
+from src.metrics.trends import (
+    account_key,
+    build_account_scope_days,
+    build_scope_days,
+    build_scope_trends,
+)
 from src.metrics.window import MetricsWindow, resolve_metrics_window
-from src.metrics.workhours import EffectiveWorkHours, resolve_effective_work_hours
+from src.metrics.workhours import (
+    EffectiveWorkHours,
+    default_work_hours,
+    resolve_effective_work_hours,
+)
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -210,6 +236,8 @@ def build_payload(
     tz: ZoneInfo | None = None,
     tone: dict[str, Any] | None = None,
     scope: PageScope = ADMIN_SCOPE,
+    accounts: dict[UUID, list[AccountStats]] | None = None,
+    deactivated: dict[UUID, tuple[datetime, str | None]] | None = None,
 ) -> dict[str, Any]:
     """The metrics document handed to the React shell.
 
@@ -222,6 +250,8 @@ def build_payload(
     disagree about which day a case belongs to.
     """
     risk_tz = tz if tz is not None else UTC
+    accounts = accounts or {}
+    deactivated = deactivated or {}
     return {
         "trends": trends,
         # Who is reading. Drives the mode switch and the "signed in as" line; the
@@ -254,12 +284,22 @@ def build_payload(
             "substantiveChars": settings.SLA_SUBSTANTIVE_REPLY_CHARS,
             "offlineSeconds": settings.SLA_OFFLINE_AFTER_SECONDS,
             "activeChatMinMessages": settings.ACTIVE_CHAT_MIN_MESSAGES,
+            "crewLookbackDays": settings.METRICS_CREW_LOOKBACK_DAYS,
         },
         "categories": _category_totals(metrics),
         "managers": [
             {
                 "id": str(m.manager_id),
                 "name": m.name,
+                "deactivatedAt": (
+                    deactivated[m.manager_id][0].astimezone(risk_tz).date().isoformat()
+                    if m.manager_id in deactivated
+                    else None
+                ),
+                "deactivationNote": (
+                    deactivated[m.manager_id][1] if m.manager_id in deactivated else None
+                ),
+                "accounts": [a.to_payload() for a in accounts.get(m.manager_id, [])],
                 "slaPercent": m.sla.percent,
                 "slaMet": m.sla.met + m.sla.met_substantive,
                 "slaRated": m.sla.rated,
@@ -304,6 +344,9 @@ def build_payload(
                         "why": r.why,
                         "attribution": r.attribution.value,
                         "counts": r.counts,
+                        "senderAccount": (
+                            str(r.sender_id) if r.sender_id is not None else None
+                        ),
                     }
                     for r in m.risks
                 ],
@@ -319,10 +362,15 @@ def _category_totals(metrics: list[ManagerMetrics]) -> list[dict[str, Any]]:
     Counts every case, context included — the overview answers "what is happening
     across the business", which is a different question from "what did this
     manager do". The per-manager split into own/context lives on the dossier.
+    A case shown on several pages (context for a whole crew) is counted ONCE.
     """
     totals: dict[str, int] = {}
+    seen: set[UUID] = set()
     for manager in metrics:
         for risk in manager.risks:
+            if risk.risk_id in seen:
+                continue
+            seen.add(risk.risk_id)
             totals[risk.risk_type] = totals.get(risk.risk_type, 0) + 1
     return [
         {"type": risk_type, "count": count}
@@ -348,24 +396,39 @@ def _chat_days_payload(
     registry_rows: list[dict[str, Any]],
     chat_day_rows: list[dict[str, Any]],
     tz: ZoneInfo,
+    crews: Crews | None = None,
 ) -> dict[str, Any]:
     """Compact per-chat day counts for client-side custom-range coverage.
 
-    One entry per owned chat: its id (``i`` — what lets the dossier's chat table
-    recompute per-period message counts), its manager (``m``), local creation day
-    (``c`` — bounds the denominator so a chat born mid-range doesn't drag earlier
-    ranges down), and a sparse ``{iso day: messages}`` map (``d``).
+    One entry per chat: its id (``i`` — what lets the dossier's chat table
+    recompute per-period message counts), the managers it belongs to (``ms`` —
+    everyone present, so one chat may sit in several portfolios; the team
+    counts the entry once), local creation day (``c`` — bounds the denominator
+    so a chat born mid-range doesn't drag earlier ranges down), and a sparse
+    ``{iso day: messages}`` map (``d``).
     """
     per_chat: dict[Any, dict[str, int]] = {}
     for row in chat_day_rows:
         per_chat.setdefault(row["chat_id"], {})[row["day"].isoformat()] = row[
             "messages"
         ]
+
+    def managers_of(row: dict[str, Any]) -> list[str]:
+        if crews is not None:
+            # Holders = the managers present AND their present accounts
+            # (``acct:<id>``), so one filter serves the person view and the
+            # Old / New account view alike.
+            return sorted(str(m) for m in crews.members_of(row["chat_id"])) + sorted(
+                account_key(a) for a in crews.present_accounts.get(row["chat_id"], ())
+            )
+        owner = row.get("owner_id", row.get("manager_id"))
+        return [str(owner)] if owner is not None else []
+
     return {
         "chats": [
             {
                 "i": str(row["chat_id"]),
-                "m": str(row["manager_id"]),
+                "ms": managers_of(row),
                 "c": row["created_at"].astimezone(tz).date().isoformat(),
                 "d": per_chat.get(row["chat_id"], {}),
             }
@@ -379,8 +442,8 @@ async def _on_own_connection(
 ) -> Any:
     """Run one query on its own pooled connection, so a batch can gather.
 
-    asyncpg serialises queries per connection; running the stand's eight reads
-    on one connection means eight sequential round trips to a pooler an ocean
+    asyncpg serialises queries per connection; running the stand's reads on one
+    connection means that many sequential round trips to a pooler an ocean
     away. Fanning out across the pool turns that into roughly the latency of the
     slowest single query.
     """
@@ -421,6 +484,30 @@ async def _load_tone(floor: date, today: date, tz: ZoneInfo) -> dict[str, Any] |
     }
 
 
+async def _load_memberships() -> list[dict[str, Any]]:
+    """``chat_members`` presence, or an empty list before migration 0027 exists.
+
+    Failing soft keeps the page up during the deploy window; with no membership
+    the crew model falls back to chat owners for every chat, which is exactly
+    the pre-0027 behaviour.
+    """
+    try:
+        rows: list[dict[str, Any]] = await _on_own_connection(list_present_memberships)
+        return rows
+    except asyncpg.PostgresError as exc:
+        log.warning("membership.payload_unavailable", error=str(exc))
+        return []
+
+
+async def _load_first_seen() -> dict[int, datetime]:
+    try:
+        seen: dict[int, datetime] = await _on_own_connection(first_seen_by_account)
+        return seen
+    except asyncpg.PostgresError as exc:
+        log.warning("membership.first_seen_unavailable", error=str(exc))
+        return {}
+
+
 async def build_preview(
     days: int = 30,
     *,
@@ -439,16 +526,14 @@ async def build_preview(
     outcome.
 
     The rendered page is TTL-cached (see :mod:`src.metrics.cache`): mode
-    switching on the stand re-requests this page, and a review surface must feel
-    instant rather than second-fresh. ``fresh=True`` bypasses the cache.
+    switching re-requests this page, and a review surface must feel instant
+    rather than second-fresh. ``fresh=True`` bypasses the cache.
 
     Prefers the built React shell. Falls back to the plain server-rendered table
     when the frontend has not been built — a container built without the Node
     stage still serves working numbers instead of an error page.
 
-    ``include_tone`` adds the tone-of-voice block (section 18). It is a per-route
-    switch so the feature can sit on the /preview stand for review while the live
-    dashboard keeps rendering exactly what it rendered before.
+    ``include_tone`` adds the tone-of-voice block (section 18).
 
     ``scope`` decides WHOSE page this is (:mod:`src.metrics.scope`). A head's
     page is built without them in it — the exclusion happens on the raw rows,
@@ -477,6 +562,7 @@ async def build_preview(
     metrics: list[ManagerMetrics] = []
     trends: dict[str, Any] | None = None
     tone: dict[str, Any] | None = None
+    accounts: dict[UUID, list[AccountStats]] = {}
     async with acquire_connection() as conn:
         all_managers = await list_real_managers(conn)
     # The attribution index spans the WHOLE team on purpose: whether a case was
@@ -484,11 +570,18 @@ async def build_preview(
     # reading it. Scoping happens on the rows below, never on this index.
     manager_index = build_manager_index(all_managers)
     managers = visible_managers(all_managers, scope)
-    # A manager with no work-hours entry never opens a wait (see
-    # pair_waits_dated), so leaving the hidden one out here already keeps their
-    # waits out of both their own series and the team's.
+    roster_ids = [m.id for m in managers]
+    staff_ids = sorted({tg for m in all_managers for tg in m.telegram_accounts})
     hours: dict[UUID, EffectiveWorkHours] = {
         m.id: resolve_effective_work_hours(m) for m in managers
+    }
+    deactivated_at = {
+        m.id: (m.deactivated_at, m.deactivation_note)
+        for m in managers
+        if m.deactivated_at is not None
+    }
+    deactivated_days = {
+        mid: local_day(when, tz) for mid, (when, _) in deactivated_at.items()
     }
     if not horizon.is_empty:
         tz_name = str(tz)
@@ -503,6 +596,10 @@ async def build_preview(
             # The chat registry (with created_at) must span the horizon too, so
             # past buckets know which chats already existed back then.
             registry_rows,
+            membership_rows,
+            sender_day_rows,
+            first_seen,
+            proposal_sender_days,
         ) = await asyncio.gather(
             _on_own_connection(list_sla_messages, horizon.since, horizon.until),
             _on_own_connection(count_messages_per_chat, window.since, window.until),
@@ -525,14 +622,27 @@ async def build_preview(
             _on_own_connection(
                 count_messages_per_chat, horizon.since, horizon.until
             ),
+            _load_memberships(),
+            _on_own_connection(
+                count_messages_per_sender_day,
+                horizon.since,
+                horizon.until,
+                tz_name,
+                staff_ids,
+            ),
+            _load_first_seen(),
+            _on_own_connection(
+                count_proposals_per_sender_day, horizon.since, horizon.until, tz_name
+            ),
         )
 
-        # Scope every manager-keyed row set before a single number is derived
-        # from it. build_scope_days folds the same rows into the team series, so
-        # filtering afterwards would leave a hidden manager inside the totals.
-        chat_rows = visible_rows(chat_rows, scope)
-        chat_day_rows = visible_rows(chat_day_rows, scope)
-        registry_rows = visible_rows(registry_rows, scope)
+        # Scope every person-keyed row set before a single number is derived
+        # from it. The crews and the team series are built from these same
+        # rows, so filtering afterwards would leave a hidden manager inside
+        # every total.
+        membership_rows = visible_memberships(membership_rows, scope)
+        sender_day_rows = visible_sender_rows(sender_day_rows, scope)
+        proposal_sender_days = visible_sender_rows(proposal_sender_days, scope)
         proposal_days = visible_rows(proposal_days, scope)
         risk_days = visible_risk_rows(risk_days, scope)
         risk_rows = visible_risk_rows(risk_rows, scope)
@@ -542,35 +652,104 @@ async def build_preview(
             if manager_id not in scope.hidden_manager_ids
         }
 
-        dated = pair_waits_dated(sla_rows, hours)
+        crews = build_crews(
+            membership_rows,
+            sender_day_rows,
+            registry_rows,
+            manager_index=manager_index,
+            roster=roster_ids,
+            deactivated=deactivated_days,
+            lookback_days=settings.METRICS_CREW_LOOKBACK_DAYS,
+        )
+        waits: list[WaitOutcome] = pair_waits_all(
+            sla_rows,
+            hours,
+            crews=crews,
+            manager_index=manager_index,
+            tz=tz,
+            default_hours=default_work_hours(),
+            hidden_accounts=scope.hidden_telegram_ids,
+        )
+        dated = by_manager(waits)
         window_outcomes = {
             manager_id: [o for started, o in pairs if started >= window.since]
             for manager_id, pairs in dated.items()
         }
+        # The detail window's portfolio is "present now, still active": a person
+        # deactivated before the window closed has no chats in it.
+        today = until.astimezone(tz).date()
+        detail_rows = [
+            row
+            for row in fan_out_by_portfolio(chat_rows, crews)
+            if crews.is_active_on(row["manager_id"], today)
+        ]
         metrics = assemble(
             managers,
-            coverage=coverage_by_manager(chat_rows),
+            coverage=coverage_by_manager(detail_rows),
             sla_outcomes=window_outcomes,
             proposals=proposals,
             hours=hours,
-            chats=chats_by_manager(chat_rows),
-            risks=risks_by_manager(risk_rows, manager_index),
+            chats=chats_by_manager(detail_rows),
+            risks=risks_by_manager(risk_rows, manager_index, crews=crews, tz=tz),
         )
 
         scopes = build_scope_days(
-            [m.id for m in managers],
-            sla_dated=dated,
+            roster_ids,
+            waits=waits,
             proposal_days=proposal_days,
             risk_days=risk_days,
             manager_index=manager_index,
             chat_day_rows=chat_day_rows,
             chat_registry=registry_rows,
             tz=tz,
+            crews=crews,
+            deactivated=deactivated_days,
         )
-        today = until.astimezone(tz).date()
         floor = horizon.since.astimezone(tz).date()
         test_until = settings.METRICS_TEST_PERIOD_UNTIL
+        labels_by_manager = {
+            m.id: label_accounts(m.telegram_accounts, m.account_labels, first_seen)
+            for m in managers
+        }
+        accounts = {
+            m.id: account_stats(
+                m.telegram_accounts,
+                labels=labels_by_manager[m.id],
+                sender_day_rows=sender_day_rows,
+                waits=waits,
+                crews=crews,
+                since=window.since,
+                tz=tz,
+            )
+            for m in managers
+        }
+        # Old / New: one scope per account of every person who has more than
+        # one. Same trend builder as the person, so the account view is the
+        # same page with fewer facts in it, never a second formula.
+        multi = {
+            account: m.id
+            for m in managers
+            if len(m.telegram_accounts) > 1
+            for account in m.telegram_accounts
+        }
+        account_scopes = build_account_scope_days(
+            multi,
+            waits=waits,
+            proposal_sender_days=proposal_sender_days,
+            risk_days=risk_days,
+            chat_day_rows=chat_day_rows,
+            chat_registry=registry_rows,
+            crews=crews,
+            tz=tz,
+            deactivated=deactivated_days,
+        )
         trends = {
+            "accounts": {
+                key: build_scope_trends(
+                    scope_days, today=today, floor=floor, test_until=test_until
+                )
+                for key, scope_days in account_scopes.items()
+            },
             "team": build_scope_trends(
                 scopes[None], today=today, floor=floor, test_until=test_until
             ),
@@ -584,7 +763,16 @@ async def build_preview(
             # ARBITRARY date range exactly — counters sum, and coverage re-runs
             # the same threshold formula the server uses, instead of averaging
             # daily percentages (which would lie).
-            "chatDays": _chat_days_payload(registry_rows, chat_day_rows, tz),
+            "chatDays": _chat_days_payload(registry_rows, chat_day_rows, tz, crews),
+            # Per-account day maps: messages, replies and on-time replies per
+            # local day, so the old/new split follows the selected period too.
+            "accountDays": account_days_payload(
+                managers,
+                labels_by_manager=labels_by_manager,
+                sender_day_rows=sender_day_rows,
+                waits=waits,
+                tz=tz,
+            ),
             "horizon": {
                 "floor": floor.isoformat(),
                 "today": today.isoformat(),
@@ -595,7 +783,16 @@ async def build_preview(
             tone = visible_tone(await _load_tone(floor, today, tz), scope)
 
     rendered = render_with_shell(
-        build_payload(metrics, window, trends=trends, tz=tz, tone=tone, scope=scope)
+        build_payload(
+            metrics,
+            window,
+            trends=trends,
+            tz=tz,
+            tone=tone,
+            scope=scope,
+            accounts=accounts,
+            deactivated=deactivated_at,
+        )
     )
     page = (
         rendered

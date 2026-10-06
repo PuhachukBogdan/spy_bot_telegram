@@ -45,11 +45,34 @@ export interface RiskCase {
   attribution: 'manager_action' | 'chat_context'
   /** Context cases are shown but never counted. Mirrors RiskAttribution.counts. */
   counts: boolean
+  /** Telegram account that wrote the flagged message — the account view's filter. */
+  senderAccount: string | null
+}
+
+/** One Telegram account of a person, over the server's detail window.
+ * `label` is 'old' / 'new' when the person has more than one account (set by
+ * an admin, or derived from which account was seen first), else null. */
+export interface AccountRow {
+  id: string
+  label: 'old' | 'new' | null
+  /** Active chats this account is present in right now. */
+  chats: number
+  messages: number
+  activeDays: number
+  lastActiveAt: string | null
+  /** Rated waits this account closed, and how many of those were on time. */
+  replies: number
+  repliesOnTime: number
 }
 
 export interface ManagerRow {
   id: string
   name: string
+  /** Local ISO day from which nothing is attributed to this person; null = working.
+   * The row stays — with its history — on purpose. */
+  deactivatedAt: string | null
+  deactivationNote: string | null
+  accounts: AccountRow[]
   /** null = nothing was rated this period. NOT zero — zero would read as failure. */
   slaPercent: number | null
   slaMet: number
@@ -82,6 +105,9 @@ export interface ReportData {
     substantiveChars: number
     offlineSeconds: number
     activeChatMinMessages: number
+    /** A chat's crew on a day = managers present who wrote there within this
+     * many days before. Unanswered waits are charged to the crew. */
+    crewLookbackDays: number
   }
   /** Risk counts by category across everyone, biggest first. */
   categories: { type: string; count: number }[]
@@ -138,21 +164,40 @@ export interface GranularityTrend {
 
 export type ScopeTrend = Record<TrendGranularity, GranularityTrend>
 
-/** One owned chat: chat id, manager id, local creation day, sparse
- * day→messages map. What lets custom ranges compute coverage EXACTLY (same
- * threshold formula as the server) instead of averaging daily percentages,
- * and lets the dossier's chat table recount messages for any period. */
+/** One chat: chat id, the managers it belongs to (everyone PRESENT in it —
+ * one chat may sit in several portfolios; the team counts the entry once),
+ * local creation day, sparse day→messages map. What lets custom ranges compute
+ * coverage EXACTLY (same threshold formula as the server) instead of averaging
+ * daily percentages, and lets the dossier's chat table recount messages for
+ * any period. */
 export interface ChatDaysEntry {
   i: string
-  m: string
+  ms: string[]
   c: string
   d: Record<string, number>
+}
+
+/** One (manager, account): sparse per-day messages `d`, rated replies `r` and
+ * on-time replies `o`, keyed by local day — the old/new split per period. */
+export interface AccountDaysEntry {
+  m: string
+  a: string
+  label: 'old' | 'new' | null
+  d: Record<string, number>
+  r: Record<string, number>
+  o: Record<string, number>
+  /** chat id -> {day: messages written by this account}. */
+  cd: Record<string, Record<string, number>>
 }
 
 export interface Trends {
   team: ScopeTrend
   managers: Record<string, ScopeTrend>
   chatDays: { chats: ChatDaysEntry[] }
+  accountDays: AccountDaysEntry[]
+  /** One trend per Telegram account of a person with several, keyed `acct:<id>`.
+   * Same bucket shape as a manager's; offline is always 0 (it stays on the person). */
+  accounts: Record<string, ScopeTrend>
   horizon: { floor: string; today: string; testUntil: string | null }
 }
 
@@ -190,6 +235,8 @@ export interface ToneFlag {
   quote: string
   reason: string
   confidence: number
+  /** Telegram account that wrote the judged message, when known. */
+  account: string | null
 }
 
 export interface ToneData {

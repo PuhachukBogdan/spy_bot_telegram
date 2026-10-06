@@ -9,7 +9,13 @@
  * pro-rated threshold. Averaging pre-computed percentages would lie.
  */
 
-import type { ChatDaysEntry, ScopeTrend, TrendGranularity, TrendPoint } from '@/data'
+import type {
+  AccountDaysEntry,
+  ChatDaysEntry,
+  ScopeTrend,
+  TrendGranularity,
+  TrendPoint,
+} from '@/data'
 
 export interface PeriodState {
   granularity: TrendGranularity
@@ -163,7 +169,9 @@ export function computeRange(
   let total = 0
   let active = 0
   for (const chat of chats) {
-    if (managerId !== null && chat.m !== managerId) continue
+    // A chat belongs to every manager present in it; the team (null) counts
+    // each entry once, however many portfolios it sits in.
+    if (managerId !== null && !chat.ms.includes(managerId)) continue
     if (chat.c > to) continue // born after the range — not in the denominator
     total += 1
     let messages = 0
@@ -184,6 +192,38 @@ export function computeRange(
     coveragePercent: total ? Math.round((1000 * active) / total) / 10 : null,
     truncated: false,
   }
+}
+
+/** Per-account usage over [from, to], summed from the day maps. */
+export interface AccountRange {
+  messages: number
+  activeDays: number
+  replies: number
+  repliesOnTime: number
+}
+
+export function computeAccountRange(
+  entry: AccountDaysEntry,
+  from: string,
+  to: string,
+): AccountRange {
+  let messages = 0
+  let activeDays = 0
+  for (const [day, count] of Object.entries(entry.d)) {
+    if (day >= from && day <= to && count > 0) {
+      messages += count
+      activeDays += 1
+    }
+  }
+  let replies = 0
+  let repliesOnTime = 0
+  for (const [day, count] of Object.entries(entry.r)) {
+    if (day >= from && day <= to) replies += count
+  }
+  for (const [day, count] of Object.entries(entry.o)) {
+    if (day >= from && day <= to) repliesOnTime += count
+  }
+  return { messages, activeDays, replies, repliesOnTime }
 }
 
 /* ── collapsed-section persistence ──────────────────────────────────────────

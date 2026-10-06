@@ -271,9 +271,11 @@ async def list_tone_flags(
         """
         SELECT f.id, f.manager_id, f.chat_id, f.message_id, f.metric, f.confidence,
                f.quote, f.reason, f.occurred_at, f.day,
-               c.chat_name, c.unit_type
+               c.chat_name, c.unit_type,
+               m.sender_id
         FROM manager_tone_flags f
         JOIN chats c ON c.id = f.chat_id
+        LEFT JOIN messages m ON m.id = f.message_id
         WHERE f.day >= $1 AND f.day <= $2
         ORDER BY f.occurred_at DESC
         LIMIT $3

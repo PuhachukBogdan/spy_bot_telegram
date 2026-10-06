@@ -151,8 +151,16 @@ export default function HowToRead({ data }: { data: ReportData }) {
               weekends or holidays. A burst of partner messages is one wait, timed from the first.
             </li>
             <li>
-              <B>The wait belongs to the manager who owns the chat</B>, not to whoever happened to
-              answer. That is what keeps an unanswered chat attached to someone.
+              <B>A wait somebody answered belongs to the person who answered</B> — on time or late
+              by their own timing. A reply by someone not on this page (an admin) closes the wait
+              and is credited to nobody; the team still counts it.
+            </li>
+            <li>
+              <B>A wait nobody answered is charged to the chat&apos;s crew</B>: the managers present
+              in the chat who had written there within the last {t.crewLookbackDays} days and whose
+              working hours covered that moment. One chat usually has several managers; a silence is
+              shared by the people who were working it, not pinned on whoever added the bot. A chat
+              nobody has worked yet falls back to the manager who added it.
             </li>
             <li>
               A dash (<K>—</K>) means nothing waited in this period. It is not a failure and not a zero.
@@ -188,9 +196,15 @@ export default function HowToRead({ data }: { data: ReportData }) {
               minimum 1 — so 3 for a week, 1 for a day.
             </li>
             <li>
-              The denominator is the manager&apos;s whole portfolio (the chats they own). Silent chats
-              stay in it: a quiet chat is a fact about the portfolio, not a gap in the data. A chat
-              created after the period ended is left out.
+              The denominator is the manager&apos;s whole portfolio — <B>every chat they are present
+              in</B>, as Telegram reports it now, so one chat counts for each manager in it. Silent
+              chats stay in it: a quiet chat is a fact about the portfolio, not a gap in the data. A
+              chat created after the period ended is left out.
+            </li>
+            <li>
+              Membership is re-read from Telegram every few hours and on every join or leave the bot
+              sees; group titles are refreshed the same way, so a renamed group shows its current
+              name.
             </li>
           </Ul>
 
@@ -205,10 +219,11 @@ export default function HowToRead({ data }: { data: ReportData }) {
           <H>Risk</H>
           <Ul>
             <li>
-              A case appears on the page of the manager who <B>owns the chat</B>. Cases the manager
-              wrote are marked <K>manager&apos;s action</K> and counted; cases someone else raised in
-              their chat are marked <K>in their chat</K>, shown for context and <B>never counted</B>{' '}
-              (the grey <K>+N</K>). An unattributable author is context, not conduct.
+              A case a manager <B>wrote</B> appears on that manager&apos;s page, marked{' '}
+              <K>manager&apos;s action</K>, and counts. A case someone else raised appears, marked{' '}
+              <K>in their chat</K>, on the page of every manager in that chat&apos;s crew that day —
+              shown for context and <B>never counted</B> (the grey <K>+N</K>). A colleague&apos;s case
+              counts against the colleague only. An unattributable author is context, not conduct.
             </li>
             <li>
               The <B>Risk by category</B> chart on the overview includes context cases: it asks
@@ -359,6 +374,60 @@ export default function HowToRead({ data }: { data: ReportData }) {
             ) : null}
           </Ul>
 
+          <H>Several managers in one chat</H>
+          <Ul>
+            <li>
+              A partner group normally holds three to five of our managers. The page follows that:
+              the chat sits in <B>each</B> of their portfolios, while the team counts it once. So the
+              managers&apos; chat counts add up to more than the team&apos;s — by design, not by
+              double counting.
+            </li>
+            <li>
+              <B>What is personal:</B> replies given (SLA), messages written (Tone, Proposals), cases
+              written (Risk). <B>What is shared:</B> an unanswered wait and a partner-raised case, which
+              go to the chat&apos;s crew — the managers present who had been working the chat.
+            </li>
+            <li>
+              A manager present in many chats but writing in few has a large portfolio and a small
+              crew footprint: many chats, few waits. That is the head of department&apos;s normal shape.
+            </li>
+          </Ul>
+
+          <H>Accounts: old and new</H>
+          <Ul>
+            <li>
+              A person with more than one Telegram account gets one row per account under their own
+              row in the overview table, with the same columns for what that account did. The
+              person&apos;s row is the total and the only one counted in the team numbers.
+            </li>
+            <li>
+              <K>old</K> is the account seen first; <K>new</K> the one that came later. An admin can
+              pin the label.
+            </li>
+            <li>
+              <B>In the dossier</B> the switch <K>All accounts · Old account · New account</K> reruns
+              the whole page for one account: SLA from the replies that account gave, Active chats
+              over the chats it is a member of, proposals and own risk cases it wrote, its tone flags
+              and, in the chat table, how much it wrote in each chat. <B>Offline and the tone gauges
+              stay on the person</B> — an unanswered wait belongs to nobody&apos;s account.
+            </li>
+            <li>
+              <B>Moving to the new account</B> (All view): the weekly share of messages written from
+              the new account, the chats where the new account is not a member yet, and the chats
+              where both are members but only the old one still writes in the selected period.
+            </li>
+          </Ul>
+
+          <H>Deactivated</H>
+          <Ul>
+            <li>
+              <K>deactivated · since …</K> marks a person who stopped working but was kept on the page
+              on purpose. Their history stays exactly as it was; from that date no chat, wait or case
+              is attributed to them, so the current period reads <K>—</K> and <K>0 / 0</K>. Replies
+              they personally give after that date would still count as theirs.
+            </li>
+          </Ul>
+
           <H>A manager with no data at all</H>
           <Ul>
             <li>
@@ -366,19 +435,14 @@ export default function HowToRead({ data }: { data: ReportData }) {
               still shows something is not a fault. Two different attribution rules meet here.
             </li>
             <li>
-              <B>SLA, Offline, Active chats and context risks follow the chat owner.</B> A manager who
-              owns no chat (never added the bot, no chat authorised under them) has nobody waiting
-              &quot;in their chats&quot;, so SLA is <K>—</K> and chats are <K>0 / 0</K>. Replies they give
-              in a colleague&apos;s chat go to that colleague&apos;s SLA.
+              <B>Active chats follow presence</B>: a manager in no active chat has <K>0 / 0</K>.{' '}
+              <B>SLA follows replies and the crew</B>: a manager who answered nothing and worked no
+              chat in the last {t.crewLookbackDays} days has nothing to be charged, so SLA is <K>—</K>.
             </li>
             <li>
               <B>Tone of voice, Proposals and own risks follow the author.</B> So the same person gets
               tone numbers from exactly what they wrote, wherever they wrote it — and{' '}
               <K>too few messages</K> if that was little.
-            </li>
-            <li>
-              For such a manager to get SLA and Active chats, chats have to be assigned to them as
-              owner. Until then the page shows a dash, not a zero.
             </li>
           </Ul>
 

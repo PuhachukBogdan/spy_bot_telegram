@@ -15,6 +15,9 @@ DB (CLAUDE.md hard rule).
 
 from __future__ import annotations
 
+from uuid import UUID
+
+import asyncpg
 from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.types import Message
@@ -22,7 +25,9 @@ from aiogram.types import Message
 from src.bot.topics import effective_topic_id
 from src.db.client import acquire_connection
 from src.db.queries.chat_events import insert_chat_event
-from src.db.queries.chats import get_chat_unit, migrate_chat_telegram_id
+from src.db.queries.chat_members import record_event_status
+from src.db.queries.chats import get_chat_unit, migrate_chat_telegram_id, update_chat_title
+from src.db.queries.etc import get_internal_user_by_telegram_id_any
 from src.pipeline.ingest import ingest_message
 from src.utils.logging import get_logger
 
@@ -100,6 +105,8 @@ async def on_members_joined(message: Message) -> None:
                 target_user_id=member.id,
                 payload={"name": member.full_name, "is_bot": member.is_bot},
             )
+            if not member.is_bot:
+                await _record_staff_membership(conn, chat.id, member.id, "member", message)
     log.info("chat.members_joined", chat_id=message.chat.id, count=len(members))
 
 
@@ -122,6 +129,7 @@ async def on_member_left(message: Message) -> None:
             target_user_id=member.id,
             payload={"name": member.full_name},
         )
+        await _record_staff_membership(conn, chat.id, member.id, "left", message)
     log.info("chat.member_left", chat_id=message.chat.id, member_id=member.id)
 
 
@@ -143,7 +151,36 @@ async def on_title_change(message: Message) -> None:
             actor_user_id=actor.id if actor is not None else None,
             payload={"old_title": chat.chat_name, "new_title": new_title},
         )
+        # The event alone used to be the whole handler, so chats.chat_name kept
+        # the creation-time title forever (161 of 317 were stale by 2026-10).
+        await update_chat_title(conn, message.chat.id, new_title)
     log.info("chat.title_changed", chat_id=message.chat.id)
+
+
+async def _record_staff_membership(
+    conn: asyncpg.Connection,
+    chat_id: UUID,
+    telegram_user_id: int,
+    status: str,
+    message: Message,
+) -> None:
+    """Mirror a witnessed join/leave into ``chat_members`` when the person is ours.
+
+    Partners are not tracked there. The enabled-agnostic lookup is right: a
+    disabled or deactivated colleague joining or leaving a chat is still a fact
+    about OUR presence in it.
+    """
+    internal = await get_internal_user_by_telegram_id_any(conn, telegram_user_id)
+    if internal is None:
+        return
+    await record_event_status(
+        conn,
+        chat_id=chat_id,
+        telegram_user_id=telegram_user_id,
+        internal_user_id=internal.id,
+        status=status,
+        at=message.date,
+    )
 
 
 @router.message()

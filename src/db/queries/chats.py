@@ -145,6 +145,39 @@ async def get_chat_unit(
     return Chat.from_record(row) if row is not None else None
 
 
+async def update_chat_title(
+    conn: asyncpg.Connection, telegram_chat_id: int, title: str | None
+) -> int:
+    """Bring every unit of a Telegram chat up to its current title.
+
+    Returns how many rows changed. Titles used to be written once at creation and
+    never again — a ``title_change`` event was logged but ``chat_name`` kept the
+    old text, so after the 2026-09 rebrand every renamed group still read
+    ``| Betonwin`` on the dashboard. Called from the title-change handler and
+    from the membership sweep (which asks ``getChat`` on every pass).
+
+    Forum topics keep their own ``topic_name``; this touches the GROUP title only,
+    which every unit of the group shares.
+    """
+    if not title:
+        return 0
+    status = await conn.execute(
+        """
+        UPDATE chats
+        SET chat_name = $2
+        WHERE telegram_chat_id = $1
+          AND status <> 'merged'
+          AND chat_name IS DISTINCT FROM $2
+        """,
+        telegram_chat_id,
+        title,
+    )
+    try:
+        return int(status.rsplit(" ", 1)[-1])
+    except ValueError:  # pragma: no cover - asyncpg always returns "UPDATE n"
+        return 0
+
+
 async def get_chat_by_id(conn: asyncpg.Connection, chat_id: UUID) -> Chat | None:
     """Return a chat unit by its primary key, or ``None`` (Tier-2 worker)."""
     row = await conn.fetchrow("SELECT * FROM chats WHERE id = $1", chat_id)

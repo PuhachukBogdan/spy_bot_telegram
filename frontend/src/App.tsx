@@ -1,5 +1,6 @@
 import { useState } from 'react'
 
+import { DeactivatedBadge } from '@/components/Accounts'
 import Dossier from '@/components/Dossier'
 import HowToRead from '@/components/HowToRead'
 import Overview from '@/components/Overview'
@@ -69,19 +70,24 @@ function Managers({
                   : 'border-border bg-card hover:bg-secondary'
               }`}
             >
-              <div className="font-semibold">{m.name}</div>
+              <div className="font-semibold">
+                {m.name}
+                {m.deactivatedAt ? <DeactivatedBadge manager={m} className="ml-1.5" /> : null}
+              </div>
               <div
                 className={`num text-[11px] ${
                   m.id === active.id ? 'opacity-80' : 'text-muted-foreground'
                 }`}
               >
                 {sla === null ? 'no data' : `SLA ${sla}%`} · {chatsTotal} chats
+                {m.accounts.length > 1 ? ` · ${m.accounts.length} accounts` : ''}
               </div>
             </button>
           )
         })}
       </nav>
       <Dossier
+        key={active.id}
         manager={active}
         trends={trends}
         activeChatMin={data.thresholds.activeChatMinMessages}

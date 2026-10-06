@@ -8,6 +8,12 @@ import {
   UnitBadge,
   riskLabel,
 } from '@/components/bits'
+import {
+  AccountSwitch,
+  DeactivatedBadge,
+  MovingBlock,
+  accountKey,
+} from '@/components/Accounts'
 import ToneBlock, { ToneFlagList } from '@/components/ToneBlock'
 import TrendBlock from '@/components/TrendBlock'
 import { Card, CardContent } from '@/components/ui/card'
@@ -43,9 +49,10 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
   )
 }
 
-/** A risk card. Context cases — raised by someone else in this manager's chat —
- *  are deliberately recessive: no severity spine, muted type. They belong on the
- *  page because the chat is theirs, but the eye must not read them as conduct. */
+/** A risk card. Context cases — raised by someone else in a chat this manager
+ *  works — are deliberately recessive: no severity spine, muted type. They belong
+ *  on the page because the chat is theirs to work, but the eye must not read
+ *  them as conduct. */
 function RiskCard({ risk }: { risk: RiskCase }) {
   return (
     <div
@@ -107,7 +114,17 @@ export default function Dossier({
   onPeriodChange: (period: PeriodState) => void
   range: PeriodRange | null
 }) {
-  const trend = trends?.managers[manager.id] ?? null
+  // 'all' = the person; otherwise one of their Telegram accounts. The account
+  // view runs the SAME components on the account's own scope (`acct:<id>`).
+  const [view, setView] = useState('all')
+  const account = view === 'all' ? null : (manager.accounts.find((a) => a.id === view) ?? null)
+  const scopeKey = account ? accountKey(account.id) : manager.id
+  const trend = account
+    ? (trends?.accounts[scopeKey] ?? null)
+    : (trends?.managers[manager.id] ?? null)
+  const accountEntry = account
+    ? (trends?.accountDays.find((e) => e.m === manager.id && e.a === account.id) ?? null)
+    : null
 
   const [collapsed, setCollapsed] = useState<Record<SectionId, boolean>>(loadCollapsed)
   const toggle = (id: SectionId) =>
@@ -120,10 +137,11 @@ export default function Dossier({
   // Everything below the analytics block follows the selected period: the risk
   // list filters by local detection day, proposals sum from the day buckets,
   // and the chat table recounts messages against the pro-rated threshold.
-  const periodRisks = useMemo(
-    () => (range ? manager.risks.filter((r) => inRange(r.day, range)) : manager.risks),
-    [manager.risks, range],
-  )
+  const periodRisks = useMemo(() => {
+    const scoped = range ? manager.risks.filter((r) => inRange(r.day, range)) : manager.risks
+    // An account owns only the cases it wrote; context belongs to the person.
+    return account ? scoped.filter((r) => r.counts && r.senderAccount === account.id) : scoped
+  }, [manager.risks, range, account])
   const own = periodRisks.filter((r) => r.counts)
   const context = periodRisks.filter((r) => !r.counts)
 
@@ -132,12 +150,12 @@ export default function Dossier({
     return computeRange(
       trend.day.buckets,
       trends.chatDays.chats,
-      manager.id,
+      scopeKey,
       range.from,
       range.to,
       activeChatMin,
     ).proposals
-  }, [trends, trend, range, manager, activeChatMin])
+  }, [trends, trend, range, manager, activeChatMin, scopeKey])
 
   const chatRows = useMemo(() => {
     if (!trends || !range) return manager.chats
@@ -147,6 +165,7 @@ export default function Dossier({
       daysBetweenInclusive(range.from, range.to),
     )
     return manager.chats
+      .filter((chat) => !account || (byId.get(chat.id)?.ms.includes(scopeKey) ?? false))
       .map((chat) => {
         const entry = byId.get(chat.id)
         let messages = 0
@@ -155,22 +174,33 @@ export default function Dossier({
             if (inRange(day, range)) messages += count
           }
         }
-        return { ...chat, messages, active: messages >= threshold }
+        // In the account view the count is what THIS account wrote there;
+        // "active" still describes the chat, same rule as the person view.
+        let own = 0
+        for (const [day, count] of Object.entries(accountEntry?.cd[chat.id] ?? {})) {
+          if (inRange(day, range)) own += count
+        }
+        return { ...chat, messages: account ? own : messages, active: messages >= threshold }
       })
       .sort((a, b) => b.messages - a.messages || a.name.localeCompare(b.name))
-  }, [trends, range, manager.chats, activeChatMin])
+  }, [trends, range, manager.chats, activeChatMin, account, accountEntry, scopeKey])
   const activeCount = chatRows.filter((c) => c.active).length
   const quietCount = chatRows.length - activeCount
   const periodNote = range ? ` · ${periodLabel(period, range)}` : ''
 
   // Accepted tone flags for this manager, filtered by local day like risks.
   const toneFlags = useMemo(() => {
-    const all = tone?.flags[manager.id] ?? []
+    const all = (tone?.flags[manager.id] ?? []).filter(
+      (f) => !account || f.account === account.id,
+    )
     return range ? all.filter((f) => inRange(f.day, range)) : all
-  }, [tone, manager.id, range])
+  }, [tone, manager.id, range, account])
 
   return (
     <div>
+      {manager.accounts.length > 1 ? (
+        <AccountSwitch manager={manager} value={view} onChange={setView} />
+      ) : null}
       {/* The manager-scoped analytics block — same component as the overview's,
           so the two scales can never drift apart visually or numerically. */}
       {trends && trend ? (
@@ -179,7 +209,7 @@ export default function Dossier({
             trend={trend}
             chats={trends.chatDays.chats}
             horizon={trends.horizon}
-            managerId={manager.id}
+            managerId={scopeKey}
             activeChatMin={activeChatMin}
             period={period}
             onPeriodChange={onPeriodChange}
@@ -212,6 +242,14 @@ export default function Dossier({
         </div>
       )}
 
+      {manager.deactivatedAt ? (
+        <div className="mb-2 rounded-md border border-dashed bg-card p-3 text-[12.5px] text-muted-foreground">
+          <DeactivatedBadge manager={manager} className="mr-2" />
+          Kept on the page with full history. From this date no chat, wait or case is
+          attributed to them{manager.deactivationNote ? ` — ${manager.deactivationNote}` : ''}.
+        </div>
+      ) : null}
+
       <Card className="mb-2 shadow-card">
         <CardContent className="flex flex-wrap items-center gap-x-8 gap-y-2 p-3 text-[12px]">
           <div>
@@ -233,6 +271,10 @@ export default function Dossier({
         </CardContent>
       </Card>
 
+      {!account && trends && manager.accounts.length > 1 ? (
+        <MovingBlock manager={manager} trends={trends} range={range} periodNote={periodNote} />
+      ) : null}
+
       <SectionTitle>Positive</SectionTitle>
       {proposals > 0 ? (
         <div className="mb-3 rounded-md border bg-card p-3 text-[13px]">
@@ -244,7 +286,14 @@ export default function Dossier({
         </div>
       )}
       {tone ? (
-        <ToneBlock tone={tone} managerId={manager.id} range={range} periodNote={periodNote} />
+        <>
+          {account ? (
+            <div className="mb-1 text-[11.5px] italic text-muted-foreground">
+              Tone gauges are per person (all accounts); the flag list below is this account only.
+            </div>
+          ) : null}
+          <ToneBlock tone={tone} managerId={manager.id} range={range} periodNote={periodNote} />
+        </>
       ) : null}
 
       <FoldableTitle open={!collapsed.risks} onToggle={() => toggle('risks')}>
@@ -296,7 +345,9 @@ export default function Dossier({
                 <TableRow>
                   <TableHead>Chat</TableHead>
                   <TableHead className="w-[90px]">Type</TableHead>
-                  <TableHead className="w-[110px] text-right">Messages</TableHead>
+                  <TableHead className="w-[110px] text-right">
+                    {account ? 'By this account' : 'Messages'}
+                  </TableHead>
                   <TableHead className="w-[90px] text-right">Active</TableHead>
                 </TableRow>
               </TableHeader>
@@ -314,7 +365,7 @@ export default function Dossier({
                 {chatRows.length === 0 ? (
                   <TableRow>
                     <TableCell colSpan={4} className="italic text-muted-foreground">
-                      No chats owned in this period.
+                      Not present in any chat in this period.
                     </TableCell>
                   </TableRow>
                 ) : null}

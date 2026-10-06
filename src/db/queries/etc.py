@@ -6,7 +6,7 @@ and authorization checks). Each takes an already-acquired ``asyncpg.Connection``
 
 from __future__ import annotations
 
-from datetime import time
+from datetime import datetime, time
 from uuid import UUID
 
 import asyncpg
@@ -116,6 +116,13 @@ async def list_real_managers(conn: asyncpg.Connection) -> list[InternalUser]:
     conflating "may use the bot" with "is staff" corrupted risk analysis; here we
     genuinely want only people currently being measured.
 
+    One exception (0027): a **deactivated** person — marked with
+    ``deactivated_at`` because they stopped working but were kept on purpose —
+    stays on the roster whether or not ``enabled`` was also switched off. Their
+    history must remain readable and the page shows the badge; the metrics stop
+    attributing anything to them from that date (``src.metrics.membership``).
+    Deactivated people sort last.
+
     ``head`` counts as a manager here. A department lead still owns chats and
     still writes to partners, so they are measured like anyone else — what the
     ``head`` role changes is what that person may READ (they do not see their own
@@ -128,10 +135,10 @@ async def list_real_managers(conn: asyncpg.Connection) -> list[InternalUser]:
         SELECT *
         FROM internal_users
         WHERE role IN ('manager', 'head')
-          AND enabled = true
+          AND (enabled = true OR deactivated_at IS NOT NULL)
           AND COALESCE(is_test, false) = false
           AND jsonb_array_length(COALESCE(telegram_accounts, '[]'::jsonb)) > 0
-        ORDER BY full_name
+        ORDER BY (deactivated_at IS NOT NULL), full_name
         """
     )
     return [InternalUser.from_record(row) for row in rows]
@@ -372,6 +379,52 @@ async def update_user_role(
         """,
         user_id,
         role,
+    )
+    return InternalUser.from_record(row) if row is not None else None
+
+
+async def set_user_deactivated(
+    conn: asyncpg.Connection,
+    user_id: UUID,
+    *,
+    deactivated_at: datetime | None,
+    note: str | None,
+) -> InternalUser | None:
+    """Mark a person as no longer working (or clear the mark). Returns the row.
+
+    Deliberately separate from ``enabled``: deactivation is about what the
+    dashboard attributes to them from a date on, not about bot access. The
+    caller audits.
+    """
+    row = await conn.fetchrow(
+        """
+        UPDATE internal_users
+        SET deactivated_at = $2, deactivation_note = $3
+        WHERE id = $1
+        RETURNING *
+        """,
+        user_id,
+        deactivated_at,
+        note,
+    )
+    return InternalUser.from_record(row) if row is not None else None
+
+
+async def set_account_label(
+    conn: asyncpg.Connection, user_id: UUID, telegram_user_id: int, label: str
+) -> InternalUser | None:
+    """Pin an account's dashboard label (``old`` / ``new``) on a person."""
+    row = await conn.fetchrow(
+        """
+        UPDATE internal_users
+        SET account_labels = COALESCE(account_labels, '{}'::jsonb)
+                             || jsonb_build_object($2::text, $3::text)
+        WHERE id = $1
+        RETURNING *
+        """,
+        user_id,
+        str(telegram_user_id),
+        label,
     )
     return InternalUser.from_record(row) if row is not None else None
 
